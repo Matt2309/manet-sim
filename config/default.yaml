@@ -1,1 +1,44 @@
-#Parametri di simulazione
+# Configurazione di default per il simulatore MANET-sim.
+# Blocco 1 (mobilità): nessun valore numerico è cablato nel codice Python,
+# tutte le costanti del modello stanno qui.
+
+simulation:
+  dt: 0.1                  # passo di simulazione in secondi
+  duration: null           # secondi; null = usa l'intera traccia GPX
+  seed: 42                 # seme RNG, per riproducibilità
+
+track:
+  gpx_file: "../data/gpx/Corsa_serale.gpx"  # relativo a questo file di configurazione
+  assumed_sample_rate: 1.0    # Hz; il GPX non ha timestamp (vedi docstring di load_track)
+  glitch_max_step: 8.0        # m; passi oltre questa soglia sono buchi di campionamento GPS
+  start_offset: 20.0          # m; da dove parte il gruppo lungo il percorso (margine per l'OU a regime)
+  speed_smoothing_window: 5.0 # s; finestra della media mobile sul profilo di velocità
+  end_margin: 20.0            # m; con duration=null, ci si ferma a length - end_margin
+  plausible_speed_range: [1.5, 6.0]  # m/s; range atteso per la corsa, usato per validare
+                                      # a runtime l'assunzione di campionamento uniforme
+
+group:
+  n_nodes: 5
+  longitudinal_spread: 10.0   # m; estensione testa-coda del gruppo (statistica: spread_statistic)
+  lateral_spread: 2.0         # m; larghezza della formazione (stessa statistica)
+  correlation_time: 8.0       # s; tempo di correlazione degli scostamenti (OU)
+  spread_statistic: p95       # come interpretare *_spread: "mean" | "p95"
+  min_node_gap: 1.2           # m; distanza minima euclidea fra nodi (repulsione fisica)
+  min_gap_softness: 0.15      # m; scala del margine casuale (OU) oltre min_node_gap
+  margin_sigmas: 4.0          # start_offset/end_margin richiesti, in unità di sigma_long
+  spread_margin_factor: 1.5   # longitudinal_spread deve superare (n_nodes-1)*min_node_gap*fattore
+  max_displacement_p95: 1.0   # m; oltre questo p95 di spostamento indotto dal vincolo -> warning
+  min_gap_tolerance: 0.001    # m; violazione residua accettata dal rilassamento del vincolo
+  min_gap_max_iterations: 100 # iterazioni massime del rilassamento del vincolo di distanza minima
+  calibration:                 # calibrazione numerica di sigma sull'uscita (dopo il vincolo)
+    samples: 10000
+    seed: 0
+    max_iterations: 30
+    tolerance: 0.001          # convergenza relativa sulla statistica osservata
+
+separation:
+  enabled: false
+  node_id: 4               # quale nodo si separa
+  start_time: 300.0        # s; istante di inizio della separazione
+  target_speed: 1.8        # m/s; velocità a cui il nodo rallenta
+  ramp_duration: 5.0        # s; tempo per passare dalla velocità di gruppo a target_speed

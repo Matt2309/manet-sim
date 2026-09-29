@@ -221,3 +221,8 @@ __marimo__/
 .idea/
 
 results/
+
+# macOS
+.DS_Store
+
+data/gpx/*
