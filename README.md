@@ -26,6 +26,7 @@ pytest
 ```bash
 python scripts/plot_mobility.py                    # usa config/default.yaml
 python scripts/plot_mobility.py path/al/config.yaml # configurazione alternativa
+python scripts/plot_channel.py                     # Blocco 2: RSSI, shadowing, corpi (3 simulazioni)
 ```
 
 Le figure vengono salvate in `results/` (cartella ignorata da git).
@@ -38,8 +39,10 @@ costante è cablata nel codice.
 ## Stato
 
 - [x] **Blocco 1 — Mobilità**: traiettorie dei nodi lungo una traccia GPX reale,
-  formazione del gruppo con processo di Ornstein-Uhlenbeck, evento di separazione.
-- [ ] Blocco 2 — Modello di canale (RSSI)
+  formazione del gruppo con un processo del secondo ordine a smorzamento critico e repulsione fra i corridori, evento di separazione.
+- [x] **Blocco 2 — Modello di canale**: RSSI per coppia ordinata (attenuazione con la distanza,
+  shadowing correlato a mappa condivisa, torso e altri corridori, fading di Rice, scarti delle schede,
+  saturazione e quantizzazione).
 - [ ] Blocco 3 — Pacchetti e comunicazione
 - [ ] Blocco 4 — Filtro di Kalman
 - [ ] Blocco 5 — Routing

@@ -13,6 +13,7 @@ track:
   glitch_max_step: 8.0        # m; passi oltre questa soglia sono buchi di campionamento GPS
   start_offset: 20.0          # m; da dove parte il gruppo lungo il percorso (margine per l'OU a regime)
   speed_smoothing_window: 5.0 # s; finestra della media mobile sul profilo di velocità
+  heading_smoothing: 6.0      # m; larghezza della media mobile della direzione del percorso lungo s (riferimento locale continuo nelle curve)
   end_margin: 20.0            # m; con duration=null, ci si ferma a length - end_margin
   plausible_speed_range: [1.5, 6.0]  # m/s; range atteso per la corsa, usato per validare
                                       # a runtime l'assunzione di campionamento uniforme
@@ -21,17 +22,22 @@ group:
   n_nodes: 5
   longitudinal_spread: 10.0   # m; estensione testa-coda del gruppo (statistica: spread_statistic)
   lateral_spread: 2.0         # m; larghezza della formazione (stessa statistica)
-  correlation_time: 8.0       # s; tempo di correlazione degli scostamenti (OU)
+  correlation_time: 8.0       # s; costante di tempo longitudinale degli scostamenti (OU del 2° ordine a smorzamento critico)
+  lateral_correlation_time: 2.5  # s; costante di tempo laterale: tornare sulla propria linea dopo una schivata è più rapido della deriva longitudinale
   spread_statistic: p95       # come interpretare *_spread: "mean" | "p95"
-  min_node_gap: 1.2           # m; distanza minima euclidea fra nodi (repulsione fisica)
-  min_gap_softness: 0.15      # m; scala del margine casuale (OU) oltre min_node_gap
+  min_node_gap: 1.2           # m; distanza di riferimento fra nodi: la repulsione cresce sotto di essa
+  repulsion:                  # forza repulsiva fra i corridori, nel piano: A·(exp((g-d)/B) - exp((g-R)/B)) per d < R
+    strength: 1.0             # m/s^2; A, accelerazione a distanza g (circa)
+    scale: 0.3                # m; B, scala della crescita esponenziale
+    action_distance: 2.4      # m; R, oltre questa distanza la forza è nulla
+  warmup_taus: 3.0            # tempi di correlazione simulati e scartati prima di registrare (stato stazionario con la repulsione)
   margin_sigmas: 4.0          # start_offset/end_margin richiesti, in unità di sigma_long
   spread_margin_factor: 1.5   # longitudinal_spread deve superare (n_nodes-1)*min_node_gap*fattore
-  max_displacement_p95: 1.0   # m; oltre questo p95 di spostamento indotto dal vincolo -> warning
-  min_gap_tolerance: 0.001    # m; violazione residua accettata dal rilassamento del vincolo
-  min_gap_max_iterations: 100 # iterazioni massime del rilassamento del vincolo di distanza minima
-  calibration:                 # calibrazione numerica di sigma sull'uscita (dopo il vincolo)
-    samples: 10000
+  max_relative_speed_p99: 1.0 # m/s; p99 della velocità relativa al baricentro (a passo dt) sotto cui il moto è realistico
+  max_relative_speed: 2.0     # m/s; massimo della velocità relativa al baricentro (a passo dt)
+  calibration:                 # calibrazione numerica di sigma sull'uscita (con la repulsione)
+    groups: 100               # gruppi indipendenti simulati
+    duration: 300.0           # s registrati per gruppo
     seed: 0
     max_iterations: 30
     tolerance: 0.001          # convergenza relativa sulla statistica osservata
@@ -42,3 +48,55 @@ separation:
   start_time: 300.0        # s; istante di inizio della separazione
   target_speed: 1.8        # m/s; velocità a cui il nodo rallenta
   ramp_duration: 5.0        # s; tempo per passare dalla velocità di gruppo a target_speed
+
+# Blocco 2 (canale): RSSI di ogni coppia ordinata di nodi.
+channel:
+  frequency: 2.437e+9         # Hz, canale Wi-Fi 6
+  tx_power: 10.0              # dBm; ridotta da 17 per evitare la saturazione (esp_wifi_set_max_tx_power)
+  antenna_gain_tx: 0.0        # dBi
+  antenna_gain_rx: 0.0        # dBi
+
+  path_loss:
+    exponent: 3.0             # n; 3 all'aperto, 4 al chiuso
+    reference_distance: 1.0   # m; d0: sotto questa distanza l'attenuazione resta quella a d0
+
+  shadowing:
+    enabled: true
+    mode: field               # "field" (mappa condivisa) | "independent" (per link)
+    sigma: 4.0                # dB; deviazione standard sui link lunghi (field) o su tutti (independent)
+    correlation_distance: 7.0 # m; delta, distanza di correlazione
+    grid_resolution: 1.0      # m; passo della griglia della mappa
+    field_margin: 50.0        # m; margine attorno all'area percorsa
+    fft_padding: 70.0         # m; padding della FFT (>= 10 delta: la correlazione residua fra i bordi opposti è e^-10)
+    integration_step: 0.5     # m; passo di campionamento lungo il segmento del link
+    long_link_factor: 50.0    # i link più lunghi di questo multiplo di delta usano il passo grande
+    long_link_step_factor: 0.5 # passo di integrazione dei link lunghi, in unità di delta
+    chunk_points: 4000000     # punti di integrazione per blocco (solo memoria, non cambia il risultato)
+
+  body:
+    own:
+      enabled: true
+      mount_side: right       # scheda sulla spalla destra -> il torso blocca verso sinistra
+      max_loss: 12.0          # dB, quando l'altro nodo è esattamente dal lato del torso
+      lobe_exponent: 3.0      # forma del lobo: più alto = lobo più stretto
+    others:
+      enabled: true
+      loss: 8.0               # dB per ogni corridore che sta in mezzo al link
+      radius: 0.2             # m; il corridore è un cilindro verticale di questo raggio
+      transition_width: 0.05  # m; larghezza della transizione graduale al bordo del cilindro
+      max_total_loss: 12.0    # dB; tetto alla somma delle perdite di più corridori (il 2° e 3° corpo bloccano meno del 1°: il segnale gira attorno)
+
+  fading:
+    enabled: true
+    rician_k_db: 6.0          # fattore K di Rice in dB
+
+  device_offset:
+    enabled: true
+    sigma: 1.5                # dB; scarto fisso per scheda, separato per trasmissione e ricezione
+
+  measurement:
+    saturation_dbm: -30.0     # dBm; valore da verificare sulle schede
+    quantization_step: 1.0    # dB; l'ESP32 restituisce un intero in dBm
+
+  obstacles:
+    enabled: false            # edifici da OpenStreetMap: Blocco 2b, per ora contributo nullo

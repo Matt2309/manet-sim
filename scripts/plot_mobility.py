@@ -7,7 +7,9 @@ configurazione YAML (config/default.yaml se non specificato altrimenti).
 
 import argparse
 import itertools
+import subprocess
 import sys
+import types
 from pathlib import Path
 
 _REPO_ROOT = Path(__file__).resolve().parent.parent
@@ -19,7 +21,18 @@ matplotlib.use("Agg")
 import matplotlib.pyplot as plt
 import numpy as np
 
-from src.mobility import Track, load_config, load_track, simulate_mobility
+from src.mobility import (
+    Track,
+    lateral_offset_speed,
+    load_config,
+    load_track,
+    relative_speed,
+    simulate_mobility,
+)
+
+# Commit con il modulo di mobilità originale (OU del primo ordine e vincolo
+# di distanza minima a proiezione): serve solo al confronto prima/dopo.
+LEGACY_MOBILITY_COMMIT = "921bfb8"
 
 
 def _suffix(cfg: dict) -> str:
@@ -241,6 +254,119 @@ def plot_separation_detail(result, out_dir: Path, suffix: str, cfg: dict, window
     plt.close(fig)
 
 
+def print_group_stats(track: Track, result, cfg: dict) -> None:
+    """Statistiche del gruppo sulla finestra di analisi (prima della
+    separazione, se attiva), stampate a console: estensione longitudinale e
+    laterale, distanze fra coppie, velocità 2D (rispetto al baricentro delle
+    posizioni e del solo scostamento laterale).
+    """
+    idx_a, idx_b = _analysis_window(result, cfg)
+    n_nodes = cfg["group"]["n_nodes"]
+    sl = slice(idx_a, idx_b)
+
+    ext_long = np.ptp(result.s_nodes[sl], axis=1)
+    ext_lat = np.ptp(result.lateral_offsets[sl], axis=1)
+    iu, ju = np.triu_indices(n_nodes, k=1)
+    pair = result.distances[sl][:, iu, ju].reshape(-1)
+
+    dt = result.metadata["dt"]
+    centroid = result.positions[sl].mean(axis=1, keepdims=True)
+    v_full = np.linalg.norm(np.diff(result.positions[sl] - centroid, axis=0), axis=-1) / dt
+    v_lat = lateral_offset_speed(result, track)[idx_a : max(idx_b - 1, idx_a + 1)]
+    v_road = relative_speed(result)[idx_a : max(idx_b - 1, idx_a + 1)]
+
+    print(f"Statistiche del gruppo, finestra [{result.t[idx_a]:.0f}, {result.t[idx_b - 1]:.0f}] s ({idx_b - idx_a} campioni):")
+    print(f"  sigma_long = {result.metadata['sigma_long']:.4f} m, sigma_lat = {result.metadata['sigma_lat']:.4f} m")
+    print(f"  estensione longitudinale: mediana {np.median(ext_long):.2f} m, p95 {np.percentile(ext_long, 95):.2f} m")
+    print(f"  estensione laterale:      mediana {np.median(ext_lat):.2f} m, p95 {np.percentile(ext_lat, 95):.2f} m")
+    print(
+        f"  distanza fra coppie: mediana {np.median(pair):.2f} m, p95 {np.percentile(pair, 95):.2f} m, "
+        f"p1 {np.percentile(pair, 1):.2f} m; campioni sotto 1 m: {int(np.sum(pair < 1.0))} su {len(pair)} "
+        f"({100 * np.mean(pair < 1.0):.4f} %)"
+    )
+    for label, v in (
+        ("2D rispetto al baricentro", v_full),
+        ("2D dello scostamento laterale", v_lat),
+        ("stradale (s, l)", v_road),
+    ):
+        print(f"  velocità {label}: p99 {np.percentile(v, 99):.2f} m/s, max {v.max():.2f} m/s")
+
+
+def _git_show(path: str) -> str:
+    return subprocess.run(
+        ["git", "-C", str(_REPO_ROOT), "show", f"{LEGACY_MOBILITY_COMMIT}:{path}"],
+        check=True,
+        capture_output=True,
+        text=True,
+    ).stdout
+
+
+def legacy_relative_speed(cfg: dict) -> np.ndarray:
+    """Velocità relativa al baricentro ottenuta col modulo e la configurazione
+    originali (OU del primo ordine, vincolo di distanza minima a proiezione),
+    letti dal commit `LEGACY_MOBILITY_COMMIT`. Stessa definizione di
+    `relative_speed`: coordinate stradali, passo dt. Solleva se git non è
+    disponibile.
+    """
+    import yaml
+
+    module = types.ModuleType("mobility_legacy")
+    sys.modules[module.__name__] = module
+    exec(compile(_git_show("src/mobility.py"), "mobility_legacy", "exec"), module.__dict__)
+
+    legacy_cfg = yaml.safe_load(_git_show("config/default.yaml"))
+    legacy_cfg["track"]["gpx_file"] = cfg["track"]["gpx_file"]
+    legacy_cfg["simulation"].update(cfg["simulation"])
+    legacy_cfg["separation"] = dict(cfg["separation"])
+    result = module.simulate_mobility(legacy_cfg)
+
+    track = module.load_track(legacy_cfg)
+    sample = track.query(result.s_nodes)
+    lateral = np.sum((result.positions - sample.position) * sample.normal, axis=-1)
+    dt = legacy_cfg["simulation"]["dt"]
+    rel_long = np.diff(result.s_nodes - result.s_centroid[:, None], axis=0) / dt
+    rel_lat = np.diff(lateral, axis=0) / dt
+    return np.hypot(rel_long, rel_lat)
+
+
+def plot_relative_speed(result, out_dir: Path, suffix: str, cfg: dict) -> dict:
+    """Distribuzione della velocità di ogni nodo relativa al baricentro,
+    misurata a passo dt, nella finestra di analisi (prima della separazione),
+    con `max_relative_speed_p99` tracciato. Se il modulo originale è
+    leggibile da git, ne sovrappone la distribuzione (prima/dopo).
+    Restituisce i 99° percentili, per la stampa a console.
+    """
+    idx_a, idx_b = _analysis_window(result, cfg)
+    v_new = relative_speed(result)[idx_a : max(idx_b - 1, idx_a + 1)].ravel()
+    limit = cfg["group"]["max_relative_speed_p99"]
+    p99 = {"dopo": float(np.percentile(v_new, 99))}
+
+    series = [("dopo (2° ordine + repulsione)", v_new, "tab:blue")]
+    try:
+        v_old_all = legacy_relative_speed(cfg)
+        v_old = v_old_all[idx_a : max(idx_b - 1, idx_a + 1)].ravel()
+        series.insert(0, ("prima (OU del 1° ordine + vincolo)", v_old, "tab:red"))
+        p99["prima"] = float(np.percentile(v_old, 99))
+    except (subprocess.CalledProcessError, FileNotFoundError) as exc:
+        print(f"confronto con il modulo originale saltato: {exc}")
+
+    bins = np.logspace(-2, np.log10(max(v.max() for _, v, _ in series) * 1.05), 80)
+    fig, ax = plt.subplots(figsize=(9, 5))
+    for label, v, color in series:
+        ax.hist(v, bins=bins, density=True, alpha=0.5, color=color,
+                label=f"{label}: p99 = {np.percentile(v, 99):.2f} m/s")
+    ax.axvline(limit, color="k", linestyle="--", label=f"max_relative_speed_p99 = {limit:g} m/s")
+    ax.set_xscale("log")
+    ax.set_xlabel("velocità relativa al baricentro [m/s] (scala log)")
+    ax.set_ylabel("densità")
+    ax.set_title(f"Velocità dei nodi relativa al baricentro, a passo dt — {len(v_new)} campioni")
+    ax.legend(fontsize=8)
+    fig.tight_layout()
+    fig.savefig(out_dir / f"relative_speed{suffix}.png", dpi=150)
+    plt.close(fig)
+    return p99
+
+
 def plot_speed_profile(track: Track, out_dir: Path, suffix: str) -> None:
     """Profilo di velocità lungo il percorso, grezzo e lisciato sovrapposti."""
     fig, ax = plt.subplots(figsize=(9, 4))
@@ -284,6 +410,10 @@ def main() -> None:
     if cfg["separation"]["enabled"]:
         plot_separation_detail(result, out_dir, suffix, cfg)
     plot_speed_profile(track, out_dir, suffix)
+    p99 = plot_relative_speed(result, out_dir, suffix, cfg)
+    print_group_stats(track, result, cfg)
+    for label, value in p99.items():
+        print(f"p99 della velocità relativa al baricentro, {label}: {value:.2f} m/s")
 
     print(f"Figure salvate in {out_dir} (suffisso '{suffix}')")
 

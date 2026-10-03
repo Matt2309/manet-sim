@@ -23,6 +23,7 @@ from typing import Union
 import numpy as np
 import yaml
 from scipy.integrate import quad
+from scipy.linalg import expm
 from scipy.ndimage import uniform_filter1d
 from scipy.optimize import brentq
 from scipy.stats import norm
@@ -65,6 +66,8 @@ class Track:
     n_points_raw: int
     n_points: int
     sample_rate: float
+    heading_s: np.ndarray  # punti medi dei segmenti, ascissa curvilinea
+    heading: np.ndarray  # angolo di direzione lisciato, srotolato, in radianti
 
     def query(self, s: Union[float, np.ndarray]) -> PathSample:
         """Interroga il percorso a una o più ascisse curvilinee.
@@ -72,8 +75,12 @@ class Track:
         Input: `s`, metri dall'inizio del percorso (scalare o array di
         qualunque forma). Valori fuori da [0, length] vengono bloccati ai
         capi, con un warning.
-        Procedimento: interpolazione lineare lungo la polilinea,
-        vettorializzata.
+        Procedimento: posizione e velocità per interpolazione lineare lungo
+        la polilinea, vettorializzata. Tangente e normale NON sono costanti
+        a tratti: l'angolo di direzione lisciato (`_smooth_heading`) è
+        interpolato linearmente in `s`, quindi il riferimento locale varia
+        con continuità anche ai vertici. La linea centrale resta quella
+        della polilinea.
         Output: `PathSample` con posizione, versore tangente, versore
         normale (a sinistra della marcia) e velocità del profilo GPX.
         """
@@ -102,10 +109,8 @@ class Track:
         pos_x = x0 + frac * (x1 - x0)
         pos_y = y0 + frac * (y1 - y0)
 
-        dx, dy = x1 - x0, y1 - y0
-        seg_norm = np.hypot(dx, dy)
-        seg_norm_safe = np.where(seg_norm > 0, seg_norm, 1.0)
-        tx, ty = dx / seg_norm_safe, dy / seg_norm_safe
+        theta = np.interp(clipped, self.heading_s, self.heading)
+        tx, ty = np.cos(theta), np.sin(theta)
         nx, ny = -ty, tx  # rotazione di +90°: normale verso sinistra
 
         speed = np.interp(clipped, self.s, self.speed)
@@ -118,6 +123,39 @@ class Track:
         if scalar_input:
             return PathSample(position[()], tangent[()], normal[()], speed[()])
         return PathSample(position, tangent, normal, speed)
+
+
+def _smooth_heading(
+    x: np.ndarray, y: np.ndarray, s: np.ndarray, width: float
+) -> tuple[np.ndarray, np.ndarray]:
+    """Angolo di direzione del percorso, continuo lungo l'ascissa curvilinea.
+
+    Input: x, y, s della polilinea e larghezza `width` (m) della media mobile.
+    Procedimento: l'angolo di ogni segmento è attribuito al suo punto medio e
+    srotolato con `np.unwrap`. La media mobile di larghezza `width` in `s` è
+    esatta anche con segmenti di lunghezza diversa: l'integrale Θ(s) di
+    un angolo costante a tratti è lineare a tratti (somma cumulata di
+    θ_j·lunghezza_j), quindi θ̄(s) = (Θ(s+w/2) − Θ(s−w/2)) / w. Oltre i capi
+    l'angolo è prolungato costante.
+    Output: punti medi dei segmenti e angolo lisciato in quei punti. I
+    segmenti di lunghezza nulla sono ignorati.
+    """
+    dx, dy, ds = np.diff(x), np.diff(y), np.diff(s)
+    valid = ds > 0
+    theta = np.unwrap(np.arctan2(dy[valid], dx[valid]))
+    edges = np.concatenate([[s[0]], s[1:][valid]])
+    length = np.diff(edges)
+    mid = (edges[:-1] + edges[1:]) / 2.0
+    cumulative = np.concatenate([[0.0], np.cumsum(theta * length)])
+
+    def integral(position: np.ndarray) -> np.ndarray:
+        inside = np.interp(position, edges, cumulative)
+        before = theta[0] * (position - edges[0])
+        after = cumulative[-1] + theta[-1] * (position - edges[-1])
+        return np.where(position < edges[0], before, np.where(position > edges[-1], after, inside))
+
+    smoothed = (integral(mid + width / 2.0) - integral(mid - width / 2.0)) / width
+    return mid, smoothed
 
 
 def _parse_gpx(path: Union[str, Path]) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
@@ -243,7 +281,11 @@ def load_track(cfg: dict) -> Track:
             f"{sample_rate} Hz potrebbe essere sbagliato per questo file."
         )
 
+    heading_s, heading = _smooth_heading(x, y, s, track_cfg["heading_smoothing"])
+
     return Track(
+        heading_s=heading_s,
+        heading=heading,
         x=x,
         y=y,
         s=s,
@@ -259,39 +301,71 @@ def load_track(cfg: dict) -> Track:
 
 
 # ---------------------------------------------------------------------------
-# Processo di Ornstein-Uhlenbeck (scostamenti dei nodi)
+# Processo del secondo ordine a smorzamento critico (scostamenti dei nodi)
 # ---------------------------------------------------------------------------
 
 
-def ou_process(
+def _exact_discretization(dt: float, tau: float) -> tuple[np.ndarray, np.ndarray]:
+    """Discretizzazione esatta del sistema a 2 stati (posizione, velocità).
+
+    Input: passo `dt` e costante di tempo `tau`.
+    Procedimento: A = [[0, 1], [-1/tau^2, -2/tau]], rumore solo sulla
+    velocità con intensità q^2 = 4/tau^3 (cioè sigma = 1). Matrice di
+    transizione Phi = expm(A·dt); covarianza del rumore Qd con il metodo di
+    Van Loan, sull'esponenziale della matrice a blocchi
+    [[-A, G q^2 G^T], [0, A^T]]·dt. Per una sigma qualunque Qd scala con
+    sigma^2, quindi il fattore di Cholesky scala con sigma.
+    Output: Phi (2, 2) e fattore di Cholesky triangolare inferiore di Qd per
+    sigma = 1.
+    """
+    a_mat = np.array([[0.0, 1.0], [-1.0 / tau**2, -2.0 / tau]])
+    q_mat = np.array([[0.0, 0.0], [0.0, 4.0 / tau**3]])
+
+    van_loan = np.zeros((4, 4))
+    van_loan[:2, :2] = -a_mat
+    van_loan[:2, 2:] = q_mat
+    van_loan[2:, 2:] = a_mat.T
+    blocks = expm(van_loan * dt)
+    phi = blocks[2:, 2:].T
+    qd = phi @ blocks[:2, 2:]
+    qd = (qd + qd.T) / 2.0
+    return phi, np.linalg.cholesky(qd + 1e-15 * np.eye(2))
+
+
+def critically_damped_process(
     n_steps: int,
     dt: float,
     tau: float,
     sigma: float,
     rng: np.random.Generator,
     size: int = 1,
-) -> np.ndarray:
-    """Genera realizzazioni indipendenti di un processo di Ornstein-Uhlenbeck.
+) -> tuple[np.ndarray, np.ndarray]:
+    """Genera realizzazioni indipendenti di un processo del secondo ordine
+    a smorzamento critico (due stadi OU in cascata con la stessa `tau`).
 
-    Input: numero di passi, passo `dt`, tempo di correlazione `tau`,
-    deviazione standard a regime `sigma`, generatore `rng`, numero di
-    realizzazioni `size`.
-    Procedimento: discretizzazione esatta (valida per qualunque `dt`):
-        a = exp(-dt/tau)
-        X[k+1] = a*X[k] + sigma*sqrt(1-a^2)*N(0,1)
-    Lo stato iniziale è estratto dalla distribuzione stazionaria
-    N(0, sigma^2), non posto a zero, per non "aprire" il gruppo nei primi
-    secondi.
-    Output: array di forma (n_steps, size).
+    Input: numero di passi, passo `dt`, costante di tempo `tau`, deviazione
+    standard stazionaria della posizione `sigma`, generatore `rng`, numero
+    di realizzazioni `size`.
+    Procedimento: equazione x'' + (2/tau)·x' + x/tau^2 = rumore bianco.
+    Varianze stazionarie: var(x) = sigma^2, var(v) = sigma^2/tau^2, covarianza
+    nulla; autocorrelazione della posizione (1 + |t|/tau)·exp(-|t|/tau).
+    Discretizzazione esatta (vedi `_exact_discretization`), valida per
+    qualunque `dt`. Lo stato iniziale è estratto dalla covarianza stazionaria
+    congiunta, non posto a zero.
+    Output: (x, v), ciascuno di forma (n_steps, size). La posizione è
+    derivabile, quindi `v` è la velocità regolare dello scostamento.
+    È il processo lineare "libero": la dinamica del gruppo, con la repulsione
+    fra i corridori, sta in `simulate_group_offsets`.
     """
-    a = math.exp(-dt / tau)
-    noise_std = sigma * math.sqrt(max(1.0 - a**2, 0.0))
+    phi, chol = _exact_discretization(dt, tau)
+    noise_factor = sigma * chol
 
-    x = np.empty((n_steps, size))
-    x[0] = rng.normal(0.0, sigma, size=size)
+    stationary_std = np.array([sigma, sigma / tau])  # covarianza stazionaria diagonale
+    state = np.empty((n_steps, 2, size))
+    state[0] = stationary_std[:, None] * rng.standard_normal((2, size))
     for k in range(1, n_steps):
-        x[k] = a * x[k - 1] + noise_std * rng.normal(0.0, 1.0, size=size)
-    return x
+        state[k] = phi @ state[k - 1] + noise_factor @ rng.standard_normal((2, size))
+    return state[:, 0, :], state[:, 1, :]
 
 
 @lru_cache(maxsize=None)
@@ -336,92 +410,183 @@ def range_statistic_of_normals(n: int, statistic: str = "mean", integration_limi
 
 
 # ---------------------------------------------------------------------------
-# Vincolo di distanza minima fra nodi
+# Dinamica del gruppo: processo del secondo ordine più repulsione fra corridori
 # ---------------------------------------------------------------------------
 
 
-def _random_gap_margin(
-    rng: np.random.Generator,
+@dataclass
+class GroupOffsets:
+    """Scostamenti dei nodi dal baricentro, con le velocità."""
+
+    long: np.ndarray  # (n_steps, size, N) scostamento longitudinale
+    lat: np.ndarray  # (n_steps, size, N) scostamento laterale
+    vel_long: np.ndarray  # (n_steps, size, N) velocità longitudinale relativa
+    vel_lat: np.ndarray  # (n_steps, size, N) velocità laterale relativa
+
+
+def _straight_frame(s: np.ndarray) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+    """Sistema di riferimento di una strada rettilinea: posizione (s, 0),
+    tangente +x, normale +y. Serve alla calibrazione, che non ha percorso.
+    """
+    zero = np.zeros_like(s)
+    one = np.ones_like(s)
+    return (
+        np.stack([s, zero], axis=-1),
+        np.stack([one, zero], axis=-1),
+        np.stack([zero, one], axis=-1),
+    )
+
+
+def _repulsion_force(positions: np.ndarray, min_gap: float, strength: float, scale: float, action_distance: float) -> np.ndarray:
+    """Forza repulsiva (accelerazione) fra tutte le coppie di nodi, nel piano.
+
+    Input: posizioni (size, N, 2), distanza minima `min_gap`, `strength` A
+    (m/s^2), `scale` B (m), `action_distance` R (m).
+    Procedimento: per ogni coppia, modulo
+        f(d) = A·(exp((g - d)/B) - exp((g - R)/B))   per d < R, altrimenti 0
+    diretto lungo la congiungente, verso l'allontanamento. Il termine
+    sottratto annulla la forza esattamente in R, quindi f è continua ovunque
+    e senza gradini. A d = 0 la forza resta finita (A·exp(g/B)); per due nodi
+    coincidenti la direzione è indefinita e si spinge lungo +x.
+    Output: forza risultante su ogni nodo (size, N, 2).
+    """
+    diff = positions[:, :, None, :] - positions[:, None, :, :]  # (size, i, j, 2): da j verso i
+    dist = np.linalg.norm(diff, axis=-1)
+    magnitude = strength * (np.exp((min_gap - dist) / scale) - np.exp((min_gap - action_distance) / scale))
+    n_nodes = positions.shape[1]
+    active = (dist < action_distance) & ~np.eye(n_nodes, dtype=bool)[None]
+    magnitude = np.where(active, magnitude, 0.0)
+
+    safe = np.where(dist > 1e-9, dist, 1.0)
+    unit = np.where((dist > 1e-9)[..., None], diff / safe[..., None], np.array([1.0, 0.0]))
+    return np.sum(magnitude[..., None] * unit, axis=2)
+
+
+def simulate_group_offsets(
     n_steps: int,
-    n_nodes: int,
-    tau: float,
     dt: float,
-    softness: float,
-) -> np.ndarray:
-    """Margine casuale da sommare a `min_node_gap`.
+    tau_long: float,
+    tau_lat: float,
+    sigma_long: float,
+    sigma_lat: float,
+    rng: np.random.Generator,
+    n_nodes: int,
+    repulsion: Union[dict, None] = None,
+    size: int = 1,
+    s_centroid: Union[np.ndarray, None] = None,
+    path_frame=None,
+    warmup_steps: int = 0,
+    detach: Union[dict, None] = None,
+) -> GroupOffsets:
+    """Dinamica degli scostamenti dei nodi: UNICA funzione usata sia dalla
+    simulazione sia dalla calibrazione di `sigma_long` e `sigma_lat`.
 
-    Input: generatore, numero di passi e di nodi, `tau`, `dt`, `softness`
-    (sigma del margine).
-    Procedimento: per ciascuna coppia di nodi, `|X(t)|` con `X` processo
-    OU indipendente (stesso `tau` del gruppo, tramite `ou_process`).
-    Output: matrice simmetrica (n_steps, n_nodes, n_nodes) con diagonale
-    nulla (tutta zero se `softness` <= 0).
+    Input: numero di passi registrati, `dt`, costanti di tempo longitudinale
+    `tau_long` e laterale `tau_lat`, sigma longitudinale e laterale della
+    posizione, generatore `rng`, numero di nodi, parametri
+    della repulsione `repulsion` (dizionario con `min_gap`, `strength`,
+    `scale`, `action_distance`; None = nodi indipendenti), numero di gruppi
+    indipendenti `size`, ascissa del baricentro `s_centroid` (n_steps,),
+    funzione `path_frame(s) -> (posizione, tangente, normale)` (None = strada
+    rettilinea), passi di riscaldamento `warmup_steps` scartati, e
+    `detach` (None oppure dizionario con `node`, `start` e `increment`, vedi
+    sotto).
+    Procedimento: ogni scostamento, longitudinale e laterale, segue il sistema
+    lineare a 2 stati di `critically_damped_process`, con la propria costante
+    di tempo. Le due sono diverse: il riallineamento laterale, cioè tornare
+    sulla propria linea dopo una schivata, è molto più rapido della deriva
+    longitudinale rispetto al gruppo; con la stessa tau un calcio laterale
+    della repulsione persisterebbe per decine di secondi e l'estensione
+    laterale non sarebbe più calibrabile. A ogni passo, per
+    l'intero gruppo: (1) si calcolano le posizioni nel piano (punto del
+    percorso più scostamento laterale lungo la normale); (2) la forza di
+    repulsione fra le coppie, calcolata nel piano lungo la congiungente, si
+    proietta sulla tangente e sulla normale locali di ciascun nodo e si somma
+    alla velocità come impulso `F·dt` (Eulero semi-implicito: la velocità si
+    aggiorna prima della posizione); (3) lo stato avanza con la
+    discretizzazione esatta della parte lineare. L'esattezza vale SOLO per la
+    parte lineare: la forza è integrata a passo `dt`. Lo stato iniziale è
+    estratto dalla covarianza stazionaria del processo libero; il
+    riscaldamento lascia che la repulsione porti il gruppo alla propria
+    distribuzione.
+    Nodo separato: da `detach["start"]` lo scostamento longitudinale del nodo
+    `detach["node"]` non ha più il richiamo né il rumore del gruppo: avanza
+    con `detach["increment"][k]` (metri per passo, relativi al baricentro) e
+    subisce comunque la forza (risposta lineare smorzata, senza rumore), ed è
+    sorgente di forza per gli altri. La repulsione non lo trattiene.
+    Output: `GroupOffsets`, ogni array di forma (n_steps, size, n_nodes).
     """
-    if softness <= 0.0:
-        return np.zeros((n_steps, n_nodes, n_nodes))
+    frame = path_frame if path_frame is not None else _straight_frame
+    phi_long, chol_long = _exact_discretization(dt, tau_long)
+    phi_lat, chol_lat = _exact_discretization(dt, tau_lat)
 
-    iu, ju = np.triu_indices(n_nodes, k=1)
-    n_pairs = len(iu)
-    raw = ou_process(n_steps, dt, tau, softness, rng, size=n_pairs)
+    def per_axis(long_value: float, lat_value: float) -> np.ndarray:
+        return np.array([long_value, lat_value]).reshape(2, 1, 1)
 
-    margin = np.zeros((n_steps, n_nodes, n_nodes))
-    margin[:, iu, ju] = np.abs(raw)
-    margin[:, ju, iu] = np.abs(raw)
-    return margin
+    p00 = per_axis(phi_long[0, 0], phi_lat[0, 0])
+    p01 = per_axis(phi_long[0, 1], phi_lat[0, 1])
+    p10 = per_axis(phi_long[1, 0], phi_lat[1, 0])
+    p11 = per_axis(phi_long[1, 1], phi_lat[1, 1])
+    c00 = per_axis(chol_long[0, 0], chol_lat[0, 0])
+    c10 = per_axis(chol_long[1, 0], chol_lat[1, 0])
+    c11 = per_axis(chol_long[1, 1], chol_lat[1, 1])
+    tau = per_axis(tau_long, tau_lat)
+    s_c = np.zeros(n_steps) if s_centroid is None else np.asarray(s_centroid, dtype=float)
 
+    sigma = np.empty((2, size, n_nodes))
+    sigma[0], sigma[1] = sigma_long, sigma_lat
+    x = sigma * rng.standard_normal((2, size, n_nodes))
+    v = sigma / tau * rng.standard_normal((2, size, n_nodes))
+    base = np.zeros((size, n_nodes))  # deriva deterministica del nodo separato
 
-def _enforce_min_distance(
-    off_long: np.ndarray,
-    off_lat: np.ndarray,
-    min_gap: float,
-    margin: np.ndarray,
-    tolerance: float,
-    max_iterations: int,
-) -> tuple[np.ndarray, np.ndarray, np.ndarray, float]:
-    """Impone una distanza euclidea minima fra tutti i nodi, a ogni istante.
+    out_long = np.empty((n_steps, size, n_nodes))
+    out_lat = np.empty_like(out_long)
+    out_vlong = np.empty_like(out_long)
+    out_vlat = np.empty_like(out_long)
 
-    Input: scostamenti longitudinali `off_long` e laterali `off_lat`
-    (T, N), distanza minima `min_gap`, `margin` casuale, `tolerance`,
-    `max_iterations`.
-    Procedimento: rilassamento a "sfere soffici" nel piano delle
-    coordinate stradali; a ogni iterazione le coppie più vicine del
-    bersaglio (`min_gap + margin`) vengono allontanate simmetricamente
-    lungo la congiungente, fino a violazione residua sotto `tolerance` o
-    `max_iterations`. Vettorializzato su tutti gli istanti (nessun ciclo
-    su T).
-    Output: scostamenti corretti (off_long, off_lat), spostamento indotto
-    per nodo-istante (diagnostica di quanto il vincolo perturba la
-    formazione) e violazione residua massima.
-    """
-    s = off_long.copy()
-    l = off_lat.copy()
-    n_nodes = s.shape[1]
-    eye = np.eye(n_nodes, dtype=bool)[None, :, :]
-    target = min_gap + margin
+    for step in range(warmup_steps + n_steps):
+        k = step - warmup_steps  # indice registrato; negativo durante il riscaldamento
+        kc = max(k, 0)
 
-    for _ in range(max_iterations):
-        ds = s[:, :, None] - s[:, None, :]
-        dl = l[:, :, None] - l[:, None, :]
-        d = np.hypot(ds, dl)
-        overlap = (d < target - tolerance) & ~eye
-        if not overlap.any():
+        if detach is not None and k >= 0:
+            node = detach["node"]
+            if k == detach["start"]:
+                base[:, node] = x[0, :, node]
+                x[0, :, node] = 0.0
+                v[0, :, node] = 0.0
+                sigma[0, :, node] = 0.0
+            elif k > detach["start"]:
+                base[:, node] += detach["increment"][k]
+
+        if k >= 0:
+            out_long[k] = x[0] + base
+            out_lat[k] = x[1]
+            out_vlong[k] = v[0]
+            out_vlat[k] = v[1]
+
+        if repulsion is not None:
+            s = s_c[kc] + x[0] + base
+            position, tangent, normal = frame(s)
+            position = position + x[1][..., None] * normal
+            force = _repulsion_force(
+                position,
+                repulsion["min_gap"],
+                repulsion["strength"],
+                repulsion["scale"],
+                repulsion["action_distance"],
+            )
+            v[0] += np.sum(force * tangent, axis=-1) * dt
+            v[1] += np.sum(force * normal, axis=-1) * dt
+
+        if k == n_steps - 1:
             break
 
-        d_safe = np.where(d > 1e-9, d, 1.0)
-        ux = np.where(d > 1e-9, ds / d_safe, 1.0)  # fallback se d=0: spinta lungo +s
-        uy = np.where(d > 1e-9, dl / d_safe, 0.0)
-        push = np.where(overlap, (target - d) / 2.0, 0.0)
+        z = rng.standard_normal((2, 2, size, n_nodes))
+        noise_x = sigma * c00 * z[0]
+        noise_v = sigma * (c10 * z[0] + c11 * z[1])
+        x, v = p00 * x + p01 * v + noise_x, p10 * x + p11 * v + noise_v
 
-        s = s + (push * ux).sum(axis=2)
-        l = l + (push * uy).sum(axis=2)
-
-    ds = s[:, :, None] - s[:, None, :]
-    dl = l[:, :, None] - l[:, None, :]
-    d = np.hypot(ds, dl)
-    residual = float(np.max(np.where(~eye, target - d, 0.0)))
-
-    displacement = np.hypot(s - off_long, l - off_lat)
-    return s, l, displacement, residual
+    return GroupOffsets(long=out_long, lat=out_lat, vel_long=out_vlong, vel_lat=out_vlat)
 
 
 @lru_cache(maxsize=None)
@@ -430,32 +595,34 @@ def calibrate_spread_sigmas(
     statistic: str,
     longitudinal_spread: float,
     lateral_spread: float,
-    min_node_gap: float,
-    min_gap_softness: float,
-    tau: float,
+    tau_long: float,
+    tau_lat: float,
     dt: float,
-    calib_samples: int,
+    repulsion: tuple,
+    warmup_steps: int,
+    calib_groups: int,
+    calib_steps: int,
     calib_seed: int,
     calib_max_iterations: int,
     calib_tolerance: float,
-    min_gap_tolerance: float,
-    min_gap_max_iterations: int,
 ) -> tuple[float, float]:
-    """Calibra `sigma_long` e `sigma_lat` del processo OU.
+    """Calibra `sigma_long` e `sigma_lat` del processo degli scostamenti.
 
     Input: numero di nodi, `statistic` ("mean" o "pNN"), spread
-    longitudinale e laterale desiderati, parametri del vincolo di distanza
-    minima (gap, softness, tolleranza, iterazioni), `tau`, `dt` e
-    parametri della calibrazione (campioni, seed, iterazioni, tolleranza).
+    longitudinale e laterale desiderati, `tau_long`, `tau_lat`, `dt`, parametri della
+    repulsione come tupla (min_gap, strength, scale, action_distance),
+    passi di riscaldamento e parametri della calibrazione (gruppi
+    indipendenti, passi, seme, iterazioni, tolleranza).
     Procedimento: sigma iniziale = spread / `range_statistic_of_normals`
-    (esatto senza vincolo); poi punto fisso su `calib_samples` campioni
-    i.i.d. N(0, sigma^2) (le marginali stazionarie dell'OU): si applica
-    `_enforce_min_distance`, si misura la statistica osservata e si
-    riscala sigma finché l'errore relativo scende sotto `calib_tolerance`.
-    Il risultato è in cache (tipicamente poche iterazioni, sotto il
-    secondo).
-    Output: (sigma_long, sigma_lat) tali che, DOPO il vincolo, l'estensione
-    testa-coda osservata valga gli spread richiesti.
+    (esatto senza repulsione); poi punto fisso: si simula con
+    `simulate_group_offsets` (la stessa funzione della simulazione, su una
+    strada rettilinea) `calib_groups` gruppi indipendenti, si misura la
+    statistica dell'estensione testa-coda osservata e si riscala sigma finché
+    l'errore relativo scende sotto `calib_tolerance`. Ogni iterazione usa lo
+    stesso seme, quindi gli stessi numeri casuali: il punto fisso è
+    deterministico. Il risultato è in cache.
+    Output: (sigma_long, sigma_lat) tali che, CON la repulsione, l'estensione
+    osservata valga gli spread richiesti.
     """
     k = range_statistic_of_normals(n_nodes, statistic)
     sigma_long = longitudinal_spread / k
@@ -463,18 +630,25 @@ def calibrate_spread_sigmas(
 
     is_percentile = statistic != "mean"
     q = float(statistic[1:]) if is_percentile else None
-
-    rng = np.random.default_rng(calib_seed)
-    z_long = rng.standard_normal((calib_samples, n_nodes))
-    z_lat = rng.standard_normal((calib_samples, n_nodes))
-    margin = _random_gap_margin(rng, calib_samples, n_nodes, tau, dt, min_gap_softness)
+    repulsion_cfg = dict(zip(("min_gap", "strength", "scale", "action_distance"), repulsion))
 
     for _ in range(calib_max_iterations):
-        s, l, _, _ = _enforce_min_distance(
-            z_long * sigma_long, z_lat * sigma_lat, min_node_gap, margin, min_gap_tolerance, min_gap_max_iterations
+        rng = np.random.default_rng(calib_seed)
+        offsets = simulate_group_offsets(
+            calib_steps,
+            dt,
+            tau_long,
+            tau_lat,
+            sigma_long,
+            sigma_lat,
+            rng,
+            n_nodes,
+            repulsion=repulsion_cfg,
+            size=calib_groups,
+            warmup_steps=warmup_steps,
         )
-        ext_long = s.max(axis=1) - s.min(axis=1)
-        ext_lat = l.max(axis=1) - l.min(axis=1)
+        ext_long = (offsets.long.max(axis=2) - offsets.long.min(axis=2)).ravel()
+        ext_lat = (offsets.lat.max(axis=2) - offsets.lat.min(axis=2)).ravel()
         obs_long = float(np.percentile(ext_long, q)) if is_percentile else float(ext_long.mean())
         obs_lat = float(np.percentile(ext_lat, q)) if is_percentile else float(ext_lat.mean())
 
@@ -503,7 +677,44 @@ class MobilityResult:
     s_nodes: np.ndarray  # (T, N) ascissa curvilinea di ogni nodo
     s_centroid: np.ndarray  # (T,) ascissa curvilinea del baricentro
     distances: np.ndarray  # (T, N, N) distanze euclidee fra tutte le coppie
+    headings: np.ndarray  # (T, N, 2) versore tangente del percorso, direzione di marcia
+    lateral_offsets: np.ndarray  # (T, N) scostamento laterale dal percorso, dopo il vincolo
     metadata: dict
+
+
+def relative_speed(result: MobilityResult) -> np.ndarray:
+    """Velocità di ogni nodo relativa al baricentro, a passo `dt`.
+
+    Input: `MobilityResult`.
+    Procedimento: in coordinate stradali, `hypot(d(s_i - s_c)/dt, d(l_i)/dt)`.
+    Si evita la differenza in 2D perché nelle curve un nodo davanti al
+    baricentro ha direzione di marcia diversa: ne risulterebbe una velocità
+    relativa apparente del tutto fisica, che non è il rumore da misurare.
+    Output: array (T-1, N) in m/s.
+    """
+    dt = result.metadata["dt"]
+    rel_long = np.diff(result.s_nodes - result.s_centroid[:, None], axis=0) / dt
+    rel_lat = np.diff(result.lateral_offsets, axis=0) / dt
+    return np.hypot(rel_long, rel_lat)
+
+
+def lateral_offset_speed(result: MobilityResult, track: Track) -> np.ndarray:
+    """Velocità 2D dello scostamento laterale di ogni nodo, a passo `dt`.
+
+    Input: `MobilityResult` e la `Track` da cui proviene.
+    Procedimento: derivata a passo `dt` del vettore `positions − linea
+    centrale(s_nodes)`, cioè del solo scostamento laterale, misurato nel
+    piano. Non si usa la velocità 2D rispetto al baricentro delle posizioni:
+    in curva include la rotazione rigida del gruppo (un nodo davanti al
+    baricentro ha direzione di marcia diversa), che dipende dalla geometria
+    e non dal rumore; resta ~1-3 m/s anche con scostamenti laterali nulli.
+    Questa misura isola ciò che il riferimento locale può rompere: i salti
+    dello scostamento quando tangente e normale cambiano di colpo.
+    Output: array (T-1, N) in m/s.
+    """
+    dt = result.metadata["dt"]
+    offset = result.positions - track.query(result.s_nodes).position
+    return np.linalg.norm(np.diff(offset, axis=0), axis=-1) / dt
 
 
 def load_config(config: Union[str, Path, dict]) -> dict:
@@ -574,16 +785,27 @@ def _plausible_speed_floor(track: Track) -> float:
     return max(float(np.percentile(track.speed, 10)), 1e-3)
 
 
+def _repulsion_config(group_cfg: dict) -> dict:
+    """Parametri della repulsione dal blocco `group` della configurazione."""
+    rep = group_cfg["repulsion"]
+    return {
+        "min_gap": group_cfg["min_node_gap"],
+        "strength": rep["strength"],
+        "scale": rep["scale"],
+        "action_distance": rep["action_distance"],
+    }
+
+
 def simulate_mobility(config: Union[str, Path, dict]) -> MobilityResult:
     """Esegue la simulazione di mobilità del Blocco 1.
 
     Input: percorso di un file YAML o configurazione già caricata.
     Procedimento: validazione della formazione, calibrazione degli sigma,
-    caricamento della traccia, moto del baricentro, scostamenti OU dei
-    nodi, eventuale separazione di un nodo, vincolo di distanza minima,
-    proiezione sul percorso. Il generatore casuale è unico
-    (`default_rng(seed)`) e passato esplicitamente, mai `np.random`
-    globale, per la riproducibilità.
+    caricamento della traccia, moto del baricentro, dinamica degli scostamenti
+    dei nodi (processo del secondo ordine con repulsione fra i corridori,
+    eventuale separazione di un nodo) in `simulate_group_offsets`, proiezione
+    sul percorso. Il generatore casuale è unico (`default_rng(seed)`) e
+    passato esplicitamente, mai `np.random` globale, per la riproducibilità.
     Output: `MobilityResult`.
     """
     cfg = load_config(config)
@@ -598,18 +820,19 @@ def simulate_mobility(config: Union[str, Path, dict]) -> MobilityResult:
 
     n_nodes = group_cfg["n_nodes"]
     tau = group_cfg["correlation_time"]
+    tau_lat = group_cfg["lateral_correlation_time"]
     spread_statistic = group_cfg["spread_statistic"]
     longitudinal_spread = group_cfg["longitudinal_spread"]
     lateral_spread = group_cfg["lateral_spread"]
     min_node_gap = group_cfg["min_node_gap"]
-    min_gap_tolerance = group_cfg["min_gap_tolerance"]
-    min_gap_max_iterations = group_cfg["min_gap_max_iterations"]
     margin_sigmas = group_cfg["margin_sigmas"]
     calib_cfg = group_cfg["calibration"]
+    repulsion = _repulsion_config(group_cfg)
+    warmup_steps = int(round(group_cfg["warmup_taus"] * max(tau, tau_lat) / dt))
 
     # Input: spread e min_node_gap. Procedimento: la formazione deve poter
-    # contenere n_nodes distanziati almeno min_node_gap, altrimenti il
-    # vincolo domina la dinamica. Output: errore se lo spread è troppo piccolo.
+    # contenere n_nodes distanziati almeno min_node_gap, altrimenti la
+    # repulsione domina la dinamica. Output: errore se lo spread è troppo piccolo.
     min_required_spread = (n_nodes - 1) * min_node_gap * group_cfg["spread_margin_factor"]
     if longitudinal_spread <= min_required_spread:
         raise ValueError(
@@ -619,25 +842,24 @@ def simulate_mobility(config: Union[str, Path, dict]) -> MobilityResult:
             f"serve longitudinal_spread > {min_required_spread:.2f} m."
         )
 
-    # Input: spread desiderati e parametri del vincolo. Procedimento:
-    # calibrazione sull'estensione osservata DOPO il vincolo (dividere per
-    # range_statistic_of_normals non basta: con min_node_gap vicino allo
-    # spread il vincolo è il regime dominante). Output: sigma_long, sigma_lat.
+    # Input: spread desiderati e parametri della repulsione. Procedimento:
+    # calibrazione sull'estensione osservata CON la repulsione (dividere per
+    # range_statistic_of_normals non basta). Output: sigma_long, sigma_lat.
     sigma_long, sigma_lat = calibrate_spread_sigmas(
         n_nodes,
         spread_statistic,
         longitudinal_spread,
         lateral_spread,
-        min_node_gap,
-        group_cfg["min_gap_softness"],
         tau,
+        tau_lat,
         dt,
-        calib_cfg["samples"],
+        tuple(repulsion[key] for key in ("min_gap", "strength", "scale", "action_distance")),
+        warmup_steps,
+        calib_cfg["groups"],
+        int(round(calib_cfg["duration"] / dt)),
         calib_cfg["seed"],
         calib_cfg["max_iterations"],
         calib_cfg["tolerance"],
-        min_gap_tolerance,
-        min_gap_max_iterations,
     )
 
     # Input: start_offset, end_margin, sigma_long. Procedimento: devono
@@ -672,86 +894,77 @@ def simulate_mobility(config: Union[str, Path, dict]) -> MobilityResult:
     n_steps = len(s_centroid)
     t = np.arange(n_steps) * dt
 
-    off_long = ou_process(n_steps, dt, tau, sigma_long, rng, size=n_nodes)
-    off_lat = ou_process(n_steps, dt, tau, sigma_lat, rng, size=n_nodes)
-
-    # Input: ascissa del baricentro e scostamenti OU. Procedimento: ogni
-    # nodo ha una propria ascissa curvilinea, non uno scostamento euclideo;
-    # così in una curva a gomito il nodo in coda resta dietro l'angolo e si
-    # riproduce la perdita di visibilità, caso d'uso principale. Output:
-    # s_nodes ideale (non ancora vincolato).
-    s_nodes = s_centroid[:, None] + off_long  # (T, N), traiettoria "ideale" (non ancora vincolata)
-
     separation_enabled = bool(sep_cfg["enabled"])
     node_id = sep_cfg["node_id"] if separation_enabled else None
     idx_start = int(np.searchsorted(t, sep_cfg["start_time"])) if separation_enabled else None
 
+    # Input: nodo separato, start_time, ramp_duration, target_speed.
+    # Procedimento: dopo start_time il nodo lascia il baricentro con una
+    # rampa lineare dalla velocità di gruppo a target_speed, che parte dal
+    # valore che aveva nel gruppo, senza discontinuità. `increment[k]` è
+    # l'avanzamento per passo rispetto al baricentro, cioè
+    # alpha·(target_speed - v_gruppo)·dt. Output: dizionario per
+    # `simulate_group_offsets`, o None.
+    detach = None
     if separation_enabled and idx_start < n_steps:
         start_time = sep_cfg["start_time"]
-        ramp_duration = sep_cfg["ramp_duration"]
-        target_speed = sep_cfg["target_speed"]
+        increment = np.zeros(n_steps)
+        for k in range(idx_start + 1, n_steps):
+            alpha = min(max((t[k - 1] - start_time) / sep_cfg["ramp_duration"], 0.0), 1.0)
+            v_group = track.query(s_centroid[k - 1]).speed
+            increment[k] = alpha * (sep_cfg["target_speed"] - v_group) * dt
+        detach = {"node": node_id, "start": idx_start, "increment": increment}
 
-        # Input: nodo separato, start_time, ramp_duration, target_speed.
-        # Procedimento: dopo start_time il nodo lascia il baricentro e
-        # integra la propria ascissa con una rampa lineare dalla velocità di
-        # gruppo a target_speed (parte dal valore che aveva nel gruppo, senza
-        # discontinuità). Lo scostamento OU longitudinale del nodo viene
-        # ignorato da qui in poi. Output: s_nodes[:, node_id] sovrascritto;
-        # il vincolo di distanza minima è applicato dopo, sulla traiettoria
-        # reale (rampa inclusa).
-        s_sep = s_nodes[idx_start, node_id]
-        for k in range(idx_start, n_steps):
-            if k > idx_start:
-                alpha = min(max((t[k - 1] - start_time) / ramp_duration, 0.0), 1.0)
-                v_group = track.query(s_centroid[k - 1]).speed
-                v = (1.0 - alpha) * v_group + alpha * target_speed
-                s_sep = s_sep + v * dt
-            s_nodes[k, node_id] = s_sep
+    def path_frame(s: np.ndarray):
+        with warnings.catch_warnings():
+            warnings.simplefilter("ignore")  # il clamp ai capi viene segnalato più sotto
+            sample = track.query(s)
+        return sample.position, sample.tangent, sample.normal
 
-    # Input: s_nodes (rampa inclusa), off_lat, margine casuale.
-    # Procedimento: vincolo di distanza minima (i corridori non si
-    # compenetrano) applicato SEMPRE a tutti i nodi e istanti, sulla
-    # traiettoria REALE del nodo separato e non su quella ideale: se
-    # applicato prima della rampa, questa lo scavalcherebbe subito dopo
-    # start_time, quando il nodo è ancora dentro il gruppo. È puramente
-    # repulsivo, quindi inerte quando il nodo si allontana.
-    # Output: s_nodes e off_lat corretti, spostamento indotto e residuo.
-    off_long_effective = s_nodes - s_centroid[:, None]
-    margin = _random_gap_margin(rng, n_steps, n_nodes, tau, dt, group_cfg["min_gap_softness"])
-    off_long_effective, off_lat, min_gap_displacement, min_gap_residual = _enforce_min_distance(
-        off_long_effective, off_lat, min_node_gap, margin, min_gap_tolerance, min_gap_max_iterations
+    # Input: ascissa del baricentro, sigma, parametri della repulsione.
+    # Procedimento: ogni nodo ha una propria ascissa curvilinea, non uno
+    # scostamento euclideo; così in una curva a gomito il nodo in coda
+    # resta dietro l'angolo e si riproduce la perdita di visibilità, caso
+    # d'uso principale. La repulsione, calcolata nel piano, impedisce che i
+    # corridori si compenetrino e agisce SEMPRE su tutti i nodi, separato
+    # incluso. Output: scostamenti longitudinale e laterale.
+    offsets = simulate_group_offsets(
+        n_steps,
+        dt,
+        tau,
+        tau_lat,
+        sigma_long,
+        sigma_lat,
+        rng,
+        n_nodes,
+        repulsion=repulsion,
+        s_centroid=s_centroid,
+        path_frame=path_frame,
+        warmup_steps=warmup_steps,
+        detach=detach,
     )
-    s_nodes = s_centroid[:, None] + off_long_effective
+    off_long = offsets.long[:, 0, :]
+    off_lat = offsets.lat[:, 0, :]
+    s_nodes = s_centroid[:, None] + off_long
 
     s_nodes_before_clip = s_nodes
     s_nodes = np.clip(s_nodes, 0.0, track.length)
     if not np.array_equal(s_nodes_before_clip, s_nodes):
         warnings.warn(
-            "s_nodes conteneva valori fuori da [0, length] dopo i vincoli di "
-            "margine e distanza minima: valori clampati. Con start_offset/"
-            "end_margin validati contro sigma_long non dovrebbe accadere; "
-            "verificare la configurazione."
+            "s_nodes conteneva valori fuori da [0, length]: valori clampati. Con "
+            "start_offset/end_margin validati contro sigma_long non dovrebbe "
+            "accadere; verificare la configurazione."
         )
 
     flat_sample = track.query(s_nodes.reshape(-1))
     base_position = flat_sample.position.reshape(n_steps, n_nodes, 2)
     normal = flat_sample.normal.reshape(n_steps, n_nodes, 2)
+    headings = flat_sample.tangent.reshape(n_steps, n_nodes, 2)
     positions = base_position + off_lat[:, :, None] * normal
 
     diff = positions[:, :, None, :] - positions[:, None, :, :]
     distances = np.linalg.norm(diff, axis=-1)
     min_pair_distance = float(np.min(distances + np.eye(n_nodes)[None, :, :] * 1e9))
-
-    min_gap_displacement_mean = float(np.mean(min_gap_displacement))
-    min_gap_displacement_p95 = float(np.percentile(min_gap_displacement, 95))
-    if min_gap_displacement_p95 > group_cfg["max_displacement_p95"]:
-        warnings.warn(
-            f"Il vincolo di distanza minima induce uno spostamento p95 di "
-            f"{min_gap_displacement_p95:.2f} m, oltre max_displacement_p95="
-            f"{group_cfg['max_displacement_p95']} m: min_node_gap potrebbe essere "
-            f"troppo grande rispetto a sigma_long ({sigma_long:.3f} m), distorcendo "
-            f"la formazione del gruppo invece di limitarsi alla repulsione di contatto."
-        )
 
     metadata = {
         "seed": seed,
@@ -763,9 +976,6 @@ def simulate_mobility(config: Union[str, Path, dict]) -> MobilityResult:
         "duration": float(t[-1]) if n_steps > 0 else 0.0,
         "sigma_long": sigma_long,
         "sigma_lat": sigma_lat,
-        "min_gap_displacement_mean": min_gap_displacement_mean,
-        "min_gap_displacement_p95": min_gap_displacement_p95,
-        "min_gap_residual": min_gap_residual,
         "min_pair_distance": min_pair_distance,
         "separation_start_time": sep_cfg["start_time"] if separation_enabled else None,
         "separation_node_id": sep_cfg["node_id"] if separation_enabled else None,
@@ -779,5 +989,7 @@ def simulate_mobility(config: Union[str, Path, dict]) -> MobilityResult:
         s_nodes=s_nodes,
         s_centroid=s_centroid,
         distances=distances,
+        headings=headings,
+        lateral_offsets=off_lat,
         metadata=metadata,
     )
