@@ -100,3 +100,14 @@ channel:
 
   obstacles:
     enabled: false            # edifici da OpenStreetMap: Blocco 2b, per ora contributo nullo
+
+# Blocco 3 (pacchetti): beacon ESP-NOW e ricezione.
+packets:
+  beacon_period: 0.5          # s; intervallo fra due beacon dello stesso nodo (2 Hz, come il firmware)
+  jitter: 0.05                # s; ritardo casuale uniforme in [-jitter, +jitter] su ogni intervallo
+  reception:
+    model: curve              # "curve" (probabilità graduale) | "threshold" (soglia netta, per confronto)
+    sensitivity_dbm: -98.4    # dBm; ESP32-S3 Series Datasheet, tab. 6-4, 802.11b 1 Mbit/s, valore tipico
+    sensitivity_success: 0.92 # probabilità di ricezione alla sensibilità (definizione 802.11b: 8% di pacchetti persi)
+    transition_width: 2.0     # dB; da 10% a 90% di ricezione. Valore iniziale, da misurare con le Heltec
+    background_loss: 0.02     # probabilità di perdita indipendente dal segnale (interferenze Wi-Fi)

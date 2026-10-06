@@ -31,10 +31,6 @@ from src.channel import (
 )
 from src.mobility import load_config, simulate_mobility
 
-# Sensibilità dell'ESP32 usata solo come riferimento visivo nei grafici: la
-# decisione di ricezione appartiene al Blocco 3, che la porterà in config.
-SENSITIVITY_DBM_REFERENCE = -92.0
-
 # Finestra, dopo l'inizio della separazione, in cui il rilevamento deve
 # avvenire: serve solo alle statistiche e ai grafici, non è un parametro del modello.
 DETECTION_WINDOW_S = 60.0
@@ -71,7 +67,7 @@ def plot_rssi_vs_distance(mob, res, cfg: dict, out_dir: Path) -> None:
     ax.fill_between(grid, line - band, line + band, color="crimson", alpha=0.15,
                     label="±σ shadowing in funzione della lunghezza del link")
     ax.axhline(ch["measurement"]["saturation_dbm"], color="0.3", linestyle="--", label="saturazione")
-    ax.axhline(SENSITIVITY_DBM_REFERENCE, color="tab:green", linestyle="--", label="sensibilità (riferimento)")
+    ax.axhline(cfg["packets"]["reception"]["sensitivity_dbm"], color="tab:green", linestyle="--", label="sensibilità (riferimento)")
     ax.set_xscale("log")
     ax.set_xlabel("distanza [m] (scala log)")
     ax.set_ylabel("RSSI [dBm]")

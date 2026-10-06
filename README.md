@@ -27,6 +27,7 @@ pytest
 python scripts/plot_mobility.py                    # usa config/default.yaml
 python scripts/plot_mobility.py path/al/config.yaml # configurazione alternativa
 python scripts/plot_channel.py                     # Blocco 2: RSSI, shadowing, corpi (3 simulazioni)
+python scripts/plot_packets.py                     # Blocco 3: beacon, ricezione, conoscenza dei nodi
 ```
 
 Le figure vengono salvate in `results/` (cartella ignorata da git).
@@ -43,7 +44,9 @@ costante è cablata nel codice.
 - [x] **Blocco 2 — Modello di canale**: RSSI per coppia ordinata (attenuazione con la distanza,
   shadowing correlato a mappa condivisa, torso e altri corridori, fading di Rice, scarti delle schede,
   saturazione e quantizzazione).
-- [ ] Blocco 3 — Pacchetti e comunicazione
+- [x] **Blocco 3 — Pacchetti e beacon**: istanti dei beacon ESP-NOW con jitter, ricezione
+  (curva logistica sulla sensibilità × perdita di fondo), RSSI riportato, tabella dei vicini nei beacon
+  e conoscenza di ogni nodo (con età dell'informazione).
 - [ ] Blocco 4 — Filtro di Kalman
 - [ ] Blocco 5 — Routing
 - [ ] Blocco 6 — Valutazione dell'algoritmo di rilevamento
