@@ -1,8 +1,6 @@
 """Test del Blocco 1 (mobilità).
 
-Ogni test verifica un fatto noto indipendentemente (sulla traccia GPX o
-sulla teoria del processo di Ornstein-Uhlenbeck), non solo l'assenza di
-eccezioni.
+Ogni test verifica un fatto noto (traccia GPX o teoria del processo di Ornstein-Uhlenbeck).
 """
 
 import copy
@@ -42,9 +40,7 @@ def track(base_config):
 
 @pytest.fixture
 def short_config(base_config):
-    """Configurazione a durata ridotta, senza separazione, per i test che
-    devono eseguire l'intera simulazione senza rallentare la suite.
-    """
+    """Configurazione a durata ridotta e senza separazione, per tenere veloce la suite."""
     cfg = copy.deepcopy(base_config)
     cfg["simulation"]["duration"] = 300.0
     cfg["separation"]["enabled"] = False
@@ -61,9 +57,7 @@ def separation_config(base_config):
 
 @pytest.fixture
 def dispersion_config(base_config):
-    """Durata più lunga di `short_config`: serve a stimare in modo stabile
-    una statistica di coda (p95) sull'estensione del gruppo.
-    """
+    """Durata più lunga di `short_config`, per stimare in modo stabile il p95 dell'estensione del gruppo."""
     cfg = copy.deepcopy(base_config)
     cfg["simulation"]["duration"] = 1200.0
     cfg["separation"]["enabled"] = False
@@ -108,7 +102,6 @@ def test_query_interpolation(track):
     assert p_known.position[0] == pytest.approx(track.x[idx], abs=1e-6)
     assert p_known.position[1] == pytest.approx(track.y[idx], abs=1e-6)
 
-    # un punto a metà segmento deve stare esattamente sulla polilinea
     s_mid = (track.s[idx] + track.s[idx + 1]) / 2.0
     p_mid = track.query(s_mid)
     seg = np.array([track.x[idx + 1] - track.x[idx], track.y[idx + 1] - track.y[idx]])
@@ -130,9 +123,7 @@ def test_orthonormal_frame(track):
 
 
 def _turning_bound(track, window: float) -> float:
-    """Massima rotazione totale |Δθ| dei vertici della polilinea in una
-    finestra di ascissa curvilinea di larghezza `window`.
-    """
+    """Massima rotazione totale |Δθ| dei vertici della polilinea in una finestra di ascissa `window`."""
     dx, dy = np.diff(track.x), np.diff(track.y)
     theta = np.unwrap(np.arctan2(dy, dx))
     vertex_s = track.s[1:-1]
@@ -144,15 +135,7 @@ def _turning_bound(track, window: float) -> float:
 
 
 def test_heading_continuity(track, base_config):
-    """La variazione dell'angolo fra due campioni di `s` distanti ds = 0,1 m
-    non supera ds·T/W, con W = `heading_smoothing` e T la massima rotazione
-    totale dei vertici della polilinea in una finestra di larghezza W.
-    Derivazione: l'angolo lisciato è una media mobile di larghezza W, la
-    cui derivata (θ(s+W/2) − θ(s−W/2))/W è limitata da T/W; l'interpolazione
-    lineare fra i punti medi dei segmenti ne è una media, quindi mantiene il
-    limite. Il riferimento a tratti di prima salta invece fino a 162° in
-    un solo vertice e lo viola.
-    """
+    """La variazione d'angolo fra campioni di `s` a ds = 0,1 m non supera ds·T/W (W = `heading_smoothing`)."""
     window = base_config["track"]["heading_smoothing"]
     ds = 0.1
     bound = ds * _turning_bound(track, window) / window
@@ -169,10 +152,7 @@ def test_heading_continuity(track, base_config):
 
 
 def test_frame_matches_segment_on_straight(base_config, tmp_path):
-    """Lontano dall'angolo (più di W/2 più un passo), il riferimento
-    lisciato coincide con la direzione del segmento (±1°). Percorso a L:
-    rettilineo verso est, angolo di 90°, rettilineo verso nord.
-    """
+    """Lontano dall'angolo il riferimento lisciato coincide con la direzione del segmento (±1°), su un percorso a L."""
     lat0, lon0, step_m, n_leg = 45.0, 9.0, 2.8, 100
     dlon = np.degrees(step_m / (6371000.0 * np.cos(np.radians(lat0))))
     dlat = np.degrees(step_m / 6371000.0)
@@ -207,10 +187,7 @@ def test_frame_matches_segment_on_straight(base_config, tmp_path):
 
 
 def test_cd_stationary_variances():
-    """Varianza stazionaria della posizione = sigma^2 e della velocità =
-    sigma^2/tau^2, su più realizzazioni indipendenti per ridurre l'errore
-    campionario (tau = 8 s: una sola traccia ha pochi tempi di correlazione).
-    """
+    """Varianza stazionaria di posizione sigma^2 e di velocità sigma^2/tau^2, su più realizzazioni indipendenti."""
     rng = np.random.default_rng(123)
     sigma, tau, dt = 1.5, 8.0, 0.1
     x, v = critically_damped_process(n_steps=40_000, dt=dt, tau=tau, sigma=sigma, rng=rng, size=20)
@@ -231,11 +208,7 @@ def test_cd_autocorrelation(lag_in_taus):
 
 
 def test_cd_position_is_differentiable():
-    """La posizione è derivabile: la deviazione standard della differenza
-    finita a passo dt coincide con quella della velocità, sigma/tau (±5%).
-    Con l'OU del primo ordine valeva invece sigma·sqrt(1 - e^(-2dt/tau))/dt,
-    circa 12 volte più grande a dt = 0,1 s.
-    """
+    """La deviazione standard della differenza finita della posizione coincide con sigma/tau (±5%)."""
     rng = np.random.default_rng(7)
     dt, tau, sigma = 0.1, 8.0, 2.0
     x, v = critically_damped_process(n_steps=40_000, dt=dt, tau=tau, sigma=sigma, rng=rng, size=20)
@@ -245,9 +218,7 @@ def test_cd_position_is_differentiable():
 
 
 def _free_group_offsets(tau_long: float, tau_lat: float, sigma_long: float, sigma_lat: float):
-    """Scostamenti senza repulsione, su più gruppi indipendenti, per verificare
-    la parte lineare della dinamica del gruppo con costanti di tempo diverse.
-    """
+    """Senza repulsione, su più gruppi indipendenti, la dinamica lineare vale per costanti di tempo diverse."""
     return simulate_group_offsets(
         n_steps=20_000,
         dt=0.1,
@@ -263,9 +234,7 @@ def _free_group_offsets(tau_long: float, tau_lat: float, sigma_long: float, sigm
 
 
 def test_group_offsets_variances_per_direction():
-    """Con tau diverse per le due direzioni: var(posizione) = sigma^2 e
-    var(velocità) = sigma^2/tau^2 (±5%), separatamente per ciascuna direzione.
-    """
+    """Con tau diverse per direzione: var(posizione) = sigma^2 e var(velocità) = sigma^2/tau^2 (±5%)."""
     tau_long, tau_lat, sigma_long, sigma_lat = 8.0, 2.5, 2.0, 0.5
     off = _free_group_offsets(tau_long, tau_lat, sigma_long, sigma_lat)
     assert np.var(off.long) == pytest.approx(sigma_long**2, rel=0.05)
@@ -276,9 +245,7 @@ def test_group_offsets_variances_per_direction():
 
 @pytest.mark.parametrize("lag_in_taus", [0.5, 1.0, 2.0])
 def test_group_offsets_autocorrelation_per_direction(lag_in_taus):
-    """Autocorrelazione (1 + |t|/tau)·exp(-|t|/tau), con la tau di ciascuna
-    direzione, ai ritardi tau/2, tau e 2·tau (±0,05).
-    """
+    """Autocorrelazione (1 + |t|/tau)·exp(-|t|/tau) ai ritardi tau/2, tau e 2·tau (±0,05)."""
     dt = 0.1
     tau_long, tau_lat = 8.0, 2.5
     off = _free_group_offsets(tau_long, tau_lat, 1.0, 1.0)
@@ -290,7 +257,6 @@ def test_group_offsets_autocorrelation_per_direction(lag_in_taus):
 
 
 # ---------------------------------------------------------------------------
-# statistica del range di N gaussiane standard
 # ---------------------------------------------------------------------------
 
 
@@ -308,10 +274,7 @@ def test_range_statistic_p95():
 
 
 def test_group_dispersion_p95(dispersion_config):
-    """Con spread_statistic: p95 (default), è il 95° percentile
-    dell'estensione testa-coda, misurato DOPO il vincolo di distanza
-    minima, ad avvicinarsi a longitudinal_spread — non la media.
-    """
+    """Con spread_statistic p95 l'estensione testa-coda dopo il vincolo di distanza minima si avvicina a longitudinal_spread."""
     assert dispersion_config["group"]["spread_statistic"] == "p95"
     result = simulate_mobility(dispersion_config)
     spread = np.max(result.s_nodes, axis=1) - np.min(result.s_nodes, axis=1)
@@ -331,10 +294,7 @@ def test_group_dispersion_mean(dispersion_config):
 
 
 def test_relative_speed_realistic(separation_config):
-    """Prima della separazione, la velocità di ogni nodo relativa al
-    baricentro, misurata a passo dt, ha 99° percentile sotto
-    `max_relative_speed_p99`. Con l'OU del primo ordine era ~15 m/s.
-    """
+    """Prima della separazione il p99 della velocità relativa al baricentro sta sotto `max_relative_speed_p99`."""
     result = simulate_mobility(separation_config)
     idx_start = int(np.searchsorted(result.t, separation_config["separation"]["start_time"]))
     v_rel = relative_speed(result)[: idx_start - 1]
@@ -349,11 +309,7 @@ def test_relative_speed_realistic(separation_config):
 
 
 def test_lateral_2d_speed_realistic(separation_config):
-    """Prima della separazione, la velocità 2D dello scostamento laterale di
-    ogni nodo, a passo dt, ha p99 sotto `max_relative_speed_p99` e massimo
-    sotto `max_relative_speed`. Con tangente e normale a tratti il
-    massimo arrivava a ~11 m/s, per i salti ai vertici in curva.
-    """
+    """Prima della separazione la velocità 2D dello scostamento laterale ha p99 e massimo sotto i limiti configurati."""
     result = simulate_mobility(separation_config)
     track = load_track(separation_config)
     idx_start = int(np.searchsorted(result.t, separation_config["separation"]["start_time"]))
@@ -375,8 +331,7 @@ def test_start_offset_too_small_raises(short_config):
 
 def test_spread_too_small_raises(short_config):
     cfg = copy.deepcopy(short_config)
-    # (n_nodes - 1) * min_node_gap * spread_margin_factor con i valori di
-    # default è ben oltre 1 m: sicuramente troppo piccolo.
+    # con i valori di default (n_nodes-1)*min_node_gap*spread_margin_factor supera 1 m
     cfg["group"]["longitudinal_spread"] = 1.0
     with pytest.raises(ValueError, match="longitudinal_spread"):
         simulate_mobility(cfg)
@@ -388,11 +343,7 @@ def _pair_distances(result, n_nodes: int) -> np.ndarray:
 
 
 def test_repulsion_keeps_distance(dispersion_config):
-    """Senza separazione, la repulsione fra i corridori tiene le distanze:
-    1° percentile della distanza fra coppie almeno 1,1 m e al massimo lo
-    0,05% dei campioni sotto 1 m. La distanza è quella vera nel piano, quindi
-    include l'effetto della curvatura della traccia.
-    """
+    """Senza separazione la repulsione tiene le distanze: p1 delle distanze >= 1,1 m e al più 0,05% dei campioni sotto 1 m."""
     result = simulate_mobility(dispersion_config)
     pair_dist = _pair_distances(result, dispersion_config["group"]["n_nodes"])
     assert np.percentile(pair_dist, 1) >= 1.1
@@ -400,44 +351,8 @@ def test_repulsion_keeps_distance(dispersion_config):
     assert np.all(pair_dist > 0.0)
 
 
-def test_repulsion_acts_on_separated_node(separation_config):
-    """Il nodo separato esercita e subisce la repulsione come gli altri: nei
-    primi secondi dopo `start_time`, quando è ancora dentro il gruppo, la
-    distanza dagli altri nodi non scende sotto 1 m e non è un outlier rispetto
-    alle finestre di pari durata del resto della simulazione (un buco di
-    repulsione produrrebbe una distanza anomala).
-    """
-    result = simulate_mobility(separation_config)
-    n_nodes = separation_config["group"]["n_nodes"]
-    node_id = separation_config["separation"]["node_id"]
-    dt = separation_config["simulation"]["dt"]
-    other_nodes = [i for i in range(n_nodes) if i != node_id]
-
-    idx_start = int(np.searchsorted(result.t, separation_config["separation"]["start_time"]))
-    window_steps = max(int(round(5.0 / dt)), 1)
-    window = result.distances[idx_start : idx_start + window_steps, node_id][:, other_nodes]
-    assert window.min() >= 1.0, (
-        f"distanza minima nodo separato-gruppo nei primi 5 s dopo start_time = "
-        f"{window.min():.3f} m: la repulsione non agisce sul nodo separato."
-    )
-
-    diff = result.distances + np.eye(n_nodes)[None, :, :] * 1e9
-    n_steps = len(result.t)
-    other_windows = [
-        diff[k : k + window_steps].min()
-        for k in range(0, n_steps - window_steps, window_steps)
-        if k != idx_start
-    ]
-    assert window.min() >= np.percentile(other_windows, 10) - 0.1
-
-
 def test_no_pileup_at_min_node_gap(dispersion_config):
-    """La forza è continua e senza gradini, quindi la distribuzione delle
-    distanze non ha accumulo a `min_node_gap` (quello che produceva il
-    vincolo rigido, ed era la ragione del vecchio margine casuale): la
-    densità nell'intorno di ±1 cm non supera 1,5 volte quella delle fasce
-    vicine, e meno del 3% delle coppie ci cade dentro.
-    """
+    """La distribuzione delle distanze non ha accumulo a `min_node_gap`: densità entro ±1 cm al più 1,5 volte quella vicina."""
     result = simulate_mobility(dispersion_config)
     min_node_gap = dispersion_config["group"]["min_node_gap"]
     pair_dist = _pair_distances(result, dispersion_config["group"]["n_nodes"])
@@ -470,20 +385,57 @@ def test_separation_monotonic_and_initial_range(separation_config):
     gap_at_start = abs(result.s_centroid[idx_start] - result.s_nodes[idx_start, node_id])
     assert gap_at_start <= normal_spread + separation_config["group"]["longitudinal_spread"]
 
-    # dopo la rampa, il divario in ascissa curvilinea cresce in modo
-    # monotono, campionando ogni 10 s (assorbe i micro-cali di velocità)
+    # dopo la rampa il divario in ascissa cresce monotono (campioni ogni 10 s)
     idx_ramp_end = int(np.searchsorted(result.t, ramp_end))
     step_10s = max(int(round(10.0 / dt)), 1)
     sample_idx = np.arange(idx_ramp_end, len(result.t), step_10s)
     gap = result.s_centroid[sample_idx] - result.s_nodes[sample_idx, node_id]
     assert np.all(np.diff(gap) > 0)
 
-    # la distanza euclidea media dagli altri nodi cresce nel primo minuto
-    # dopo la fine della rampa
+    # la distanza media dagli altri nodi cresce nel primo minuto dopo la rampa
     idx_1min_later = min(idx_ramp_end + int(round(60.0 / dt)), len(result.t) - 1)
     dist_at_ramp_end = result.distances[idx_ramp_end, node_id, other_nodes]
     dist_1min_later = result.distances[idx_1min_later, node_id, other_nodes]
     assert np.mean(dist_1min_later) > np.mean(dist_at_ramp_end)
+
+
+def _detached_run(separation_config, scenario):
+    """Corsa con distacco; `stop` usa velocità obiettivo 0, `slowdown` quella di config."""
+    cfg = copy.deepcopy(separation_config)
+    if scenario == "stop":
+        cfg["separation"]["target_speed"] = 0.0
+    result = simulate_mobility(cfg)
+    sep = cfg["separation"]
+    idx_start = int(np.searchsorted(result.t, sep["start_time"]))
+    idx_ramp = int(np.searchsorted(result.t, sep["start_time"] + sep["ramp_duration"]))
+    return cfg, result, idx_start, idx_ramp
+
+
+@pytest.mark.parametrize("scenario", ["stop", "slowdown"])
+def test_detached_node_speed_and_overtaking(separation_config, scenario):
+    """Il nodo separato non subisce repulsione: segue la rampa di velocità e gli altri lo aggirano a più di 0,5 m."""
+    cfg, result, idx_start, idx_ramp = _detached_run(separation_config, scenario)
+    node = cfg["separation"]["node_id"]
+    dt = cfg["simulation"]["dt"]
+    others = [i for i in range(cfg["group"]["n_nodes"]) if i != node]
+
+    # non in coda: almeno un altro nodo è più indietro lungo il percorso
+    assert result.s_nodes[idx_start, node] > result.s_nodes[idx_start, others].min()
+
+    s = result.s_nodes[idx_start:, node]
+    speed = np.diff(s) / dt
+    assert np.all(speed >= -1e-9)
+    after = np.diff(result.s_nodes[idx_ramp:, node]) / dt
+    target = cfg["separation"]["target_speed"]
+    np.testing.assert_allclose(after, target, atol=1e-6)
+    if scenario == "stop":
+        assert np.ptp(result.s_nodes[idx_ramp:, node]) < 1e-6
+
+    # sorpasso: dal distacco finché il gruppo ha superato il nodo
+    passed = np.flatnonzero(result.s_nodes[idx_start:, others].min(axis=1) > result.s_nodes[idx_start:, node])
+    end = idx_start + (passed[0] if len(passed) else len(s))
+    assert len(passed) > 0, "il gruppo non ha superato il nodo separato: finestra troppo corta"
+    assert result.distances[idx_start:end, node, others].min() > 0.5
 
 
 # ---------------------------------------------------------------------------
@@ -528,12 +480,7 @@ def test_headings_are_unit_vectors(short_config):
 
 
 def test_headings_on_straight_track(short_config, tmp_path):
-    """Su un tracciato rettilineo (latitudine costante, quindi y = 0 nella
-    proiezione) la direzione di marcia è esattamente +x per ogni nodo e
-    istante, e la direzione dello spostamento netto di ogni nodo coincide
-    con essa. Sul tracciato reale l'uguaglianza vale solo in modo
-    approssimato, perché lo spostamento contiene anche la deriva laterale.
-    """
+    """Su un tracciato rettilineo la direzione di marcia è +x per ogni nodo e istante, e coincide con lo spostamento netto."""
     lat = 45.0
     n_points = 600
     step_m = 2.8

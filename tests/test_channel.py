@@ -1,8 +1,6 @@
 """Test del Blocco 2 (canale).
 
-Ogni test verifica un fatto noto indipendentemente (teoria o formula
-chiusa), non solo l'assenza di eccezioni. Dove possibile si usano posizioni
-costruite a mano o configurazioni ridotte, per tenere veloce la suite.
+Ogni test verifica un fatto noto (teoria o formula chiusa), con input costruiti a mano o ridotti.
 """
 
 import copy
@@ -91,10 +89,7 @@ def _offdiag(arr: np.ndarray) -> np.ndarray:
 
 
 def _exp_cov_link_matrix(a1, b1, a2, b2, delta: float, n: int = 500) -> float:
-    """Integrale doppio numerico (punto medio) di exp(-r/delta) fra due
-    segmenti, normalizzato come l'integrale dello shadowing:
-    (1/sqrt(d1 d2)) * int int exp(-|x1(u) - x2(v)|/delta) du dv.
-    """
+    """Integrale doppio numerico di exp(-r/delta) fra due segmenti, normalizzato come lo shadowing."""
     d1 = np.linalg.norm(b1 - a1)
     d2 = np.linalg.norm(b2 - a2)
     u = (np.arange(n) + 0.5) / n
@@ -127,11 +122,9 @@ def test_path_loss_matches_formula(cfg):
     assert np.allclose(result.rssi_true[:, 0, 1], expected, atol=1e-9)
     assert np.allclose(result.rssi_path_loss[:, 0, 1], expected, atol=1e-9)
 
-    # sotto d0 resta costante
     assert result.rssi_true[0, 0, 1] == pytest.approx(result.rssi_true[2, 0, 1], abs=1e-12)
     assert result.rssi_true[1, 0, 1] == pytest.approx(result.rssi_true[2, 0, 1], abs=1e-12)
 
-    # pendenza in log10(d) = -10 n
     above = distances >= d0
     slope = np.polyfit(np.log10(distances[above]), result.rssi_true[above, 0, 1], 1)[0]
     assert slope == pytest.approx(-10.0 * n, abs=1e-9)
@@ -278,8 +271,7 @@ def test_field_same_positions_same_shadowing(cfg):
 
 @pytest.fixture(scope="module")
 def parallel_run(base_config):
-    """5 nodi che avanzano in parallelo di 0,05 m a passo: ogni coppia
-    percorre 0,1 m per passo (somma dei due estremi)."""
+    """5 nodi in parallelo a 0,05 m per passo: ogni coppia percorre 0,1 m per passo."""
     sh = base_config["channel"]["shadowing"]
     n_steps, n_nodes, step = 100_000, 5, 0.05
     k = np.arange(n_steps)
@@ -345,9 +337,7 @@ def test_reciprocity(cfg, short_mobility, mode):
 
 
 def _torso_case(cfg, other_pos, other_heading):
-    """Nodo 0 in (0,0) che corre verso est; l'altro nodo in `other_pos`, con
-    una direzione scelta perché la sua perdita sia nulla: il totale è la
-    sola perdita dell'estremo 0."""
+    """Nodo 0 in (0,0) verso est, altro nodo con perdita nulla: il totale è la perdita dell'estremo 0."""
     positions = np.array([[[0.0, 0.0], other_pos]])
     headings = np.array([[[1.0, 0.0], other_heading]])
     return own_body_loss(positions, headings, cfg["channel"]["body"]["own"])[0, 0, 1]
@@ -369,8 +359,7 @@ def test_own_body_lobe(cfg):
 def test_own_body_mount_side_left_mirrors(cfg):
     cfg["channel"]["body"]["own"]["mount_side"] = "left"
     max_loss = cfg["channel"]["body"]["own"]["max_loss"]
-    # con la scheda a sinistra il torso blocca verso destra (sud)
-    # (la direzione dell'altro nodo è scelta perché la sua perdita sia nulla)
+    # scheda a sinistra: il torso blocca verso sud
     assert _torso_case(cfg, [0.0, -10.0], [1.0, 0.0]) == pytest.approx(max_loss, abs=1e-9)
     assert _torso_case(cfg, [0.0, 10.0], [-1.0, 0.0]) == pytest.approx(0.0, abs=1e-9)
 
@@ -404,16 +393,13 @@ def test_other_runner_beyond_endpoint(cfg):
 
 
 def test_runners_in_line_hit_the_cap(cfg):
-    """Il tetto (12 dB) vale per più corridori in fila: con 8 dB ciascuno già due
-    lo raggiungono, e anche tre danno esattamente il tetto; un corridore solo no.
-    """
+    """Il tetto sulla perdita totale vale per più corridori in fila, non per uno solo."""
     o = cfg["channel"]["body"]["others"]
-    assert 2 * o["loss"] > o["max_total_loss"]  # il tetto è davvero attivo
+    assert 2 * o["loss"] > o["max_total_loss"]
     three = _others(cfg, [[0, 0], [10, 0], [3, 0], [5, 0], [7, 0]])[0, 1]
     assert three == pytest.approx(o["max_total_loss"], abs=1e-9)
     two = _others(cfg, [[0, 0], [10, 0], [3, 0], [7, 0]])[0, 1]
     assert two == pytest.approx(o["max_total_loss"], abs=1e-9)
-    # un solo corridore in mezzo sta sotto il tetto
     one = _others(cfg, [[0, 0], [10, 0], [5, 0]])[0, 1]
     assert one == pytest.approx(o["loss"] / (1.0 + math.exp(-o["radius"] / o["transition_width"])), abs=1e-9)
     assert one < o["max_total_loss"]
@@ -464,7 +450,7 @@ def test_device_offsets_break_reciprocity(cfg, short_mobility):
 
 
 def test_measurement_saturation_and_quantization(cfg, short_mobility):
-    cfg["channel"]["tx_power"] = 30.0  # forza la saturazione dei link corti
+    cfg["channel"]["tx_power"] = 30.0
     m = cfg["channel"]["measurement"]
     result = simulate_channel(short_mobility, cfg)
     meas = _offdiag(result.rssi_measured)

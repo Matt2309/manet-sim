@@ -40,12 +40,7 @@ def _suffix(cfg: dict) -> str:
 
 
 def _analysis_window(result, cfg: dict) -> tuple[int, int]:
-    """Intervallo di indici temporali su cui calcolare le statistiche del
-    gruppo: se la separazione è attiva, solo prima del suo inizio (dopo,
-    il nodo separato non fa più parte della formazione e ne stravolgerebbe
-    le statistiche, calibrate su n_nodes nodi intatti); altrimenti l'intera
-    simulazione.
-    """
+    """Intervallo di indici su cui calcolare le statistiche: prima della separazione se attiva (il nodo separato falserebbe la formazione), altrimenti tutta la simulazione."""
     if cfg["separation"]["enabled"]:
         idx_end = int(np.searchsorted(result.t, cfg["separation"]["start_time"]))
         return 0, max(idx_end, 1)
@@ -53,9 +48,7 @@ def _analysis_window(result, cfg: dict) -> tuple[int, int]:
 
 
 def plot_path_overview(track: Track, result, out_dir: Path, suffix: str) -> None:
-    """Percorso completo in coordinate locali, con la posizione del
-    baricentro del gruppo marcata in alcuni istanti campione.
-    """
+    """Percorso completo in coordinate locali, con il baricentro del gruppo in alcuni istanti."""
     fig, ax = plt.subplots(figsize=(8, 8))
     ax.plot(track.x, track.y, "-", color="0.7", linewidth=1, label="percorso GPX")
 
@@ -82,15 +75,9 @@ def plot_path_overview(track: Track, result, out_dir: Path, suffix: str) -> None
 
 
 def plot_curve_zoom(track: Track, result, out_dir: Path, suffix: str, half_window_m: float = 8.0) -> None:
-    """Zoom sull'istante in cui il gruppo è più "a cavallo" di un tornante:
-    quello di massimo rapporto fra estensione in ascissa curvilinea ed
-    estensione in linea d'aria. I nodi sono uniti da una spezzata in
-    ordine di ascissa curvilinea, per vedere a colpo d'occhio se la catena
-    segue la strada o taglia in linea retta.
+    """Zoom sull'istante di massimo rapporto fra estensione in ascissa curvilinea e in linea d'aria (gruppo "a cavallo" di un tornante).
 
-    Generato solo senza separazione attiva: con la separazione il nodo che
-    si allontana smetterebbe rapidamente di essere "a cavallo" di nulla,
-    e la ricerca del tornante diventerebbe poco significativa.
+    I nodi sono uniti in ordine di ascissa curvilinea. Solo senza separazione attiva.
     """
     n_nodes = result.positions.shape[1]
     s_nodes = result.s_nodes  # (T, N)
@@ -134,12 +121,7 @@ def plot_curve_zoom(track: Track, result, out_dir: Path, suffix: str, half_windo
 
 
 def plot_pair_distances_window(result, out_dir: Path, suffix: str, cfg: dict, window_s: float = 120.0) -> None:
-    """Distanze fra tutte le coppie di nodi su una finestra di window_s
-    secondi presa a metà della finestra di analisi: qui le curve devono
-    risultare lisce (un ciclo del processo OU, a correlation_time = 8 s,
-    occupa 80 campioni). Se appaiono frastagliate campione per campione,
-    l'OU non sta funzionando.
-    """
+    """Distanze fra tutte le coppie su `window_s` s a metà della finestra di analisi: le curve devono essere lisce (un ciclo OU = 80 campioni a correlation_time = 8 s)."""
     n_nodes = cfg["group"]["n_nodes"]
     dt = cfg["simulation"]["dt"]
     idx_a, idx_b = _analysis_window(result, cfg)
@@ -164,11 +146,7 @@ def plot_pair_distances_window(result, out_dir: Path, suffix: str, cfg: dict, wi
 
 
 def plot_group_extent(result, out_dir: Path, suffix: str, cfg: dict) -> None:
-    """Estensione testa-coda del gruppo in ascissa curvilinea nel tempo,
-    con linee di riferimento a longitudinal_spread e alla mediana
-    osservata. Limitato alla finestra di analisi (prima della separazione,
-    se attiva): dopo, il nodo separato non fa più parte della formazione.
-    """
+    """Estensione testa-coda in ascissa curvilinea nel tempo, con longitudinal_spread e mediana osservata; solo finestra di analisi."""
     idx_a, idx_b = _analysis_window(result, cfg)
     extent = np.max(result.s_nodes[idx_a:idx_b], axis=1) - np.min(result.s_nodes[idx_a:idx_b], axis=1)
     median_extent = float(np.median(extent))
@@ -191,12 +169,7 @@ def plot_group_extent(result, out_dir: Path, suffix: str, cfg: dict) -> None:
 
 
 def plot_distance_histogram(result, out_dir: Path, suffix: str, cfg: dict) -> None:
-    """Istogramma delle distanze euclidee fra tutte le coppie di nodi,
-    sulla finestra di analisi, con mediana, 95° percentile e min_node_gap
-    marcati: è il modo corretto di leggere una statistica su decine di
-    migliaia di campioni, dove un grafico a serie temporale sovraccarico
-    di punti per pixel sarebbe illeggibile.
-    """
+    """Istogramma delle distanze euclidee fra tutte le coppie sulla finestra di analisi, con mediana, 95° percentile e min_node_gap."""
     idx_a, idx_b = _analysis_window(result, cfg)
     n_nodes = cfg["group"]["n_nodes"]
     iu, ju = np.triu_indices(n_nodes, k=1)
@@ -221,11 +194,7 @@ def plot_distance_histogram(result, out_dir: Path, suffix: str, cfg: dict) -> No
 
 
 def plot_separation_detail(result, out_dir: Path, suffix: str, cfg: dict, window_s: float = 300.0) -> None:
-    """Distanza fra il nodo separato e gli altri quattro, limitata ai
-    primi window_s secondi dopo l'inizio della separazione, asse y
-    logaritmico: è l'unica finestra temporale in cui il rilevamento della
-    separazione è realmente in gioco.
-    """
+    """Distanza fra il nodo separato e gli altri quattro nei primi `window_s` s dopo la separazione (finestra in cui il rilevamento è in gioco), asse y logaritmico."""
     sep_cfg = cfg["separation"]
     node_id = sep_cfg["node_id"]
     start_time = sep_cfg["start_time"]
@@ -255,11 +224,7 @@ def plot_separation_detail(result, out_dir: Path, suffix: str, cfg: dict, window
 
 
 def print_group_stats(track: Track, result, cfg: dict) -> None:
-    """Statistiche del gruppo sulla finestra di analisi (prima della
-    separazione, se attiva), stampate a console: estensione longitudinale e
-    laterale, distanze fra coppie, velocità 2D (rispetto al baricentro delle
-    posizioni e del solo scostamento laterale).
-    """
+    """Stampa le statistiche del gruppo nella finestra di analisi: estensione longitudinale e laterale, distanze fra coppie, velocità 2D (rispetto al baricentro e laterale)."""
     idx_a, idx_b = _analysis_window(result, cfg)
     n_nodes = cfg["group"]["n_nodes"]
     sl = slice(idx_a, idx_b)
@@ -302,12 +267,7 @@ def _git_show(path: str) -> str:
 
 
 def legacy_relative_speed(cfg: dict) -> np.ndarray:
-    """Velocità relativa al baricentro ottenuta col modulo e la configurazione
-    originali (OU del primo ordine, vincolo di distanza minima a proiezione),
-    letti dal commit `LEGACY_MOBILITY_COMMIT`. Stessa definizione di
-    `relative_speed`: coordinate stradali, passo dt. Solleva se git non è
-    disponibile.
-    """
+    """Velocità relativa al baricentro col modulo originale (letto dal commit `LEGACY_MOBILITY_COMMIT`), stessa definizione di `relative_speed`. Solleva se git non è disponibile."""
     import yaml
 
     module = types.ModuleType("mobility_legacy")
@@ -330,12 +290,7 @@ def legacy_relative_speed(cfg: dict) -> np.ndarray:
 
 
 def plot_relative_speed(result, out_dir: Path, suffix: str, cfg: dict) -> dict:
-    """Distribuzione della velocità di ogni nodo relativa al baricentro,
-    misurata a passo dt, nella finestra di analisi (prima della separazione),
-    con `max_relative_speed_p99` tracciato. Se il modulo originale è
-    leggibile da git, ne sovrappone la distribuzione (prima/dopo).
-    Restituisce i 99° percentili, per la stampa a console.
-    """
+    """Distribuzione della velocità relativa al baricentro (passo dt, finestra di analisi) con `max_relative_speed_p99`; sovrappone il modulo originale se leggibile da git. Restituisce i 99° percentili."""
     idx_a, idx_b = _analysis_window(result, cfg)
     v_new = relative_speed(result)[idx_a : max(idx_b - 1, idx_a + 1)].ravel()
     limit = cfg["group"]["max_relative_speed_p99"]

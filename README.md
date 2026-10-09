@@ -28,7 +28,13 @@ python scripts/plot_mobility.py                    # usa config/default.yaml
 python scripts/plot_mobility.py path/al/config.yaml # configurazione alternativa
 python scripts/plot_channel.py                     # Blocco 2: RSSI, shadowing, corpi (3 simulazioni)
 python scripts/plot_packets.py                     # Blocco 3: beacon, ricezione, conoscenza dei nodi
+python scripts/run_detection_experiment.py         # Blocco 4: corse, sweep, risultati in results/detection/
+python scripts/run_detection_experiment.py --jobs 4  # numero di processi (default: tutti i core)
+python scripts/plot_detector.py                    # Blocco 4: figure e riepilogo a console
 ```
+
+`run_detection_experiment.py` mette in cache i Blocchi 1-3 di ogni corsa in `results/cache/`
+(chiave = seme + hash della configurazione usata): la prima esecuzione è lenta, le successive no.
 
 Le figure vengono salvate in `results/` (cartella ignorata da git).
 
@@ -47,6 +53,10 @@ costante è cablata nel codice.
 - [x] **Blocco 3 — Pacchetti e beacon**: istanti dei beacon ESP-NOW con jitter, ricezione
   (curva logistica sulla sensibilità × perdita di fondo), RSSI riportato, tabella dei vicini nei beacon
   e conoscenza di ogni nodo (con età dell'informazione).
-- [ ] Blocco 4 — Filtro di Kalman
+- [x] **Blocco 4 — Rilevatore**: Kalman per link (accelerazione casuale continua), tabella dei vicini
+  a 5 byte, fusione per bersaglio, pre-allarme e allarme "nodo perso", allarme di sistema, metriche
+  (probabilità di rilevamento, ritardo, falsi allarmi per ora) e sweep su `sigma_a`, modalità, ambito e soglia.
+  Dal distacco in poi la repulsione del Blocco 1 è a senso unico: il nodo separato non la subisce
+  (il gruppo lo aggira), così la sua velocità è esattamente quella imposta (anche 0).
 - [ ] Blocco 5 — Routing
 - [ ] Blocco 6 — Valutazione dell'algoritmo di rilevamento

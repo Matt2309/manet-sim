@@ -111,3 +111,44 @@ packets:
     sensitivity_success: 0.92 # probabilità di ricezione alla sensibilità (definizione 802.11b: 8% di pacchetti persi)
     transition_width: 2.0     # dB; da 10% a 90% di ricezione. Valore iniziale, da misurare con le Heltec
     background_loss: 0.02     # probabilità di perdita indipendente dal segnale (interferenze Wi-Fi)
+
+# Blocco 4: Kalman per link, tabella dei vicini, fusione, allarmi, metriche.
+kalman:
+  measurement_noise: auto        # dB²; "auto" = varianza del fading (Blocco 2) + 1/12 di quantizzazione
+  sigma_a: 0.5                   # dB/s²; quanto in fretta può cambiare la pendenza (valore di default)
+  sigma_a_sweep: [0.25, 0.5, 1.0, 2.0]
+  initial_slope_std: 3.0         # dB/s; incertezza iniziale sulla pendenza
+  reinit_gap: 10.0               # s; dopo un silenzio più lungo il filtro riparte da zero
+neighbour_table:                 # 5 byte per vicino: id, RSSI, pendenza, dev. std, età
+  rssi_step: 1.0                 # dB (int8)
+  slope_step: 0.1                # dB/s (int8)
+  std_step: 0.1                  # dB (uint8)
+  age_step: 0.1                  # s (uint8, satura)
+fusion:
+  max_age: 2.0                   # s; le voci più vecchie sono escluse
+  max_age_own: true              # vale anche per la stima propria del link i→m (false = resta sempre, con varianza crescente)
+detector:
+  mode: both                     # "level" | "slope" | "both"
+  scope: fused                   # "fused" | "pairwise"
+  level_threshold: -75.0         # dBm; circa 30 m con la sola distanza
+  slope_threshold: -0.5          # dB/s; soglia in "slope", conferma in "both"
+  min_duration: 1.0              # s; durata minima della condizione per accendere il pre-allarme
+  lost_silence: 10.0             # s; allarme "nodo perso"
+  release_time: 5.0              # s di ricezione buona per spegnere un allarme
+  release_reception: 0.8         # frazione minima di beacon ricevuti in quella finestra
+  release_level_margin: 3.0      # dB oltre la soglia per considerare rientrato il livello
+  release_slope_margin: 0.5      # dB/s, idem per la pendenza
+  min_observers: 1               # osservatori in allarme necessari per l'allarme di sistema
+  warmup: 10.0                   # s iniziali esclusi
+metrics:
+  scenarios: [none, slowdown, stop]
+  n_runs: 50                     # corse per scenario
+  stop_speed: 0.0                # m/s; scenario "si ferma"
+  separation_start_range: [300.0, 2400.0]   # s; almeno 10 minuti dopo il distacco prima della fine
+  success_window: 30.0           # s; solo informativo: colonna "entro 30 s" (il criterio di successo è success_distance)
+  success_distance: 30.0         # m; rilevato in tempo se l'allarme di sistema si accende prima che la distanza minima dal gruppo superi questo valore
+  max_alarm_time_fraction: 0.01  # un punto dello sweep è ammissibile solo se nelle corse none la frazione di tempo in allarme è <= questo valore
+  confidence_level: 0.95         # livello degli intervalli di Wilson (P_d) e di Poisson (falsi allarmi per ora)
+  target_false_alarms_per_hour: 1.0
+  level_threshold_sweep: [-95.0, -60.0, 2.5]   # inizio, fine, passo (dBm)
+  slope_threshold_sweep: [-4.0, -0.25, 0.25]   # inizio, fine, passo (dB/s)

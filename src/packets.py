@@ -1,32 +1,20 @@
 """Blocco 3 — Pacchetti e beacon.
 
-Trasforma l'RSSI "perfetto" del Blocco 2 nel registro che ogni scheda
-avrebbe davvero: solo i beacon che arrivano, ciascuno con il suo RSSI, e i
-buchi dove un beacon si è perso. Convenzione degli indici: ``[i, ..., j]``
-= trasmette ``i``, riceve ``j``.
+Trasforma l'RSSI "perfetto" del Blocco 2 nel registro reale di ogni scheda: solo i
+beacon ricevuti, con il loro RSSI. Indici ``[i, ..., j]`` = trasmette ``i``, riceve ``j``.
 
-Modello:
-
-1. Ogni nodo trasmette un beacon broadcast ESP-NOW (1 Mbit/s, senza
-   conferma né ritrasmissione) ogni ``beacon_period`` s, con fase iniziale
-   uniforme e jitter uniforme su ogni intervallo.
-2. Collisioni: NON modellate. ESP-NOW usa CSMA/CA; un beacon dura circa 1 ms
-   a 1 Mbit/s, quindi il canale è occupato per una frazione
-   ``n_nodi * 1 ms / beacon_period`` del tempo (dell'ordine dell'1 % con
-   5 nodi e un periodo di 0,5 s): la probabilità che due beacon si
-   sovrappongano, già ridotta dall'ascolto del canale, è trascurabile
+1. Beacon broadcast ESP-NOW (1 Mbit/s, senza conferma) ogni ``beacon_period`` s,
+   fase iniziale uniforme e jitter uniforme su ogni intervallo.
+2. Collisioni NON modellate: CSMA/CA, beacon da ~1 ms, occupazione del canale
+   ``n_nodi * 1 ms / beacon_period`` (~1 % con 5 nodi, periodo 0,5 s), trascurabile
    rispetto alla perdita di fondo.
-3. Un beacon arriva se superano entrambe due prove indipendenti: segnale
-   sufficiente (curva logistica in dB sull'RSSI vero, vedi
-   `logistic_parameters`) e perdita di fondo (Wi-Fi circostante).
-4. Se arriva, la scheda legge `rssi_measured` del Blocco 2, altrimenti NaN.
-5. Ogni beacon porta la tabella dei vicini del trasmettitore: per ogni altro
-   nodo, l'RSSI dell'ultimo beacon ricevuto e la sua età. Un solo salto.
+3. Arriva se superano due prove indipendenti: segnale (logistica in dB sull'RSSI
+   vero, vedi `logistic_parameters`) e perdita di fondo (Wi-Fi circostante).
+4. Se arriva la scheda legge `rssi_measured` del Blocco 2, altrimenti NaN.
+5. Ogni beacon porta la tabella dei vicini del trasmettitore (ultimo RSSI e età). Un solo salto.
 6. Conoscenza di ogni osservatore `m` sulla griglia del simulatore.
 
-Nessun valore numerico del modello è salvato in questo file: tutti i
-parametri vengono letti dalla sezione ``packets`` della configurazione YAML
-(vedi ``config/default.yaml``).
+Parametri: sezione ``packets`` della config.
 """
 
 from __future__ import annotations
@@ -51,11 +39,8 @@ from src.mobility import MobilityResult, load_config
 
 @dataclass
 class PacketResult:
-    """Output della simulazione dei pacchetti (Blocco 3).
-
-    Gli array ``(N, K, N)`` seguono la convenzione ``[i, k, j]`` = il beacon
-    `k` del nodo `i`, visto dal nodo `j`. Gli array ``(T, M, N, N)`` seguono
-    ``[t, m, i, j]`` = cosa sa l'osservatore `m` del link `i → j`.
+    """Output del Blocco 3. ``(N, K, N)`` indicizzato ``[i, k, j]`` = beacon `k` di `i` visto da `j`;
+    ``(T, M, N, N)`` indicizzato ``[t, m, i, j]`` = cosa sa l'osservatore `m` del link `i → j`.
     """
 
     beacon_times: np.ndarray  # (N, K) s; NaN dove un nodo ha meno beacon
@@ -76,18 +61,8 @@ class PacketResult:
 
 
 def logistic_parameters(sensitivity: float, success: float, width: float) -> tuple:
-    """Centro e pendenza della curva logistica di ricezione.
-
-    Input: sensibilità `S` in dBm, probabilità `success` alla sensibilità,
-    larghezza `width` in dB fra il 10% e il 90% di ricezione.
-    Procedimento: ``p(x) = 1 / (1 + exp(-(x - c) / s))``. Il livello al quale
-    la probabilità vale `p` è ``x = c + s ln(p / (1 - p))``. Fra 10% e 90%:
-    ``width = s [ln 9 - ln(1/9)] = 2 s ln 9``, quindi ``s = width / (2 ln 9)``.
-    Alla sensibilità ``p(S) = success``: ``S = c + s ln(success / (1 - success))``,
-    quindi ``c = S - s ln(success / (1 - success))``. Per questo il centro (50%)
-    sta sotto la sensibilità: la sensibilità del datasheet è il livello al
-    quale l'8% dei pacchetti va perso, non il 50%.
-    Output: (c, s) in dB.
+    """Centro `c` e pendenza `s` (dB) della logistica ``p(x) = 1 / (1 + exp(-(x - c) / s))``: `width` dB fra 10% e 90% (``s = width / (2 ln 9)``)
+    e ``p(S) = success`` alla sensibilità `S` (``c = S - s ln(success / (1 - success))``). Il centro (50%) sta sotto `S`: la sensibilità di datasheet è al livello con l'8% di perdita.
     """
     scale = width / (2.0 * math.log(9.0))
     center = sensitivity - scale * math.log(success / (1.0 - success))
@@ -95,14 +70,7 @@ def logistic_parameters(sensitivity: float, success: float, width: float) -> tup
 
 
 def reception_probability(rssi: np.ndarray, reception_cfg: dict) -> np.ndarray:
-    """Probabilità che la prova del segnale sia superata.
-
-    Input: RSSI vero in dBm (qualunque forma) e sezione ``packets.reception``.
-    Procedimento: con ``model: curve`` la logistica di `logistic_parameters`;
-    con ``model: threshold`` una soglia netta alla sensibilità (1 se
-    ``rssi >= sensibilità``, 0 altrimenti), per i confronti.
-    Output: probabilità, stessa forma di `rssi`.
-    """
+    """Probabilità di superare la prova del segnale dall'RSSI vero: logistica (``model: curve``) o soglia netta alla sensibilità (``threshold``)."""
     model = reception_cfg["model"]
     x = np.asarray(rssi, dtype=float)
     if model == "curve":
@@ -125,17 +93,8 @@ def reception_probability(rssi: np.ndarray, reception_cfg: dict) -> np.ndarray:
 def beacon_schedule(
     n_nodes: int, t_end: float, dt: float, packets_cfg: dict, rng: np.random.Generator
 ) -> tuple:
-    """Istanti di trasmissione dei beacon di tutti i nodi.
-
-    Input: numero di nodi, durata `t_end` in s, passo `dt` della griglia,
-    sezione ``packets`` e generatore `rng`.
-    Procedimento: la fase iniziale di ogni nodo è uniforme in
-    ``[0, period)``; ogni intervallo successivo vale ``period + u`` con `u`
-    uniforme in ``[-jitter, +jitter]``. Si estrae un numero di intervalli
-    sufficiente a coprire `t_end` anche con tutti gli intervalli minimi, si
-    accumula e i beacon oltre `t_end` diventano NaN. L'indice della griglia è
-    quello più vicino al tempo di trasmissione (``rint(t / dt)``), -1 dove NaN.
-    Output: (times (N, K) in s, steps (N, K) int).
+    """Istanti dei beacon: (times (N, K) in s, steps (N, K) int). Fase iniziale uniforme in ``[0, period)``, intervalli ``period + U[-jitter, +jitter]``;
+    oltre `t_end` NaN. `steps` = ``rint(t / dt)``, -1 dove NaN.
     """
     period = packets_cfg["beacon_period"]
     jitter = packets_cfg["jitter"]
@@ -156,21 +115,13 @@ def beacon_schedule(
 # ---------------------------------------------------------------------------
 
 
-def _neighbour_tables(times: np.ndarray, received: np.ndarray, rssi: np.ndarray) -> tuple:
-    """Tabella dei vicini portata da ogni beacon.
-
-    Input: istanti (N, K), ricezioni (N, K, N) e RSSI riportati (N, K, N).
-    Procedimento: nel beacon `k` del nodo `j`, per ogni altro nodo `i`, si
-    prende l'ultimo beacon di `i` ricevuto da `j` prima di `times[j, k]`
-    (ricerca binaria sui soli beacon ricevuti). L'età nel beacon è la
-    differenza fra due tempi misurati dal solo nodo `j` (nessun orologio
-    comune); qui si conserva l'istante d'origine, da cui l'età a ogni
-    istante successivo si ricava per sottrazione.
-    Output: (table_rssi, table_origin), entrambi (N, K, N) indicizzati
-    ``[j, k, i]``; NaN se `j` non aveva ancora ricevuto nulla da `i`.
+def _neighbour_tables(times: np.ndarray, received: np.ndarray, payload: dict) -> tuple:
+    """Tabella dei vicini portata da ogni beacon. ``payload[nome][i, k, j]`` = valore che il beacon `k` di `i` porta a `j`.
+    Per il beacon `k` di `j`, per ogni `i`: l'ultimo beacon di `i` ricevuto da `j` prima di ``times[j, k]``. Ritorna (tabelle, table_origin) indicizzati ``[j, k, i]``;
+    `table_origin` = istante d'origine (l'età si ricava per sottrazione: nessun orologio comune). NaN se `j` non ha ancora ricevuto nulla da `i`.
     """
     n_nodes, n_beacons = times.shape
-    table_rssi = np.full((n_nodes, n_beacons, n_nodes), np.nan)
+    tables = {name: np.full((n_nodes, n_beacons, n_nodes), np.nan) for name in payload}
     table_origin = np.full((n_nodes, n_beacons, n_nodes), np.nan)
     for j in range(n_nodes):
         valid_k = np.flatnonzero(~np.isnan(times[j]))
@@ -183,29 +134,25 @@ def _neighbour_tables(times: np.ndarray, received: np.ndarray, rssi: np.ndarray)
             pos = np.searchsorted(times[i, got], times[j, valid_k], side="left") - 1
             ok = pos >= 0
             src = got[pos[ok]]
-            table_rssi[j, valid_k[ok], i] = rssi[i, src, j]
+            for name, values in payload.items():
+                tables[name][j, valid_k[ok], i] = values[i, src, j]
             table_origin[j, valid_k[ok], i] = times[i, src]
-    return table_rssi, table_origin
+    return tables, table_origin
 
 
-def _knowledge(t: np.ndarray, times: np.ndarray, received: np.ndarray, rssi: np.ndarray) -> tuple:
-    """Cosa sa ogni osservatore `m` di ogni link `i → j`, sulla griglia.
-
-    Input: istanti della griglia `t` (T,), istanti dei beacon, ricezioni e
-    RSSI riportati.
-    Procedimento: un beacon trasmesso a `t_b` è noto all'istante di griglia
-    `t` se ``t_b <= t``. Per ``j == m``: ultimo beacon di `i` ricevuto da `m`,
-    età ``t - t_b``. Per ``j != m`` (anche ``i == m``): ultimo beacon di `j`
-    ricevuto da `m`, e da esso la riga della tabella dei vicini per `i`; età
-    ``t - istante d'origine``, quindi include il ritardo di inoltro. Un solo
-    salto. NaN se l'informazione non è mai arrivata e sulla diagonale ``i == j``.
-    Output: (rssi, età), entrambi (T, M, N, N) float32 indicizzati ``[t, m, i, j]``.
+def forward_link_payload(
+    t: np.ndarray, times: np.ndarray, received: np.ndarray, payload: dict
+) -> tuple:
+    """Cosa sa ogni osservatore `m` del link `i → j`, per un carico qualsiasi (``payload[nome][i, k, j]``, valore portato dal beacon `k` di `i`).
+    Un beacon di istante `t_b` è noto a `t` se ``t_b <= t``. Per ``j == m``: ultimo beacon di `i` ricevuto da `m`; per ``j != m``: riga `i` della tabella dei vicini dell'ultimo beacon di `j` (un solo salto).
+    Ritorna (campi, age, relay_time): `campi` e `age` (s) sono (T, M, N, N) float32 ``[t, m, i, j]``; `relay_time` (float64) = istante del beacon di `j` che ha inoltrato (NaN se diretto o assente). NaN anche per ``i == j``.
     """
     n_steps = len(t)
     n_nodes = times.shape[0]
-    table_rssi, table_origin = _neighbour_tables(times, received, rssi)
-    k_rssi = np.full((n_steps, n_nodes, n_nodes, n_nodes), np.nan, dtype=np.float32)
-    k_age = np.full_like(k_rssi, np.nan)
+    tables, table_origin = _neighbour_tables(times, received, payload)
+    out = {name: np.full((n_steps, n_nodes, n_nodes, n_nodes), np.nan, dtype=np.float32) for name in payload}
+    k_age = np.full((n_steps, n_nodes, n_nodes, n_nodes), np.nan, dtype=np.float32)
+    relay = np.full((n_steps, n_nodes, n_nodes, n_nodes), np.nan)
 
     for m in range(n_nodes):
         for j in range(n_nodes):
@@ -218,8 +165,10 @@ def _knowledge(t: np.ndarray, times: np.ndarray, received: np.ndarray, rssi: np.
             ok = pos >= 0
             k = got[pos[ok]]  # beacon di j più recente noto a m, per ogni istante valido
             origin = table_origin[j, k, :]  # (n_ok, i)
-            k_rssi[ok, m, :, j] = table_rssi[j, k, :]
+            for name in payload:
+                out[name][ok, m, :, j] = tables[name][j, k, :]
             k_age[ok, m, :, j] = t[ok, None] - origin
+            relay[ok, m, :, j] = np.where(np.isnan(origin), np.nan, times[j, k][:, None])
         for i in range(n_nodes):
             if i == m:
                 continue
@@ -229,13 +178,20 @@ def _knowledge(t: np.ndarray, times: np.ndarray, received: np.ndarray, rssi: np.
             pos = np.searchsorted(times[i, got], t, side="right") - 1
             ok = pos >= 0
             k = got[pos[ok]]
-            k_rssi[ok, m, i, m] = rssi[i, k, m]
+            for name, values in payload.items():
+                out[name][ok, m, i, m] = values[i, k, m]
             k_age[ok, m, i, m] = t[ok] - times[i, k]
 
     idx = np.arange(n_nodes)
-    k_rssi[:, :, idx, idx] = np.nan
-    k_age[:, :, idx, idx] = np.nan
-    return k_rssi, k_age
+    for arr in (*out.values(), k_age, relay):
+        arr[:, :, idx, idx] = np.nan
+    return out, k_age, relay
+
+
+def _knowledge(t: np.ndarray, times: np.ndarray, received: np.ndarray, rssi: np.ndarray) -> tuple:
+    """Caso particolare di `forward_link_payload` con carico = RSSI riportato: ritorna (rssi, età), (T, M, N, N) float32 ``[t, m, i, j]``."""
+    fields, age, _ = forward_link_payload(t, times, received, {"rssi": rssi})
+    return fields["rssi"], age
 
 
 # ---------------------------------------------------------------------------
@@ -246,24 +202,9 @@ def _knowledge(t: np.ndarray, times: np.ndarray, received: np.ndarray, rssi: np.
 def simulate_packets(
     mobility: MobilityResult, channel: ChannelResult, config: Union[str, Path, dict]
 ) -> PacketResult:
-    """Esegue la simulazione dei pacchetti del Blocco 3.
-
-    Input: `MobilityResult`, `ChannelResult` e configurazione (percorso YAML
-    o dizionario; sezioni ``simulation`` e ``packets``).
-    Procedimento: due generatori indipendenti da quelli del Blocco 2,
-    ``SeedSequence(seed, spawn_key=(4,))`` per gli istanti e ``(5,)`` per la
-    ricezione. Si generano gli istanti dei beacon; il canale si legge
-    all'istante della griglia più vicino. Dal generatore di ricezione si
-    estraggono sempre, in quest'ordine, due array uniformi (N, K, N): uno per
-    la prova del segnale, uno per la perdita di fondo. La prova del segnale è
-    superata se ``u < p_curve(rssi_true)`` (si usa l'RSSI vero, non quello
-    arrotondato); quella di fondo se ``u >= background_loss``. Così cambiare
-    ``background_loss`` non cambia quali beacon superano la prova del
-    segnale, e con la stessa estrazione una sensibilità più bassa dà un
-    sovrainsieme di ricezioni. Il beacon arriva se superano entrambe; l'RSSI
-    riportato è `rssi_measured` all'indice del beacon, NaN se perso. Infine
-    si calcola la conoscenza di ogni nodo.
-    Output: `PacketResult`.
+    """Simulazione dei pacchetti del Blocco 3 (config: percorso YAML o dict con ``simulation`` e ``packets``).
+    Generatori indipendenti dal Blocco 2: ``SeedSequence(seed, spawn_key=(4,))`` per gli istanti, ``(5,)`` per la ricezione, da cui si estraggono sempre due array uniformi (N, K, N):
+    segnale (``u < p_curve(rssi_true)``, RSSI vero non arrotondato) e fondo (``u >= background_loss``), così variare uno non cambia l'altro. Il beacon arriva se superano entrambe.
     """
     cfg = load_config(config)
     pk = cfg["packets"]

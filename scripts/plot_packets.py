@@ -1,12 +1,11 @@
 #!/usr/bin/env python3
 """Script di ispezione visiva del Blocco 3 (pacchetti).
 
-Esegue due simulazioni di mobilità e canale (corsa intera senza separazione,
-per le statistiche del gruppo, e con separazione). Sulla seconda calcola i
-pacchetti con tre sensibilità (-92, -95 dBm e quella di default in
-config/default.yaml), a parità di seme. Salva le figure in results/ e stampa
-a console le statistiche principali. Configurazione: config/default.yaml se
-non specificato altrimenti.
+Due simulazioni di mobilità e canale (senza separazione, per le statistiche
+del gruppo, e con separazione); sulla seconda i pacchetti con tre
+sensibilità (-92, -95 dBm e quella di default), a parità di seme. Salva le
+figure in results/ e stampa le statistiche. Config: config/default.yaml se
+non indicata.
 """
 
 import argparse
@@ -107,11 +106,7 @@ def direct_ages(res) -> np.ndarray:
 def return_window(mob, cfg: dict) -> tuple:
     """Finestra (t_inizio, t_fine) del rientro geometrico del nodo separato.
 
-    La distanza media dal gruppo, lisciata, ha un massimo seguito da un
-    minimo locale quando il percorso torna indietro. Si prende il minimo
-    entro `RETURN_SEARCH_S` dopo l'inizio e, attorno ad esso, l'intervallo
-    contiguo in cui la distanza sta sotto la metà fra il massimo precedente e
-    il minimo.
+    Minimo della distanza media lisciata entro `RETURN_SEARCH_S` dall'inizio; l'intervallo contiguo attorno ad esso con distanza sotto la metà fra il massimo precedente e il minimo.
     """
     sep = cfg["separation"]
     node, t0, dt = sep["node_id"], sep["start_time"], cfg["simulation"]["dt"]
@@ -140,9 +135,7 @@ def return_window(mob, cfg: dict) -> tuple:
 
 
 def plot_reception_curve(runs: dict, values: dict, cfg: dict, out_dir: Path) -> None:
-    """Curva teorica con le tre sensibilità e, sopra, la frazione empirica di
-    beacon ricevuti per intervalli di `rssi_true` (1 dB), dalla corsa con separazione.
-    """
+    """Curva teorica con le tre sensibilità e frazione empirica di beacon ricevuti per intervalli di `rssi_true` (1 dB), dalla corsa con separazione."""
     rc = cfg["packets"]["reception"]
     bg = rc["background_loss"]
     x = np.linspace(-125.0, -80.0, 1000)
@@ -174,11 +167,7 @@ def plot_reception_curve(runs: dict, values: dict, cfg: dict, out_dir: Path) -> 
 
 
 def plot_separation_packets(mob, ch, res, cfg: dict, out_dir: Path) -> None:
-    """I 4 link dal nodo separato verso il gruppo, da un minuto prima a
-    cinque minuti dopo l'inizio della separazione: `rssi_true` sottile,
-    beacon ricevuti come punti, persi come segni in basso, sensibilità e,
-    su un secondo asse, la distanza.
-    """
+    """I 4 link dal nodo separato (da -1 a +5 min dalla separazione): `rssi_true`, beacon ricevuti (punti) e persi (segni in basso), sensibilità, distanza su secondo asse."""
     sep = cfg["separation"]
     node, t0, dt = sep["node_id"], sep["start_time"], cfg["simulation"]["dt"]
     sens = cfg["packets"]["reception"]["sensitivity_dbm"]
@@ -243,11 +232,7 @@ def plot_loss_vs_distance(values: dict, out_dir: Path) -> None:
 
 
 def plot_link_age(mob, runs: dict, res_nosep, cfg: dict, out_dir: Path) -> None:
-    """A sinistra l'età dei link diretti verso il nodo separato nel tempo (media
-    sui 4 link, vista dal nodo separato), per le tre sensibilità; a destra,
-    nel gruppo senza separazione, la distribuzione del numero di beacon
-    consecutivi persi.
-    """
+    """A sinistra l'età dei link diretti verso il nodo separato (media sui 4 link) per le tre sensibilità; a destra i beacon consecutivi persi nel gruppo senza separazione."""
     sep = cfg["separation"]
     node, t0 = sep["node_id"], sep["start_time"]
     others = [k for k in range(cfg["group"]["n_nodes"]) if k != node]
@@ -284,9 +269,7 @@ def plot_link_age(mob, runs: dict, res_nosep, cfg: dict, out_dir: Path) -> None:
 
 
 def plot_knowledge_delay(res_nosep, cfg: dict, out_dir: Path) -> None:
-    """Distribuzione dell'età delle informazioni inoltrate nel gruppo (il
-    ritardo con cui un nodo sa cosa vedono gli altri), a confronto con quella dei link diretti.
-    """
+    """Distribuzione dell'età delle informazioni inoltrate nel gruppo, a confronto con i link diretti."""
     fwd = forwarded_ages(res_nosep)
     dire = direct_ages(res_nosep)
     period = cfg["packets"]["beacon_period"]

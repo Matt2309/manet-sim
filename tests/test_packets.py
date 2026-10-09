@@ -1,9 +1,7 @@
 """Test del Blocco 3 (pacchetti).
 
-Ogni test verifica un fatto noto indipendentemente (teoria o formula
-chiusa), non solo l'assenza di eccezioni. Si usano canali costruiti a mano
-(RSSI costante, nodi fermi) o corse brevi. Le tolleranze statistiche sono di
-4 deviazioni standard binomiali.
+Ogni test verifica un fatto noto (teoria o formula chiusa) su canali costruiti a mano o corse brevi.
+Tolleranze statistiche a 4 deviazioni standard binomiali.
 """
 
 import copy
@@ -129,8 +127,7 @@ def test_beacon_schedule(cfg):
         assert (len(tt) - 1) / (tt[-1] - tt[0]) == pytest.approx(1.0 / period, rel=0.01)
         assert 0.0 <= tt[0] < period
         assert tt[-1] <= t_end
-    # nessun beacon perso in coda: gli intervalli estratti coprono t_end, quindi
-    # l'ultima colonna è sempre oltre la durata (NaN) per ogni nodo
+    # gli intervalli coprono t_end: l'ultima colonna è sempre NaN
     assert np.all(np.isnan(times[:, -1]))
 
     phases = times[:, 0]
