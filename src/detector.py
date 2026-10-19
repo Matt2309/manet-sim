@@ -254,6 +254,38 @@ def reception_features(t: np.ndarray, times: np.ndarray, received: np.ndarray, c
     return silence, rx_ok
 
 
+def deafness(t: np.ndarray, times: np.ndarray, received: np.ndarray, silence: np.ndarray, config: dict) -> tuple:
+    """Sordità degli osservatori (Blocco 6, D4): ricevitore `m` che non sente nessuno, non un nodo `i` davvero perso.
+
+    Input: `t`, `times` (N, K), `received` (N, K, N), `silence` (T, M, I) da `reception_features`, `config`.
+    Procedimento:
+
+    - ``deaf_window`` (T, M): `m` non ha ricevuto beacon da NESSUN vicino negli ultimi ``lost_silence`` s (definizione letterale di ``not_deaf``);
+    - ``deaf_episode`` (T, M, I): per l'episodio di silenzio di `i` iniziato all'ultimo beacon `last` di `i`, `m` non ha ricevuto beacon da nessun altro
+      vicino in ``(last + beacon_period, last + lost_silence]``. La decisione è quindi una proprietà dell'episodio (costante finché `i` tace) e non
+      dipende dall'istante: evita che il "perso" scatti per il vicino con l'ultimo beacon più vecchio (il silenzio di `m` è ancora nascosto dal beacon
+      di un altro vicino arrivato meno di un periodo dopo) o al rientro di `m` (sente un vicino prima di `i`). Si usa solo con ``not_deaf_episode``.
+    Output: (deaf_window, deaf_episode); diagonale False.
+    """
+    dcfg = config["detector"]
+    silence_limit = dcfg["lost_silence"]
+    guard = config["packets"]["beacon_period"]
+    n_nodes = times.shape[0]
+    off = ~np.eye(n_nodes, dtype=bool)
+    deaf_window = np.where(off[None], silence, np.inf).min(axis=2) > silence_limit
+    deaf_episode = np.zeros(silence.shape, dtype=bool)
+    for m in range(n_nodes):
+        heard = {k: times[k, received[k, :, m]] for k in range(n_nodes) if k != m}
+        for i in range(n_nodes):
+            if i == m:
+                continue
+            others = np.sort(np.concatenate([heard[k] for k in heard if k != i]))
+            last = t - silence[:, m, i]
+            count = np.searchsorted(others, last + silence_limit, side="right") - np.searchsorted(others, last + guard, side="right")
+            deaf_episode[:, m, i] = count == 0
+    return deaf_window, deaf_episode
+
+
 # ---------------------------------------------------------------------------
 # Allarmi
 # ---------------------------------------------------------------------------
@@ -327,12 +359,23 @@ def lost_alarm(
     t: np.ndarray,
     detector_cfg: dict,
     valid: np.ndarray | None = None,
+    deaf_window: np.ndarray | None = None,
+    deaf_episode: np.ndarray | None = None,
 ) -> np.ndarray:
     """Allarme "nodo perso" di ogni coppia: acceso con silenzio > ``lost_silence`` s, spento da `rx_ok`.
 
-    Un beacon isolato non lo spegne. `valid` esclude ``m == i``.
+    Un beacon isolato non lo spegne. `valid` esclude ``m == i``. ``detector.lost_rule`` (Blocco 6): ``any`` = base; ``not_deaf`` non accende
+    il "perso" se `m` non sente nessun vicino (`deaf_window` (T, M), vedi `deafness`); ``not_deaf_episode`` usa `deaf_episode` (T, M, I o T, M).
+    Lo spegnimento non cambia.
     """
     on = silence > detector_cfg["lost_silence"]
+    rule = detector_cfg.get("lost_rule", "any")
+    if rule == "not_deaf":
+        on = on & ~(deaf_window if silence.ndim == 2 else deaf_window[:, :, None])
+    elif rule == "not_deaf_episode":
+        on = on & ~deaf_episode
+    elif rule != "any":
+        raise ValueError(f"detector.lost_rule deve essere 'any', 'not_deaf' o 'not_deaf_episode', non {rule!r}")
     state = latched_alarm(on, rx_ok)
     return state if valid is None else state & valid
 
@@ -376,6 +419,12 @@ class DetectionInputs:
     rx_ok: np.ndarray
     valid: np.ndarray  # (M, I) False sulla diagonale
     entries: dict | None = None  # Blocco 5: voci non fuse (T, M, I, K) per il livello relativo (`fusion_entries`)
+    deaf_window: np.ndarray | None = None  # Blocco 6: (T, M), `deafness`
+    deaf_episode: np.ndarray | None = None  # Blocco 6: (T, M, I) interi, (T, M) dopo `target_slice`
+
+    def lost_kwargs(self) -> dict:
+        """Argomenti di `lost_alarm` che dipendono dalla sordità."""
+        return {"deaf_window": self.deaf_window, "deaf_episode": self.deaf_episode}
 
     def target_slice(self, target: int) -> "DetectionInputs":
         sel = (slice(None), slice(None), target)
@@ -388,6 +437,8 @@ class DetectionInputs:
             rx_ok=self.rx_ok[sel],
             valid=self.valid[:, target],
             entries=None if self.entries is None else {k: v[:, :, target, :] for k, v in self.entries.items()},
+            deaf_window=self.deaf_window,
+            deaf_episode=None if self.deaf_episode is None else self.deaf_episode[sel],
         )
 
 
@@ -403,6 +454,7 @@ def build_inputs(run: dict, config: dict, sigma_a: float, R: float, kres: Kalman
     indices = fusion_indices(t, kres, config, sigma_a)
     silence, rx_ok = reception_features(t, run["beacon_times"], run["received"], config)
     n_nodes = kres.times.shape[0]
+    deaf_window, deaf_episode = deafness(t, run["beacon_times"], run["received"], silence, config)
     inputs = DetectionInputs(
         t=t,
         level={k: v[0] for k, v in indices.items()},
@@ -412,5 +464,7 @@ def build_inputs(run: dict, config: dict, sigma_a: float, R: float, kres: Kalman
         rx_ok=rx_ok,
         valid=~np.eye(n_nodes, dtype=bool),
         entries=fusion_entries(t, kres, config, sigma_a) if config["detector"]["reference"] == "relative" else None,
+        deaf_window=deaf_window,
+        deaf_episode=deaf_episode,
     )
     return inputs, kres

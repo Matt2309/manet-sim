@@ -173,7 +173,7 @@ def _arrays(inputs, config: dict, scope: str, targets: list | None):
         raise ValueError("servono le voci non fuse: costruire gli ingressi con detector.reference = 'relative'")
     sliced = entries["value"].ndim == 3  # `target_slice`: (T, M, K)
     expand = (lambda a: a[:, :, None, ...]) if sliced else (lambda a: a)
-    lost = lost_alarm(inputs.silence, inputs.rx_ok, inputs.t, dcfg, inputs.valid)
+    lost = lost_alarm(inputs.silence, inputs.rx_ok, inputs.t, dcfg, inputs.valid, **inputs.lost_kwargs())
     lost, rx_ok = (lost[:, :, None], inputs.rx_ok[:, :, None]) if sliced else (lost, inputs.rx_ok)
     n_obs, n_tgt = rx_ok.shape[1], rx_ok.shape[2]
     pairs = [(m, i) for i in range(n_tgt) for m in range(n_obs) if sliced or m != i]

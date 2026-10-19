@@ -9,6 +9,8 @@ radio.
 
 ## Setup
 
+Python 3.13.1 (sviluppato e testato con questa versione), librerie con versioni esatte in `requirements.txt`.
+
 ```bash
 python3 -m venv venv
 source venv/bin/activate
@@ -34,7 +36,14 @@ python scripts/plot_detector.py                    # Blocco 4: figure e riepilog
 python scripts/run_block5_experiment.py            # Blocco 5: varianti A-F, risultati in results/block5/
 python scripts/run_block5_experiment.py --jobs 8   # numero di processi
 python scripts/plot_block5.py                      # Blocco 5: sette figure in results/block5/
+python scripts/run_block6_experiment.py            # Blocco 6: soglie congelate, verifica, verdetto, sensibilità (results/block6/)
+python scripts/plot_block6.py                      # Blocco 6: sei figure in results/block6/
+python scripts/reproduce_all.py                    # TUTTO: figure dei Blocchi 1-6 e results/final_summary.md
+python scripts/reproduce_all.py --clean            # idem, ripartendo senza cache
 ```
+
+Gli script dei Blocchi 4-5 rimettono i valori del Blocco 4 (`history.block4` in `config/default.yaml`): i default di `config/default.yaml`
+descrivono dal Blocco 6 il rilevatore finale (soglia congelata, spegnimento 30 s).
 
 `run_detection_experiment.py` mette in cache i Blocchi 1-3 di ogni corsa in `results/cache/`
 (chiave = seme + hash della configurazione usata): la prima esecuzione è lenta, le successive no.
@@ -69,7 +78,7 @@ costante è cablata nel codice.
   Kalman ai salti da corpo (`kalman.robust`: `inflate` | `nis_gate`); (E) shadowing indipendente invece che condiviso.
   Ogni variante si confronta con la base a coppie (corse guadagnate e perse) sulle stesse 150 corse in cache; la
   regola di scelta è in `src/refinement.py`. Poi si combinano le vincenti (F).
-- [ ] Blocco 6 — Valutazione dell'algoritmo di rilevamento (corse nuove, altri semi)
+- [x] **Blocco 6 — Numeri finali, sensibilità e chiusura** (vedi sotto)
 - [ ] Blocco 7 — Routing (era il Blocco 5 nell'elenco originale: slitta dopo la rifinitura del rilevatore)
 
 ### Nota sul Blocco 5 (da riportare nella tesi)
@@ -81,3 +90,40 @@ differenza di 1-2 corse sta dentro il rumore, e per questo una variante vince so
 
 `numba` è una dipendenza del solo livello relativo (`pip install -r requirements.txt`); senza numba il codice
 gira in Python puro, molto più lento.
+
+
+## Blocco 6 — Numeri finali, sensibilità e chiusura
+
+**Taratura e verifica.** Le soglie si scelgono *solo* sull'insieme di **taratura** (le 150 corse dei Blocchi 4-5, chiavi 6-7) e si scrivono in
+`results/block6/frozen_thresholds.yaml` (data, hash del commit, valori sulla taratura). La valutazione sulle **300 corse di verifica** (100 per scenario,
+chiavi 8-9, mai viste) le *legge* da quel file: nessun percorso del codice sceglie una soglia sulla verifica (`src/final.py`, `evaluate_at`; lo sweep sulla
+verifica serve solo a disegnare le curve). Il verdetto `media` contro `migliore` ha una regola fissata prima (`final.min_net_gain`, falsi allarmi non
+superiori) ed è in `results/block6/verdict.yaml`. La sensibilità al canale (sensibilità del ricevitore, perdite a raffiche di Gilbert-Elliott, regola
+`not_deaf`) usa le prime 50 corse per scenario della verifica e cambia solo il Blocco 3.
+
+**Riproduzione con un comando:** `python scripts/reproduce_all.py` (circa 1,5 minuti con la cache e i risultati già presenti; con `--clean`
+ricalcola tutto: cache, esperimenti dei Blocchi 4-6, vedi i tempi stampati; la cache occupa circa 5 GB).
+
+| Figura | Script |
+| --- | --- |
+| Blocchi 1-3 (mobilità, canale, pacchetti) | `plot_mobility.py`, `plot_channel.py`, `plot_packets.py` |
+| Blocco 4 (`results/*.png`) | `plot_detector.py` (dopo `run_detection_experiment.py`) |
+| Blocco 5 (`results/block5/*.png`) | `plot_block5.py` (dopo `run_block5_experiment.py`) |
+| `final_tradeoff.png`, `detection_distance.png`, `detection_delay.png`, `tuning_vs_test.png`, `sensitivity.png`, `burst_example.png` | `plot_block6.py` (dopo `run_block6_experiment.py`) |
+| `results/final_summary.md` | `reproduce_all.py` (generato dal codice) |
+
+**Generatori casuali** (`SeedSequence(simulation.seed, spawn_key=(k,))`, o il seme della corsa per i Blocchi 3):
+
+| Chiave | Uso |
+| --- | --- |
+| 0-3 | Blocco 2: mappa di shadowing, shadowing indipendente, scarti delle schede, fading (`ss.spawn(4)` di `SeedSequence(seed)`) |
+| 4 | Blocco 3: istanti dei beacon |
+| 5 | Blocco 3: ricezione (segnale e fondo) |
+| 6 | Blocchi 4-5 (taratura): nodo e istante del distacco |
+| 7 | Blocchi 4-5 (taratura): semi delle corse |
+| 8 | Blocco 6 (verifica): semi delle corse |
+| 9 | Blocco 6 (verifica): nodo e istante del distacco |
+| 10 | Blocco 3: raffiche di Gilbert-Elliott (`background_model: bursty`) |
+| 11 | Blocco 6: ricampionamenti del bootstrap (scelta mia, non prevista dalla specifica) |
+
+Il Blocco 1 usa un generatore unico `default_rng(seed)` (e `calibration.seed` per la calibrazione).

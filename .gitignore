@@ -220,7 +220,12 @@ __marimo__/
 #IntelliJ
 .idea/
 
-results/
+results/*
+!results/final_summary.md
+!results/block6/
+results/block6/*
+!results/block6/frozen_thresholds.yaml
+!results/block6/verdict.yaml
 
 # macOS
 .DS_Store

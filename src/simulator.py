@@ -33,16 +33,19 @@ CACHE_SECTIONS = ("simulation", "track", "group", "separation", "channel", "pack
 CACHE_VERSION = 1  # da incrementare se cambia il contenuto dei file di cache
 
 
-def run_seeds(config: dict) -> np.ndarray:
-    """Semi (n_runs,) da ``SeedSequence(simulation.seed, spawn_key=(7,))``, uguali per tutti gli scenari."""
-    ss = np.random.SeedSequence(config["simulation"]["seed"], spawn_key=(7,))
-    return ss.generate_state(config["metrics"]["n_runs"]).astype(np.int64)
+TUNING_KEYS = {"runs": 7, "separation": 6}  # Blocchi 4-5: insieme di taratura
 
 
-def draw_separations(config: dict) -> tuple:
-    """Nodo (n_runs,) e istante d'inizio (n_runs,) s del distacco, uniformi, da un generatore dedicato (``spawn_key=(6,)``)."""
-    rng = np.random.default_rng(np.random.SeedSequence(config["simulation"]["seed"], spawn_key=(6,)))
-    n_runs = config["metrics"]["n_runs"]
+def run_seeds(config: dict, key: int = TUNING_KEYS["runs"], n_runs: int | None = None) -> np.ndarray:
+    """Semi (n_runs,) da ``SeedSequence(simulation.seed, spawn_key=(key,))`` (default 7: taratura), uguali per tutti gli scenari."""
+    ss = np.random.SeedSequence(config["simulation"]["seed"], spawn_key=(key,))
+    return ss.generate_state(config["metrics"]["n_runs"] if n_runs is None else n_runs).astype(np.int64)
+
+
+def draw_separations(config: dict, key: int = TUNING_KEYS["separation"], n_runs: int | None = None) -> tuple:
+    """Nodo (n_runs,) e istante d'inizio (n_runs,) s del distacco, uniformi, da un generatore dedicato (``spawn_key=(key,)``, default 6: taratura)."""
+    rng = np.random.default_rng(np.random.SeedSequence(config["simulation"]["seed"], spawn_key=(key,)))
+    n_runs = config["metrics"]["n_runs"] if n_runs is None else n_runs
     lo, hi = config["metrics"]["separation_start_range"]
     nodes = rng.integers(0, config["group"]["n_nodes"], size=n_runs)
     starts = rng.uniform(lo, hi, size=n_runs)
@@ -67,14 +70,30 @@ def scenario_config(config: dict, scenario: str, seed: int, node: int, start: fl
     return cfg
 
 
-def cache_key(config: dict) -> str:
-    """Chiave ``<seme>_<hash>``: sha256 delle sole sezioni dei Blocchi 1-3 (GPX sostituito dal suo contenuto) e della versione."""
-    parts = {name: copy.deepcopy(config[name]) for name in CACHE_SECTIONS}
+def _hash_parts(config: dict, sections: tuple) -> str:
+    parts = {name: copy.deepcopy(config[name]) for name in sections}
+    rc = parts.get("packets", {}).get("reception")
+    if rc is not None and rc.get("background_model", "independent") == "independent":
+        rc.pop("background_model", None)  # Blocco 6: con "independent" la chiave resta quella di prima (cache dei Blocchi 4-5 valida)
+        rc.pop("bursty", None)
     gpx = Path(parts["track"]["gpx_file"])
     parts["track"]["gpx_file"] = hashlib.sha256(gpx.read_bytes()).hexdigest()
     parts["cache_version"] = CACHE_VERSION
     digest = hashlib.sha256(json.dumps(parts, sort_keys=True, default=str).encode()).hexdigest()[:16]
     return f"{config['simulation']['seed']}_{digest}"
+
+
+def cache_key(config: dict) -> str:
+    """Chiave ``<seme>_<hash>``: sha256 delle sole sezioni dei Blocchi 1-3 (GPX sostituito dal suo contenuto) e della versione.
+
+    Con ``packets.reception.background_model: independent`` le opzioni del Blocco 6 non entrano nell'hash.
+    """
+    return _hash_parts(config, CACHE_SECTIONS)
+
+
+def channel_cache_key(config: dict) -> str:
+    """Come `cache_key` ma solo per i Blocchi 1-2 (senza la sezione ``packets``): i punti di sensibilità del Blocco 6 la condividono."""
+    return _hash_parts(config, tuple(n for n in CACHE_SECTIONS if n != "packets"))
 
 
 def simulate_run(config: dict) -> dict:
@@ -86,19 +105,78 @@ def simulate_run(config: dict) -> dict:
     mob = simulate_mobility(config)
     ch = simulate_channel(mob, config)
     pk = simulate_packets(mob, ch, config)
-    off_diag = ~np.eye(mob.positions.shape[1], dtype=bool)
+    return _reduce(config, mob.t, mob.distances, float(np.var(ch.fading[:, ~np.eye(mob.positions.shape[1], dtype=bool)])), pk)
+
+
+def _reduce(config: dict, t, distances, fading_var: float, pk) -> dict:
     sep = config["separation"]
     return {
-        "t": mob.t,
-        "distances": mob.distances.astype(np.float32),
+        "t": t,
+        "distances": np.asarray(distances).astype(np.float32),
         "beacon_times": pk.beacon_times,
         "received": pk.received,
         "rssi": pk.rssi,
-        "fading_var": float(np.var(ch.fading[:, off_diag])),
+        "fading_var": fading_var,
         "sep_enabled": bool(sep["enabled"]),
         "sep_node": int(sep["node_id"]) if sep["enabled"] else -1,
         "sep_start": float(sep["start_time"]) if sep["enabled"] else float("nan"),
     }
+
+
+def channel_cache_path(config: dict, cache_dir: Path) -> Path:
+    return Path(cache_dir) / "channel" / f"{channel_cache_key(config)}.npz"
+
+
+def load_or_simulate_channel(config: dict, cache_dir: Path) -> dict:
+    """Blocchi 1-2 di una corsa, dalla cache (``<cache>/channel/``) o simulati e salvati: ``t``, ``distances``, ``rssi_true``,
+    ``rssi_measured`` (salvato float32 solo se esatto), ``fading_var`` e i campi del distacco. Non dipende dalla sezione ``packets``."""
+    path = channel_cache_path(config, cache_dir)
+    if path.exists():
+        with np.load(path) as f:
+            ch = {k: f[k] for k in f.files}
+        ch["rssi_measured"] = ch["rssi_measured"].astype(np.float64)
+        for key in ("fading_var", "sep_start"):
+            ch[key] = float(ch[key])
+        ch["sep_enabled"], ch["sep_node"] = bool(ch["sep_enabled"]), int(ch["sep_node"])
+        return ch
+    mob = simulate_mobility(config)
+    res = simulate_channel(mob, config)
+    sep = config["separation"]
+    measured = res.rssi_measured
+    narrow = measured.astype(np.float32)
+    stored = narrow if np.array_equal(narrow.astype(measured.dtype), measured) else measured
+    out = {
+        "t": mob.t,
+        "distances": mob.distances.astype(np.float32),
+        "rssi_true": res.rssi_true,
+        "rssi_measured": stored,
+        "fading_var": float(np.var(res.fading[:, ~np.eye(mob.positions.shape[1], dtype=bool)])),
+        "sep_enabled": bool(sep["enabled"]),
+        "sep_node": int(sep["node_id"]) if sep["enabled"] else -1,
+        "sep_start": float(sep["start_time"]) if sep["enabled"] else float("nan"),
+    }
+    path.parent.mkdir(parents=True, exist_ok=True)
+    tmp = path.with_suffix(".tmp.npz")
+    np.savez(tmp, **out)
+    tmp.replace(path)
+    out["rssi_measured"] = measured
+    return out
+
+
+def run_from_channel(config: dict, cache_dir: Path) -> dict:
+    """Corsa completa (stessa forma di `load_or_simulate`) con il Blocco 3 simulato in memoria sopra i Blocchi 1-2 in cache.
+
+    Non scrive nella cache delle corse: i punti di sensibilità (che cambiano solo il Blocco 3) non possono sovrascrivere la base.
+    Restituisce anche ``background_state`` (None con ``independent``) per le diagnostiche.
+    """
+    from types import SimpleNamespace
+
+    ch = load_or_simulate_channel(config, cache_dir)
+    chres = SimpleNamespace(t=ch["t"], rssi_true=ch["rssi_true"], rssi_measured=ch["rssi_measured"])
+    pk = simulate_packets(None, chres, config)
+    run = _reduce(config, ch["t"], ch["distances"], ch["fading_var"], pk)
+    run["background_state"] = pk.background_state
+    return run
 
 
 def cache_path(config: dict, cache_dir: Path) -> Path:
@@ -125,20 +203,31 @@ def load_or_simulate(config: dict, cache_dir: Path) -> dict:
 
 
 def _ensure_cached(args: tuple) -> str:
-    config, cache_dir = args
+    config, cache_dir, *rest = args
     path = cache_path(config, cache_dir)
-    if not path.exists():
+    if rest and rest[0]:  # Blocco 6: anche la cache dei Blocchi 1-2; la corsa si ricava da lì (un solo passaggio sul canale)
+        load_or_simulate_channel(config, cache_dir)
+        if not path.exists():
+            run = run_from_channel(config, cache_dir)
+            run.pop("background_state", None)
+            path.parent.mkdir(parents=True, exist_ok=True)
+            tmp = path.with_suffix(".tmp.npz")
+            np.savez(tmp, **run)
+            tmp.replace(path)
+    elif not path.exists():
         load_or_simulate(config, cache_dir)
     return str(path)
 
 
-def experiment_runs(config: dict) -> list:
+def experiment_runs(config: dict, keys: dict | None = None, n_runs: int | None = None) -> list:
     """Corse per ogni scenario di ``metrics.scenarios`` e indice, con seme, nodo e istante comuni fra scenari.
 
+    `keys` = ``{"runs": k, "separation": k}`` (default: taratura, chiavi 7 e 6) e `n_runs` scelgono l'insieme di corse.
     Dizionari ``scenario``, ``index``, ``seed``, ``node``, ``start``, ``config``.
     """
-    seeds = run_seeds(config)
-    nodes, starts = draw_separations(config)
+    keys = TUNING_KEYS if keys is None else keys
+    seeds = run_seeds(config, keys["runs"], n_runs)
+    nodes, starts = draw_separations(config, keys["separation"], n_runs)
     runs = []
     for scenario in config["metrics"]["scenarios"]:
         for index, (seed, node, start) in enumerate(zip(seeds, nodes, starts)):
@@ -155,9 +244,12 @@ def experiment_runs(config: dict) -> list:
     return runs
 
 
-def ensure_all_cached(runs: list, cache_dir: Path, jobs: int = 1) -> None:
-    """Simula e salva in cache le corse mancanti (parallelo se ``jobs > 1``; il risultato non dipende da `jobs`)."""
-    tasks = [(r["config"], cache_dir) for r in runs]
+def ensure_all_cached(runs: list, cache_dir: Path, jobs: int = 1, with_channel=None) -> None:
+    """Simula e salva in cache le corse mancanti (parallelo se ``jobs > 1``; il risultato non dipende da `jobs`).
+
+    `with_channel` (funzione ``corsa -> bool``, Blocco 6) sceglie le corse per cui si salva anche la cache dei Blocchi 1-2 (`load_or_simulate_channel`).
+    """
+    tasks = [(r["config"], cache_dir, bool(with_channel and with_channel(r))) for r in runs]
     if jobs <= 1:
         for task in tasks:
             _ensure_cached(task)

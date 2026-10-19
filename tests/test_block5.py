@@ -20,7 +20,11 @@ DATA = Path(__file__).resolve().parent / "data"
 
 @pytest.fixture(scope="session")
 def base_config():
-    return load_config(CONFIG_PATH)
+    """Config con i valori del Blocco 4 fissati esplicitamente (`history.block4`): questi test sono stati scritti per quei default."""
+    from src.refinement import apply_overrides
+
+    config = load_config(CONFIG_PATH)
+    return apply_overrides(config, config["history"]["block4"])
 
 
 @pytest.fixture
@@ -36,13 +40,14 @@ def _load_reference_module():
 
 
 # ---------------------------------------------------------------------------
-# 1. Default = Blocco 4
+# 1. Config del Blocco 4 (fissata esplicitamente) = Blocco 4
 # ---------------------------------------------------------------------------
 
 
 @pytest.mark.parametrize("scenario", ["none", "slowdown", "stop"])
-def test_default_reproduces_block4(scenario):
-    """Con la config di default, Kalman, indici fusi, allarmi e metriche coincidono ESATTAMENTE con il Blocco 4.
+def test_block4_config_reproduces_block4(scenario):
+    """Con la config del Blocco 4 FISSATA ESPLICITAMENTE (`history.block4`: release_time 5 s, mode both, sigma_a 0,5, nessuna opzione dei Blocchi 5-6;
+    non i default, che dal Blocco 6 descrivono il rilevatore finale), Kalman, indici fusi, allarmi e metriche coincidono ESATTAMENTE con il Blocco 4.
 
     Il riferimento `tests/data/block4_reference.npz` è stato generato con il codice del commit 16c6180, prima del Blocco 5
     (`tests/data/make_block4_reference.py`): una corsa breve per scenario, su tutte le modalità, gli ambiti e le soglie.
@@ -51,6 +56,7 @@ def test_default_reproduces_block4(scenario):
     config = module.reference_config()
     assert config["kalman"]["robust"] == "none" and config["fusion"]["rule"] == "weighted_mean"
     assert config["detector"]["reference"] == "absolute" and config["kalman"]["r_inflation"] == 1.0
+    assert config["detector"]["release_time"] == 5.0 and config["detector"]["lost_rule"] == "any"
     fresh = module.reference_outputs(scenario, config)
     with np.load(DATA / "block4_reference.npz") as ref:
         names = [k.split("/", 1)[1] for k in ref.files if k.startswith(scenario + "/")]

@@ -23,6 +23,7 @@ sys.path.insert(0, str(_REPO_ROOT))
 from src.experiment import pooled_fading_variance  # noqa: E402
 from src.kalman import measurement_noise  # noqa: E402
 from src.mobility import load_config  # noqa: E402
+from src.refinement import block4_config  # noqa: E402
 from src.refinement import (  # noqa: E402
     SEPARATED,
     _kalman_key,
@@ -231,7 +232,7 @@ def main() -> None:
     parser.add_argument("--force", action="store_true", help="prosegue anche se la stima supera ``refinement.time_budget_minutes``")
     args = parser.parse_args()
 
-    config = load_config(args.config)
+    config = block4_config(load_config(args.config))  # Blocco 6: i default sono cambiati, qui valgono quelli del Blocco 4
     cache_dir, out_dir = Path(args.cache_dir), Path(args.out_dir)
     rcfg = config["refinement"]
     min_net = rcfg["min_net_gain_runs"]
@@ -260,7 +261,8 @@ def main() -> None:
         t_probe.append(time.perf_counter() - t0)
     n_none = config["metrics"]["n_runs"]
     est_phase1 = (t_probe[0] * n_none + t_probe[1] * n_none * 2) / jobs / 60.0
-    est_total = est_phase1 * 1.6 + 3.5  # fase F ed E + simulazione delle corse independent (circa 3 min con 8 processi)
+    te = rcfg["time_estimate"]
+    est_total = est_phase1 * te["factor"] + te["extra_minutes"]  # fase F ed E + simulazione delle corse independent (circa 3 min con 8 processi)
     print(
         f"Una corsa none con {len(variants1)} varianti: {t_probe[0]:.1f} s; con distacco: {t_probe[1]:.1f} s."
         f" Stima: fase A-D {est_phase1:.1f} min, totale circa {est_total:.1f} min"

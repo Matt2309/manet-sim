@@ -1,0 +1,38 @@
+date: '2026-10-19T14:44:40'
+commit: 0b8c38d1876709e661b4c4ed607936d4f8e6f02c
+dirty: true
+tuning_set:
+  runs_per_scenario: 50
+  seed_keys:
+    runs: 7
+    separation: 6
+R: 10.835329115361843
+release_time: 30.0
+thresholds:
+  media:
+    threshold: -75.0
+    scope: fused
+    fusion_rule: weighted_mean
+    tuning:
+      p_detect_slowdown: 1.0
+      p_detect_stop: 0.96
+      fa_per_hour: 0.9569060039206553
+      active_fraction: 0.001969498621125029
+  migliore:
+    threshold: -67.5
+    scope: fused
+    fusion_rule: max
+    tuning:
+      p_detect_slowdown: 1.0
+      p_detect_stop: 0.98
+      fa_per_hour: 0.7655248031365243
+      active_fraction: 0.0015040701731069543
+  coppia:
+    threshold: -87.5
+    scope: pairwise
+    fusion_rule: weighted_mean
+    tuning:
+      p_detect_slowdown: 0.74
+      p_detect_stop: 0.7
+      fa_per_hour: 0.9808286540186717
+      active_fraction: 0.001916868790909393

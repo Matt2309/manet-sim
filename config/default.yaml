@@ -111,11 +111,18 @@ packets:
     sensitivity_success: 0.92 # probabilità di ricezione alla sensibilità (definizione 802.11b: 8% di pacchetti persi)
     transition_width: 2.0     # dB; da 10% a 90% di ricezione. Valore iniziale, da misurare con le Heltec
     background_loss: 0.02     # probabilità di perdita indipendente dal segnale (interferenze Wi-Fi)
+    # Blocco 6 (D2): perdite di fondo a raffiche. "independent" riproduce esattamente il Blocco 3.
+    background_model: independent   # "independent" | "bursty"
+    bursty:                        # Gilbert-Elliott a due stati (buono / disturbato), catena di Markov sulla griglia dt
+      mean_loss: 0.02            # frazione di tempo in cui il ricevitore è disturbato
+      mean_burst: 1.0            # s, durata media di una raffica
+      loss_bad: 1.0              # perdita nello stato disturbato
+      burst_scope: receiver      # "receiver" | "link"
 
 # Blocco 4: Kalman per link, tabella dei vicini, fusione, allarmi, metriche.
 kalman:
   measurement_noise: auto        # dB²; "auto" = varianza del fading (Blocco 2) + 1/12 di quantizzazione
-  sigma_a: 0.5                   # dB/s²; quanto in fretta può cambiare la pendenza (valore di default)
+  sigma_a: 0.25                  # dB/s²; quanto in fretta può cambiare la pendenza (Blocco 6: 0.25; il Blocco 4 usava 0.5)
   sigma_a_sweep: [0.25, 0.5, 1.0, 2.0]
   initial_slope_std: 3.0         # dB/s; incertezza iniziale sulla pendenza
   reinit_gap: 10.0               # s; dopo un silenzio più lungo il filtro riparte da zero
@@ -133,16 +140,17 @@ fusion:
   max_age: 2.0                   # s; le voci più vecchie sono escluse
   max_age_own: true              # vale anche per la stima propria del link i→m (false = resta sempre, con varianza crescente)
   # Blocco 5 (A): regola di fusione sull'indice di segnale (più alto = più vicino).
-  rule: weighted_mean            # "weighted_mean" | "median" | "max"
+  rule: weighted_mean            # "weighted_mean" | "median" | "max"; Blocco 6: verdetto = media (results/block6/verdict.yaml)
   rule_sweep: [weighted_mean, median, max]
 detector:
-  mode: both                     # "level" | "slope" | "both"
+  mode: level                    # "level" | "slope" | "both" (Blocco 6: level; il Blocco 4 usava both)
   scope: fused                   # "fused" | "pairwise"
-  level_threshold: -75.0         # dBm; circa 30 m con la sola distanza
+  level_threshold: -75.0         # dBm; soglia CONGELATA sulla taratura per il rilevatore finale (results/block6/frozen_thresholds.yaml); circa 30 m con la sola distanza
   slope_threshold: -0.5          # dB/s; soglia in "slope", conferma in "both"
   min_duration: 1.0              # s; durata minima della condizione per accendere il pre-allarme
   lost_silence: 10.0             # s; allarme "nodo perso"
-  release_time: 5.0              # s di ricezione buona per spegnere un allarme
+  release_time: 30.0             # s di ricezione buona per spegnere un allarme (Blocco 6: adottato dal Blocco 5; era 5.0)
+  lost_rule: any                 # Blocco 6 (D4): "any" | "not_deaf" (l'osservatore che non sente nessuno non dà il "perso")
   release_reception: 0.8         # frazione minima di beacon ricevuti in quella finestra
   release_level_margin: 3.0      # dB oltre la soglia per considerare rientrato il livello
   release_slope_margin: 0.5      # dB/s, idem per la pendenza
@@ -182,3 +190,46 @@ refinement:
   nis_quantile: 0.99             # percentile della NIS riportato nel gruppo
   time_budget_minutes: 45        # stima oltre la quale l'esperimento si ferma e chiede (con 8 processi)
   drop_histogram: [-10.0, 60.0, 1.0]   # inizio, fine, passo (dB) dell'istogramma del calo fuso (diagnostica)
+  time_estimate: {factor: 1.6, extra_minutes: 3.5}   # stima del tempo totale del Blocco 5: fase A-D * factor + extra (min, con 8 processi)
+
+# Blocco 6: numeri finali e sensibilità.
+final:
+  n_runs: 100                    # corse di verifica per scenario
+  sensitivity_runs: 50           # prime corse di verifica usate nella sensibilità
+  seed_keys: {runs: 8, separation: 9, bursts: 10, bootstrap: 11}   # bootstrap: generatore dei ricampionamenti
+  configs: [media, migliore, coppia]
+  config_defs:                   # sostituzioni di config (chiavi puntate) per ciascuna configurazione
+    media: {detector.scope: fused, fusion.rule: weighted_mean}
+    migliore: {detector.scope: fused, fusion.rule: max}
+    coppia: {detector.scope: pairwise, fusion.rule: weighted_mean}
+  common:                        # fissate esplicitamente: il Blocco 6 non dipende dai default
+    kalman.sigma_a: 0.25
+    kalman.robust: none
+    detector.mode: level
+    detector.reference: absolute
+    detector.release_time: 30.0
+    detector.min_observers: 1
+    detector.lost_rule: any
+    packets.reception.background_model: independent
+  min_net_gain: 3                # corse nette per adottare "migliore"
+  bootstrap_samples: 2000
+  time_budget_minutes: 60        # stima oltre la quale l'esperimento si ferma e chiede (con 8 processi)
+  burst_long: 10.0               # s; una raffica più lunga di questo valore fa scattare il "perso" (= detector.lost_silence)
+  sensitivity_points:
+    sens_96:     {packets.reception.sensitivity_dbm: -96.0}
+    bursty_2_1:  {packets.reception.background_model: bursty, packets.reception.bursty.mean_loss: 0.02, packets.reception.bursty.mean_burst: 1.0}
+    bursty_2_3:  {packets.reception.background_model: bursty, packets.reception.bursty.mean_loss: 0.02, packets.reception.bursty.mean_burst: 3.0}
+    bursty_5_3:  {packets.reception.background_model: bursty, packets.reception.bursty.mean_loss: 0.05, packets.reception.bursty.mean_burst: 3.0}
+    pessimista:  {packets.reception.sensitivity_dbm: -96.0, packets.reception.background_model: bursty, packets.reception.bursty.mean_loss: 0.05, packets.reception.bursty.mean_burst: 3.0}
+  not_deaf_points: [base, bursty_2_1, bursty_2_3, bursty_5_3, pessimista]   # punti in cui si prova anche lost_rule: not_deaf
+
+# Configurazione del Blocco 4 (sostituzioni ai default del Blocco 6): serve agli script dei Blocchi 4-5 e ai test.
+history:
+  block4:
+    kalman.sigma_a: 0.5
+    detector.mode: both
+    detector.release_time: 5.0
+    detector.lost_rule: any
+    fusion.rule: weighted_mean
+    kalman.robust: none
+    packets.reception.background_model: independent

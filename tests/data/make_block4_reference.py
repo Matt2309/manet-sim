@@ -24,6 +24,12 @@ DURATION, SEED, NODE, START, SIGMA_A, R = 150.0, 5, 2, 60.0, 0.25, 9.0
 
 def reference_config() -> dict:
     cfg = load_config(_ROOT / "config" / "default.yaml")
+    for dotted, value in cfg["history"]["block4"].items():  # Blocco 6: i default sono cambiati, il Blocco 4 si fissa esplicitamente
+        node = cfg
+        *path, last = dotted.split(".")
+        for key in path:
+            node = node[key]
+        node[last] = value
     cfg["simulation"]["duration"] = DURATION
     cfg["metrics"]["level_threshold_sweep"] = [-90.0, -65.0, 5.0]
     cfg["metrics"]["slope_threshold_sweep"] = [-3.0, -0.5, 0.5]

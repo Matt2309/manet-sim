@@ -162,7 +162,7 @@ def evaluate_run(inputs: DetectionInputs, config: dict, summarize) -> dict:
     dcfg = config["detector"]
     mcfg = config["metrics"]
     t = inputs.t
-    lost_obs = lost_alarm(inputs.silence, inputs.rx_ok, t, dcfg, inputs.valid)
+    lost_obs = lost_alarm(inputs.silence, inputs.rx_ok, t, dcfg, inputs.valid, **inputs.lost_kwargs())
     results = {("-", "-", "lost"): _stack([math.nan], [summarize(system_alarm(lost_obs, dcfg["min_observers"]))])}
     for scope in SCOPES:
         for mode in MODES:
@@ -409,7 +409,7 @@ def evaluate_config(
     """
     dcfg = config["detector"]
     grid, states = observer_states(inputs, config, scope)
-    lost_obs = lost_alarm(inputs.silence, inputs.rx_ok, inputs.t, dcfg, inputs.valid)
+    lost_obs = lost_alarm(inputs.silence, inputs.rx_ok, inputs.t, dcfg, inputs.valid, **inputs.lost_kwargs())
     out = {}
     for mo in min_observers:
         out[mo] = _stack(grid, [summarize(system_alarm(states[n] | lost_obs, mo)) for n in range(len(grid))])

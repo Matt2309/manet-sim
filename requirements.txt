@@ -1,6 +1,7 @@
-numpy
-scipy
-matplotlib
-pyyaml
-pytest
-numba
+numpy==2.5.3
+scipy==1.18.1
+matplotlib==3.11.2
+PyYAML==6.0.3
+pytest==9.1.1
+numba==0.68.0
+llvmlite==0.50.0

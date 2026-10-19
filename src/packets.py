@@ -15,6 +15,8 @@ beacon ricevuti, con il loro RSSI. Indici ``[i, ..., j]`` = trasmette ``i``, ric
 6. Conoscenza di ogni osservatore `m` sulla griglia del simulatore.
 
 Parametri: sezione ``packets`` della config.
+
+Blocco 6: perdite di fondo a raffiche (modello di Gilbert-Elliott per ricevitore o per link), opzione ``background_model``.
 """
 
 from __future__ import annotations
@@ -48,6 +50,7 @@ class PacketResult:
     p_success: np.ndarray  # (N, K, N) probabilità di ricezione (curva × fondo)
     passed_signal: np.ndarray  # (N, K, N) bool, prova del segnale superata
     passed_background: np.ndarray  # (N, K, N) bool, prova di fondo superata
+    background_state: np.ndarray | None  # Blocco 6: (T, N) o (T, N, N) bool, stato disturbato (None con ``independent``)
     received: np.ndarray  # (N, K, N) bool, diagonale False
     rssi: np.ndarray  # (N, K, N) dBm misurato, NaN se perso
     knowledge_rssi: np.ndarray  # (T, M, N, N) float32, cosa sa m del link i→j
@@ -83,6 +86,50 @@ def reception_probability(rssi: np.ndarray, reception_cfg: dict) -> np.ndarray:
     if model == "threshold":
         return (x >= reception_cfg["sensitivity_dbm"]).astype(float)
     raise ValueError(f"packets.reception.model deve essere 'curve' o 'threshold', non {model!r}")
+
+
+# ---------------------------------------------------------------------------
+# Perdite a raffiche (Blocco 6)
+# ---------------------------------------------------------------------------
+
+
+def gilbert_elliott_states(n_steps: int, shape: tuple, dt: float, bursty_cfg: dict, rng: np.random.Generator) -> np.ndarray:
+    """Catene di Gilbert-Elliott a due stati (buono / disturbato) sulla griglia `dt`.
+
+    Input: `n_steps` passi, `shape` = forma delle catene indipendenti (``(N,)`` per ricevitore, ``(N, N)`` per link), `bursty_cfg`
+    (``mean_loss`` L, ``mean_burst`` T_b), generatore `rng`.
+    Procedimento: durata media del periodo buono ``T_g = T_b (1 - L) / L``; per passo buono → disturbato con probabilità
+    ``1 - exp(-dt / T_g)``, disturbato → buono ``1 - exp(-dt / T_b)``. Stato iniziale dalla distribuzione stazionaria (disturbato con
+    probabilità L). Si estraggono sempre ``n_steps + 1`` uniformi per catena (la prima per lo stato iniziale).
+    Output: bool ``(n_steps, *shape)``, True = disturbato.
+    """
+    loss, burst = bursty_cfg["mean_loss"], bursty_cfg["mean_burst"]
+    if not 0.0 < loss < 1.0 or burst <= 0.0:
+        raise ValueError("packets.reception.bursty: mean_loss in (0, 1) e mean_burst > 0")
+    good = burst * (1.0 - loss) / loss
+    p_go_bad = -math.expm1(-dt / good)
+    p_go_good = -math.expm1(-dt / burst)
+    u = rng.random((n_steps + 1,) + tuple(shape))
+    state = np.empty((n_steps,) + tuple(shape), dtype=bool)
+    cur = u[0] < loss
+    for k in range(n_steps):
+        state[k] = cur
+        cur = np.where(cur, u[k + 1] >= p_go_good, u[k + 1] < p_go_bad)
+    return state
+
+
+def burst_lengths(state: np.ndarray, dt: float) -> np.ndarray:
+    """Durate (s) delle raffiche complete di `state` (tempo sul primo asse): sequenze consecutive di True comprese fra due False."""
+    flat = state.reshape(state.shape[0], -1)
+    out = []
+    for column in flat.T:
+        padded = np.concatenate([[False], column, [False]]).astype(np.int8)
+        edges = np.flatnonzero(np.diff(padded))
+        starts, stops = edges[0::2], edges[1::2]
+        for a, b in zip(starts, stops):
+            if a > 0 and b < len(column):
+                out.append((b - a) * dt)
+    return np.asarray(out)
 
 
 # ---------------------------------------------------------------------------
@@ -205,6 +252,9 @@ def simulate_packets(
     """Simulazione dei pacchetti del Blocco 3 (config: percorso YAML o dict con ``simulation`` e ``packets``).
     Generatori indipendenti dal Blocco 2: ``SeedSequence(seed, spawn_key=(4,))`` per gli istanti, ``(5,)`` per la ricezione, da cui si estraggono sempre due array uniformi (N, K, N):
     segnale (``u < p_curve(rssi_true)``, RSSI vero non arrotondato) e fondo (``u >= background_loss``), così variare uno non cambia l'altro. Il beacon arriva se superano entrambe.
+    Blocco 6: con ``background_model: bursty`` la prova di fondo è sostituita da catene di Gilbert-Elliott (`gilbert_elliott_states`, generatore dedicato
+    ``spawn_key=(10,)``, uno per ricevitore o per link secondo ``burst_scope``): nello stato disturbato il beacon è perso con probabilità ``loss_bad`` (usando
+    l'uniforme di fondo già estratta). Con ``independent`` il comportamento è identico a prima, bit per bit.
     """
     cfg = load_config(config)
     pk = cfg["packets"]
@@ -233,11 +283,31 @@ def simulate_packets(
     u_signal = rng_rx.random((n_nodes, n_beacons, n_nodes))
     u_background = rng_rx.random((n_nodes, n_beacons, n_nodes))
     passed_signal = off_diag & (u_signal < p_curve)
-    passed_background = off_diag & (u_background >= rc["background_loss"])
+    background_model = rc["background_model"]
+    background_state = None
+    if background_model == "independent":
+        passed_background = off_diag & (u_background >= rc["background_loss"])
+        background_loss = rc["background_loss"]
+    elif background_model == "bursty":
+        bcfg = rc["bursty"]
+        rng_burst = np.random.default_rng(np.random.SeedSequence(seed, spawn_key=(10,)))
+        shape = (n_nodes,) if bcfg["burst_scope"] == "receiver" else (n_nodes, n_nodes)
+        if bcfg["burst_scope"] not in ("receiver", "link"):
+            raise ValueError("packets.reception.bursty.burst_scope deve essere 'receiver' o 'link'")
+        background_state = gilbert_elliott_states(len(t), shape, dt, bcfg, rng_burst)
+        steps_safe = np.where(valid, steps, 0)[:, :, None]
+        if bcfg["burst_scope"] == "receiver":
+            bad = background_state[steps_safe, rx]
+        else:
+            bad = background_state[steps_safe, tx, rx]
+        passed_background = off_diag & ~(bad & (u_background < bcfg["loss_bad"]))
+        background_loss = bcfg["mean_loss"] * bcfg["loss_bad"]
+    else:
+        raise ValueError(f"packets.reception.background_model deve essere 'independent' o 'bursty', non {background_model!r}")
     received = passed_signal & passed_background
 
     rssi = np.where(received, rssi_meas, np.nan)
-    p_success = p_curve * (1.0 - rc["background_loss"])
+    p_success = p_curve * (1.0 - background_loss)
 
     k_rssi, k_age = _knowledge(t, times, received, rssi)
 
@@ -251,6 +321,7 @@ def simulate_packets(
         "n_beacons_per_node": valid.sum(axis=1),
         "received_fraction": float(received.sum() / n_trials),
         "lost_signal_fraction": float((off_diag & ~passed_signal).sum() / n_trials),
+        "background_model": background_model,
         "lost_background_only_fraction": float((passed_signal & ~passed_background).sum() / n_trials),
         "elapsed": time.perf_counter() - t0,
     }
@@ -261,6 +332,7 @@ def simulate_packets(
         p_success=p_success,
         passed_signal=passed_signal,
         passed_background=passed_background,
+        background_state=background_state,
         received=received,
         rssi=rssi,
         knowledge_rssi=k_rssi,

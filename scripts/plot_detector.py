@@ -27,6 +27,7 @@ from src.experiment import load_results, print_summary
 from src.kalman import predict_links
 from src.metrics import best_over_sigma
 from src.mobility import load_config
+from src.refinement import block4_config
 from src.simulator import experiment_runs, load_or_simulate
 
 # Palette categorica (ordine fisso): blu, arancio, acqua; testo e griglia neutri.
@@ -154,7 +155,7 @@ def plot_fused_index(info, run, inputs, config, path):
         style_axes(ax)
     # intervalli di allarme dell'osservatore mostrato (pre-allarme e "perso", ambito fuso)
     pre = pre_alarm(inputs.level["fused"], inputs.slope["fused"], inputs.rx_ok, t, d, valid=inputs.valid)
-    lost = lost_alarm(inputs.silence, inputs.rx_ok, t, d, inputs.valid)
+    lost = lost_alarm(inputs.silence, inputs.rx_ok, t, d, inputs.valid, **inputs.lost_kwargs())
     for ax in axes:
         shade_intervals(ax, t, pre[:, fused_obs, node], C_SLOPE, "pre-allarme" if ax is axes[0] else None)
         shade_intervals(ax, t, lost[:, fused_obs, node], C_LEVEL, "nodo perso" if ax is axes[0] else None)
@@ -309,7 +310,7 @@ def main() -> None:
     parser.add_argument("--out-dir", default=str(_REPO_ROOT / "results"))
     args = parser.parse_args()
 
-    config = load_config(args.config)
+    config = block4_config(load_config(args.config))  # Blocco 6: i default sono cambiati, qui valgono quelli del Blocco 4
     out_dir = Path(args.out_dir)
     out_dir.mkdir(parents=True, exist_ok=True)
     rows, details = load_results(Path(args.in_dir))

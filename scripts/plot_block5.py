@@ -279,7 +279,7 @@ def system_alarm_for(res, run, name):
     thr = res["summaries"][(name, "fused", 1)]["wp"]["threshold"]
     t = run["t"]
     pre = pre_alarm(sliced.level["fused"], sliced.slope["fused"], sliced.rx_ok, t, vcfg["detector"], "level", level_threshold=thr, valid=sliced.valid)
-    lost = lost_alarm(sliced.silence, sliced.rx_ok, t, vcfg["detector"], sliced.valid)
+    lost = lost_alarm(sliced.silence, sliced.rx_ok, t, vcfg["detector"], sliced.valid, **sliced.lost_kwargs())
     return vcfg, system_alarm(pre | lost, 1)
 
 

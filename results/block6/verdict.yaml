@@ -1,0 +1,12 @@
+date: '2026-10-19T14:47:50'
+commit: 0b8c38d1876709e661b4c4ed607936d4f8e6f02c
+adopted: media
+net: 1
+gained: 1
+lost: 0
+min_net_gain: 3
+fa_media: 0.9210220287736322
+fa_migliore: 0.861215403528591
+mcnemar_p: 1.0
+final: media
+final_threshold: -75.0

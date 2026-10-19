@@ -51,7 +51,11 @@ CONFIG_PATH = Path(__file__).resolve().parent.parent / "config" / "default.yaml"
 
 @pytest.fixture(scope="session")
 def base_config():
-    return load_config(CONFIG_PATH)
+    """Config con i valori del Blocco 4 fissati esplicitamente (`history.block4`): questi test sono stati scritti per quei default."""
+    from src.refinement import apply_overrides
+
+    config = load_config(CONFIG_PATH)
+    return apply_overrides(config, config["history"]["block4"])
 
 
 @pytest.fixture

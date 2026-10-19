@@ -27,6 +27,7 @@ from src.experiment import (  # noqa: E402
 )
 from src.kalman import measurement_noise  # noqa: E402
 from src.mobility import load_config  # noqa: E402
+from src.refinement import block4_config  # noqa: E402
 from src.simulator import ensure_all_cached, experiment_runs, load_or_simulate  # noqa: E402
 
 
@@ -38,7 +39,7 @@ def time_single_run(config: dict, run_info: dict, cache_dir: Path, R: float) -> 
     d = config["detector"]
     scope = d["scope"]
     pre = pre_alarm(inputs.level[scope], inputs.slope[scope], inputs.rx_ok, inputs.t, d, valid=inputs.valid)
-    lost = lost_alarm(inputs.silence, inputs.rx_ok, inputs.t, d, inputs.valid)
+    lost = lost_alarm(inputs.silence, inputs.rx_ok, inputs.t, d, inputs.valid, **inputs.lost_kwargs())
     count_episodes(system_alarm(pre | lost, d["min_observers"]), inputs.t, d["warmup"])
     return time.perf_counter() - t0
 
@@ -51,7 +52,7 @@ def main() -> None:
     parser.add_argument("--out-dir", default=str(_REPO_ROOT / "results" / "detection"))
     args = parser.parse_args()
 
-    config = load_config(args.config)
+    config = block4_config(load_config(args.config))  # Blocco 6: i default sono cambiati, qui valgono quelli del Blocco 4
     cache_dir, out_dir = Path(args.cache_dir), Path(args.out_dir)
     runs = experiment_runs(config)
     print(f"{len(runs)} corse ({config['metrics']['n_runs']} per scenario: {config['metrics']['scenarios']})")

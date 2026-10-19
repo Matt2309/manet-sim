@@ -67,6 +67,12 @@ def apply_overrides(config: dict, overrides: dict) -> dict:
     return cfg
 
 
+def block4_config(config: dict) -> dict:
+    """Copia della config con i valori del Blocco 4 (`history.block4`): i default sono quelli del rilevatore finale (Blocco 6),
+    gli script dei Blocchi 4-5 li rimettono per rifare i numeri di allora."""
+    return apply_overrides(config, config["history"]["block4"])
+
+
 def make_variant(name: str, group: str, overrides: dict, scopes=("fused",), min_observers=(1,), corr=False) -> dict:
     return {
         "name": name,
