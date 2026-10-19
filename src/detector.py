@@ -29,6 +29,7 @@ from dataclasses import dataclass
 
 import numpy as np
 
+from src.fusion import combine
 from src.kalman import KalmanResult, filter_all, predict_links
 from src.packets import forward_link_payload
 
@@ -83,6 +84,12 @@ def neighbour_knowledge(t: np.ndarray, kres: KalmanResult, table_cfg: dict) -> d
     (quantizzata) + tempo dalla ricezione (esatto). Restituisce ``r``, ``s``, ``std``, ``age``
     (T, M, N, N) indicizzati ``[t, m, i, j]``; per ``j == m`` l'età è esatta (stima propria).
     """
+    return neighbour_knowledge_relay(t, kres, table_cfg)[0]
+
+
+def neighbour_knowledge_relay(t: np.ndarray, kres: KalmanResult, table_cfg: dict) -> tuple:
+    """Come `neighbour_knowledge`, ma restituisce anche ``relay`` (T, M, N, N) float64: istante del beacon di `j` che ha inoltrato
+    la tabella (NaN per ``j == m``, cioè la stima propria). Serve a riconoscere un valore NUOVO del link (Blocco 5, livello relativo)."""
     payload = {
         "r": _quantize(kres.r, table_cfg["rssi_step"], _INT8),
         "s": _quantize(kres.s, table_cfg["slope_step"], _SLOPE),
@@ -93,7 +100,7 @@ def neighbour_knowledge(t: np.ndarray, kres: KalmanResult, table_cfg: dict) -> d
     age_tx = np.maximum(age.astype(float) - since_rx, 0.0)
     age_q = _quantize(age_tx, table_cfg["age_step"], _UINT8) + since_rx
     fields["age"] = np.where(np.isnan(relay), age.astype(float), age_q)
-    return fields
+    return fields, relay
 
 
 # ---------------------------------------------------------------------------
@@ -108,47 +115,37 @@ def fuse(
     ages: np.ndarray,
     max_age: float,
     min_variance: float = 0.0,
+    rule: str = "weighted_mean",
 ) -> tuple:
-    """Media pesata delle voci di un bersaglio (voci sull'ULTIMO asse, `max_age` in s).
+    """Fonde le voci di un bersaglio (voci sull'ULTIMO asse, `max_age` in s) con la regola `rule` (`src/fusion.py`).
 
-    Voce valida: campi finiti ed ``età <= max_age``; peso ``w = 1/max(var, min_variance)``,
-    ``L = Σ w r / Σ w``, ``S = Σ w s / Σ w``, varianza ``1/Σ w``.
-    Restituisce (L, S, varianza, n voci valide); NaN dove nessuna voce è valida.
+    Voce valida: campi finiti ed ``età <= max_age``. Con ``weighted_mean`` (base): peso ``w = 1/max(var, min_variance)``,
+    ``L = Σ w r / Σ w``, ``S = Σ w s / Σ w``, varianza ``1/Σ w``. Restituisce (L, S, varianza, n voci valide);
+    NaN dove nessuna voce è valida.
     """
     values = np.asarray(values, dtype=float)
     slopes = np.asarray(slopes, dtype=float)
     variances = np.asarray(variances, dtype=float)
     ages = np.asarray(ages, dtype=float)
-    valid = (
-        np.isfinite(values) & np.isfinite(slopes) & np.isfinite(variances) & np.isfinite(ages) & (ages <= max_age)
-    )
-    floor = max(min_variance, np.finfo(float).tiny)
-    weight = np.where(valid, 1.0 / np.maximum(np.where(valid, variances, 1.0), floor), 0.0)
-    total = weight.sum(axis=-1)
-    has = total > 0.0
-    safe = np.where(has, total, 1.0)
-    level = np.where(has, (weight * np.where(valid, values, 0.0)).sum(axis=-1) / safe, np.nan)
-    slope = np.where(has, (weight * np.where(valid, slopes, 0.0)).sum(axis=-1) / safe, np.nan)
-    variance = np.where(has, 1.0 / safe, np.nan)
-    return level, slope, variance, valid.sum(axis=-1)
+    valid = _valid_entries(values, slopes, variances, ages, max_age)
+    return combine(values, slopes, variances, valid, rule, min_variance)
 
 
-def fusion_indices(
-    t: np.ndarray, kres: KalmanResult, config: dict, sigma_a: float | None = None
-) -> dict:
-    """Livello e pendenza di ogni bersaglio per ogni osservatore, fusi e non (`sigma_a` default del filtro).
+def _valid_entries(values, slopes, variances, ages, max_age: float) -> np.ndarray:
+    """Voci valide: campi finiti ed ``età <= max_age``."""
+    return np.isfinite(values) & np.isfinite(slopes) & np.isfinite(variances) & np.isfinite(ages) & (ages <= max_age)
 
-    Voci per ``(m, i)``: stima propria ``i → m`` predetta all'istante corrente (`predict_links`) e,
-    per ogni compagno `k`, la voce ``i → k`` dall'ultima tabella di `k` ricevuta da `m`. Escluse
-    quelle con età > ``fusion.max_age`` (la propria solo se ``fusion.max_age_own``). Varianza minima
-    in tabella ``std_step²/12``. Restituisce ``fused`` (tutte le voci) e ``pairwise`` (solo la propria),
-    ciascuno ``(L, S, var, n)`` con array (T, M, I) ``[t, m, i]``; diagonale ``m == i`` NaN.
+
+def _entry_arrays(t: np.ndarray, kres: KalmanResult, config: dict, sigma_a: float) -> tuple:
+    """Voci ``(T, M, I, K)`` ``[t, m, i, k]`` del link ``i → k`` come le conosce `m`: (valore, pendenza, varianza, età per la validità, relay, età propria).
+
+    Valore ``r + s·età``, varianza ``std² + σ_a²·età³/3``; per ``k == m`` la stima propria predetta (`predict_links`).
+    ``relay`` è l'istante del beacon di `k` che ha inoltrato la voce (NaN per la propria); ``età propria`` ``[t, i, m]`` è l'età della stima propria.
     """
     fcfg = config["fusion"]
     tcfg = config["neighbour_table"]
-    sigma_a = kres.sigma_a if sigma_a is None else sigma_a
     n_nodes = kres.times.shape[0]
-    know = neighbour_knowledge(t, kres, tcfg)
+    know, relay = neighbour_knowledge_relay(t, kres, tcfg)
     own = predict_links(kres, t)
 
     age = know["age"]
@@ -163,20 +160,67 @@ def fusion_indices(
         slope[:, m, :, m] = own["s"][:, :, m]
         var[:, m, :, m] = own["p00"][:, :, m]
         mask_age[:, m, :, m] = own_age[:, :, m]
+    return value, slope, var, mask_age, relay, own["age"]
+
+
+def fusion_indices(
+    t: np.ndarray, kres: KalmanResult, config: dict, sigma_a: float | None = None
+) -> dict:
+    """Livello e pendenza di ogni bersaglio per ogni osservatore, fusi e non (`sigma_a` default del filtro).
+
+    Voci per ``(m, i)``: stima propria ``i → m`` predetta all'istante corrente (`predict_links`) e,
+    per ogni compagno `k`, la voce ``i → k`` dall'ultima tabella di `k` ricevuta da `m`. Escluse
+    quelle con età > ``fusion.max_age`` (la propria solo se ``fusion.max_age_own``). Varianza minima
+    in tabella ``std_step²/12``. Regola di fusione: ``fusion.rule`` (`src/fusion.py`). Restituisce ``fused``
+    (tutte le voci) e ``pairwise`` (solo la propria), ciascuno ``(L, S, var, n)`` con array (T, M, I)
+    ``[t, m, i]``; diagonale ``m == i`` NaN.
+    """
+    fcfg = config["fusion"]
+    tcfg = config["neighbour_table"]
+    sigma_a = kres.sigma_a if sigma_a is None else sigma_a
+    n_nodes = kres.times.shape[0]
+    value, slope, var, mask_age, _, _ = _entry_arrays(t, kres, config, sigma_a)
 
     min_var = tcfg["std_step"] ** 2 / 12.0
-    fused = fuse(value, slope, var, mask_age, fcfg["max_age"], min_var)
+    rule = fcfg["rule"]
+    fused = fuse(value, slope, var, mask_age, fcfg["max_age"], min_var, rule)
 
     idx = np.arange(n_nodes)
     own_entry = lambda a: a[:, idx, :, idx].transpose(1, 0, 2)[..., None]  # (T, M, I, 1)
     pair = fuse(
-        own_entry(value), own_entry(slope), own_entry(var), own_entry(mask_age), fcfg["max_age"], min_var
+        own_entry(value), own_entry(slope), own_entry(var), own_entry(mask_age), fcfg["max_age"], min_var, rule
     )
     out = {"fused": fused, "pairwise": pair}
     for name, parts in out.items():
         for a in parts:
             a[:, idx, idx] = np.nan if a.dtype.kind == "f" else 0
     return out
+
+
+def fusion_entries(t: np.ndarray, kres: KalmanResult, config: dict, sigma_a: float | None = None) -> dict:
+    """Voci non fuse per il livello relativo (Blocco 5): ``value``, ``var``, ``valid``, ``new``, tutte ``(T, M, I, K)`` ``[t, m, i, k]``.
+
+    Come in `fusion_indices` (stesse voci, stessa validità per età). ``new`` è vero all'istante della griglia in cui `m` ha un valore
+    NUOVO del link ``i → k``: per ``k == m`` un nuovo beacon di `i` ricevuto da `m`; per ``k != m`` un nuovo beacon di `k` (con la sua
+    tabella). Il formato dei beacon non cambia: `m` ricava tutto da sé.
+    """
+    fcfg = config["fusion"]
+    sigma_a = kres.sigma_a if sigma_a is None else sigma_a
+    n_nodes = kres.times.shape[0]
+    value, slope, var, mask_age, relay, own_age = _entry_arrays(t, kres, config, sigma_a)
+    valid = _valid_entries(value, slope, var, mask_age, fcfg["max_age"])
+    new = np.zeros(value.shape, dtype=bool)
+    with np.errstate(invalid="ignore"):
+        new[1:] = np.isfinite(relay[1:]) & ~(relay[1:] == relay[:-1])
+        new[0] = np.isfinite(relay[0])
+        dt = float(t[1] - t[0]) if len(t) > 1 else 0.0
+        for m in range(n_nodes):
+            age = own_age[:, :, m]  # (T, I)
+            fresh = np.zeros(age.shape, dtype=bool)
+            fresh[1:] = np.isfinite(age[1:]) & (np.isnan(age[:-1]) | (age[1:] < age[:-1] + dt - _TIME_TOLERANCE))
+            fresh[0] = np.isfinite(age[0])
+            new[:, m, :, m] = fresh
+    return {"value": value, "var": var, "valid": valid, "new": new & valid}
 
 
 # ---------------------------------------------------------------------------
@@ -331,6 +375,7 @@ class DetectionInputs:
     silence: np.ndarray
     rx_ok: np.ndarray
     valid: np.ndarray  # (M, I) False sulla diagonale
+    entries: dict | None = None  # Blocco 5: voci non fuse (T, M, I, K) per il livello relativo (`fusion_entries`)
 
     def target_slice(self, target: int) -> "DetectionInputs":
         sel = (slice(None), slice(None), target)
@@ -342,15 +387,18 @@ class DetectionInputs:
             silence=self.silence[sel],
             rx_ok=self.rx_ok[sel],
             valid=self.valid[:, target],
+            entries=None if self.entries is None else {k: v[:, :, target, :] for k, v in self.entries.items()},
         )
 
 
-def build_inputs(run: dict, config: dict, sigma_a: float, R: float) -> tuple:
+def build_inputs(run: dict, config: dict, sigma_a: float, R: float, kres: KalmanResult | None = None) -> tuple:
     """`filter_all` → `fusion_indices` → `reception_features` su una corsa (chiavi come `PacketResult`).
 
-    Restituisce (`DetectionInputs`, `KalmanResult`).
+    `kres` (già calcolato con gli stessi parametri del Kalman) evita di rifare il filtro. Con ``detector.reference == "relative"``
+    aggiunge anche le voci non fuse (`fusion_entries`). Restituisce (`DetectionInputs`, `KalmanResult`).
     """
-    kres = filter_all(run["beacon_times"], run["received"], run["rssi"], R, sigma_a, config["kalman"])
+    if kres is None:
+        kres = filter_all(run["beacon_times"], run["received"], run["rssi"], R, sigma_a, config["kalman"])
     t = run["t"]
     indices = fusion_indices(t, kres, config, sigma_a)
     silence, rx_ok = reception_features(t, run["beacon_times"], run["received"], config)
@@ -363,5 +411,6 @@ def build_inputs(run: dict, config: dict, sigma_a: float, R: float) -> tuple:
         silence=silence,
         rx_ok=rx_ok,
         valid=~np.eye(n_nodes, dtype=bool),
+        entries=fusion_entries(t, kres, config, sigma_a) if config["detector"]["reference"] == "relative" else None,
     )
     return inputs, kres

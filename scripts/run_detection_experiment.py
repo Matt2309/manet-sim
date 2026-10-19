@@ -78,7 +78,7 @@ def main() -> None:
         "sweep": t_sweep,
         "experiment": time.perf_counter() - t_start,
     }
-    save_results(out_dir, runs, rows, details, R, timings)
+    save_results(out_dir, runs, rows, details, R, timings, config)
     print(f"Risultati salvati in {out_dir}\n")
 
     saved_rows, saved_details = load_results(out_dir)

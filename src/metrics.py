@@ -44,6 +44,7 @@ from src.detector import (
     pre_alarm,
     system_alarm,
 )
+from src.relative import relative_alarms
 
 VARIANTS = ("pre", "lost", "both")
 MODES = ("level", "slope", "both")
@@ -287,3 +288,138 @@ def best_over_sigma(rows: list, scope: str, mode: str, variant: str) -> dict | N
         if best is None or (-point["p_detect"], point["fa_per_hour"]) < (-best["p_detect"], best["fa_per_hour"]):
             best = point
     return best
+
+
+# ---------------------------------------------------------------------------
+# Blocco 5: metriche aggiuntive e valutazione di una configurazione
+# ---------------------------------------------------------------------------
+
+
+def summarize_separated_ext(
+    system: np.ndarray, t: np.ndarray, idx_start: int, distance: np.ndarray, success_distance: float, repass_distance: float
+) -> dict:
+    """`summarize_separated` più spegnimenti a torto e ripassaggi (Blocco 5, sezione C).
+
+    Input: allarme di sistema (T,) sul nodo separato, `distance` (T,) in m dal gruppo (ground truth), `idx_start` primo campione del distacco.
+    Procedimento: in ``slowdown`` e ``stop`` il nodo separato non rientra mai, quindi ogni spegnimento dell'allarme DOPO il rilevamento
+    (primo campione in allarme `k`) è a torto. Ripassaggio: dopo `k` la distanza supera `repass_distance` e poi torna sotto (il gruppo
+    ripassa accanto al nodo fermo).
+    Output: le chiavi di `summarize_separated` più ``n_wrong_off`` (spegnimenti a torto), ``wrong_off_dist_sum`` e ``wrong_off_dist_min``
+    (m, distanza dal gruppo negli spegnimenti; NaN se nessuno), ``repass`` (bool), ``repass_off`` (l'allarme si è spento durante il
+    ripassaggio), ``alarm_on_end`` (acceso alla fine della corsa).
+    """
+    out = summarize_separated(system, t, idx_start, distance, success_distance)
+    out.update(n_wrong_off=0, wrong_off_dist_sum=0.0, wrong_off_dist_min=math.nan, repass=False, repass_off=False)
+    out["alarm_on_end"] = bool(system[-1]) if math.isfinite(out["delay"]) else False
+    if not math.isfinite(out["delay"]):
+        return out
+    k = idx_start + int(np.flatnonzero(system[idx_start:])[0])
+    falls = k + 1 + np.flatnonzero(system[k:-1] & ~system[k + 1 :])
+    out["n_wrong_off"] = int(len(falls))
+    if len(falls):
+        out["wrong_off_dist_sum"] = float(distance[falls].sum())
+        out["wrong_off_dist_min"] = float(distance[falls].min())
+    far = np.flatnonzero(distance[k:] > repass_distance)
+    if len(far):
+        c = k + int(far[0])
+        back = np.flatnonzero(distance[c:] < repass_distance)
+        if len(back):
+            first = c + int(back[0])
+            leave = np.flatnonzero(distance[first:] >= repass_distance)
+            end = first + int(leave[0]) if len(leave) else len(t)
+            out["repass"] = True
+            out["repass_off"] = bool((~system[first:end]).any())
+    return out
+
+
+def observer_states(inputs: DetectionInputs, config: dict, scope: str) -> tuple:
+    """Pre-allarme di ogni osservatore per ogni soglia: (soglie, stati) con stati ``(soglie, T, M[, I])``.
+
+    ``detector.reference``: ``absolute`` = `pre_alarm` in modalità ``level`` sulla griglia ``level_threshold_sweep`` (dBm);
+    ``relative`` = `relative_alarms` sulla griglia ``drop_threshold_sweep`` (dB).
+    """
+    dcfg, mcfg = config["detector"], config["metrics"]
+    if dcfg["reference"] == "relative":
+        grid = threshold_grid(mcfg["drop_threshold_sweep"])
+        return grid, relative_alarms(inputs, config, scope, grid)
+    if dcfg["reference"] != "absolute":
+        raise ValueError(f"detector.reference deve essere 'absolute' o 'relative', non {dcfg['reference']!r}")
+    grid = threshold_grid(mcfg["level_threshold_sweep"])
+    states = np.stack(
+        [
+            pre_alarm(inputs.level[scope], inputs.slope[scope], inputs.rx_ok, inputs.t, dcfg, "level", level_threshold=thr, valid=inputs.valid)
+            for thr in grid
+        ]
+    )
+    return grid, states
+
+
+def observer_stats(observer: np.ndarray, t: np.ndarray, warmup: float) -> dict:
+    """Somme per la correlazione fra gli allarmi degli osservatori sullo stesso bersaglio (corse ``none``).
+
+    Input: allarmi degli osservatori ``(soglie, T, M, I)``. Dopo il `warmup`: ``n`` (istanti), ``n1[s, m, i]`` (istanti in allarme),
+    ``n11[s, m, m', i]`` (in allarme insieme), ``hist[s, c]`` (istanti-bersaglio con `c` osservatori in allarme). Sommabili fra corse.
+    """
+    first = int(np.searchsorted(t, warmup))
+    a = observer[:, first:].astype(np.float32)
+    n_thr, n_steps, n_obs, n_tgt = a.shape
+    n11 = np.stack([np.einsum("tmi,tni->mni", a[s], a[s]) for s in range(n_thr)])
+    counts = a.sum(axis=2).astype(int)  # (soglie, T, I)
+    hist = np.stack([np.bincount(counts[s].ravel(), minlength=n_obs + 1) for s in range(n_thr)])
+    return {"n": np.array(n_steps), "n1": a.sum(axis=1).astype(np.float64), "n11": n11.astype(np.float64), "hist": hist}
+
+
+def observer_correlation(stats: dict, index: int) -> dict:
+    """Correlazione (phi) media fra gli allarmi di coppie di osservatori sullo stesso bersaglio, alla soglia `index`.
+
+    `stats`: somma di `observer_stats` sulle corse. Phi di ogni terna (osservatore, osservatore', bersaglio) con entrambi diversi dal
+    bersaglio e varianza non nulla; media sulle terne (``phi``, ``n_triples``). Inoltre ``p_two_given_one`` = P(≥2 osservatori | ≥1).
+    """
+    n = float(stats["n"])
+    n1, n11 = stats["n1"][index], stats["n11"][index]
+    n_obs, n_tgt = n1.shape
+    phis = []
+    for i in range(n_tgt):
+        for m1 in range(n_obs):
+            for m2 in range(m1 + 1, n_obs):
+                if i in (m1, m2):
+                    continue
+                var1 = n1[m1, i] * (n - n1[m1, i])
+                var2 = n1[m2, i] * (n - n1[m2, i])
+                if var1 > 0 and var2 > 0:
+                    phis.append((n * n11[m1, m2, i] - n1[m1, i] * n1[m2, i]) / math.sqrt(var1 * var2))
+    hist = stats["hist"][index]
+    at_least_one = float(hist[1:].sum())
+    return {
+        "phi": float(np.mean(phis)) if phis else math.nan,
+        "n_triples": len(phis),
+        "p_two_given_one": float(hist[2:].sum() / at_least_one) if at_least_one > 0 else math.nan,
+    }
+
+
+def evaluate_config(
+    inputs: DetectionInputs, config: dict, scope: str, summarize, min_observers: list, corr_warmup: float | None = None
+) -> dict:
+    """Variante ``both`` (pre-allarme + perso) di una configurazione, su tutta la griglia di soglie, per ogni `min_observers`.
+
+    Input: `inputs` (intero o ritagliato su un bersaglio), `scope`, `summarize(system) -> dict`, lista di `min_observers`.
+    Procedimento: `observer_states` (assoluto o relativo secondo ``detector.reference``), allarme "perso" (non dipende dalla soglia),
+    `system_alarm` e `summarize` a ogni soglia. Con `corr_warmup` aggiunge ``"corr"`` = `observer_stats` degli osservatori.
+    Output: ``{min_observers: {"threshold", chiavi di summarize}}``.
+    """
+    dcfg = config["detector"]
+    grid, states = observer_states(inputs, config, scope)
+    lost_obs = lost_alarm(inputs.silence, inputs.rx_ok, inputs.t, dcfg, inputs.valid)
+    out = {}
+    for mo in min_observers:
+        out[mo] = _stack(grid, [summarize(system_alarm(states[n] | lost_obs, mo)) for n in range(len(grid))])
+    if corr_warmup is not None:
+        out["corr"] = observer_stats(states | lost_obs, inputs.t, corr_warmup)
+    return out
+
+
+def paired_counts(success: np.ndarray, base_success: np.ndarray) -> tuple:
+    """Confronto a coppie con la base: (corse guadagnate, corse perse) = riuscite solo nella variante, riuscite solo nella base."""
+    success = np.asarray(success, dtype=bool)
+    base_success = np.asarray(base_success, dtype=bool)
+    return int((success & ~base_success).sum()), int((~success & base_success).sum())

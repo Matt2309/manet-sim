@@ -31,7 +31,12 @@ from src.metrics import (
 )
 from src.simulator import cache_path, load_or_simulate
 
-NIS_BIN_EDGES = np.linspace(0.0, 12.0, 121)  # solo per l'istogramma della NIS
+
+
+def nis_bin_edges(config: dict) -> np.ndarray:
+    """Estremi dell'istogramma della NIS da ``metrics.nis_histogram`` = [inizio, fine, passo] (solo per il grafico)."""
+    start, stop, step = config["metrics"]["nis_histogram"]
+    return np.linspace(start, stop, int(round((stop - start) / step)) + 1)
 
 
 def pooled_fading_variance(runs: list, cache_dir: Path) -> float:
@@ -62,8 +67,9 @@ def process_run(args: tuple) -> dict:
         nis = kres.nis[np.isfinite(kres.nis)]
         out["nis_sum"] = float(nis.sum())
         out["nis_count"] = int(len(nis))
-        out["nis_hist"] = np.histogram(nis, bins=NIS_BIN_EDGES)[0]
-        out["nis_over"] = int((nis >= NIS_BIN_EDGES[-1]).sum())
+        edges = nis_bin_edges(config)
+        out["nis_hist"] = np.histogram(nis, bins=edges)[0]
+        out["nis_over"] = int((nis >= edges[-1]).sum())
     else:
         node = run["sep_node"]
         idx_start = int(np.searchsorted(t, run["sep_start"]))
@@ -125,7 +131,7 @@ _TEXT_FIELDS = ("scope", "mode", "variant", "scenario")
 _INT_FIELDS = ("n_runs", "fortuitous", "feasible")
 
 
-def save_results(out_dir: Path, runs: list, rows: list, details: dict, R: float, timings: dict) -> None:
+def save_results(out_dir: Path, runs: list, rows: list, details: dict, R: float, timings: dict, config: dict) -> None:
     """Scrive ``runs.csv``, ``sweep.csv`` e ``details.npz`` (array per corsa (corse × soglie), NIS, ``R``, tempi)."""
     out_dir = Path(out_dir)
     out_dir.mkdir(parents=True, exist_ok=True)
@@ -138,7 +144,7 @@ def save_results(out_dir: Path, runs: list, rows: list, details: dict, R: float,
         writer = csv.DictWriter(f, fieldnames=ROW_FIELDS)
         writer.writeheader()
         writer.writerows({k: row[k] for k in ROW_FIELDS} for row in rows)
-    arrays = {"R": np.array(R), "sigma_values": np.array(list(details)), "nis_edges": NIS_BIN_EDGES}
+    arrays = {"R": np.array(R), "sigma_values": np.array(list(details)), "nis_edges": nis_bin_edges(config)}
     for name, value in timings.items():
         arrays[f"time_{name}"] = np.array(value)
     for sigma_a, d in details.items():

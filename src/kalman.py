@@ -15,14 +15,21 @@ quando riceve un beacon di `i`. Indici ``[i, ..., j]`` = trasmette `i`, riceve `
 - rumore di misura `R`: solo fading del Blocco 2 più quantizzazione; torso,
   altri corridori e shadowing sono lenti e li assorbe `Q`.
 
+Robustezza ai salti da corpo (Blocco 5, ``kalman.robust``): ``none`` (base), ``inflate`` (R
+moltiplicato per ``r_inflation``) e ``nis_gate`` (se la NIS supera ``nis_gate`` l'aggiornamento
+usa ``R·NIS/nis_gate``: l'innovazione pesa meno ma non è scartata).
+
 Parametri: sezione ``kalman`` della config.
 """
 
 from __future__ import annotations
 
+import math
 from dataclasses import dataclass
 
 import numpy as np
+
+ROBUST_OPTIONS = ("none", "inflate", "nis_gate")
 
 
 # ---------------------------------------------------------------------------
@@ -109,10 +116,12 @@ def filter_link(
     sigma_a: float,
     initial_slope_std: float,
     reinit_gap: float,
+    nis_gate: float = math.inf,
 ) -> tuple:
     """Kalman di un link su `times` (n,) crescenti e RSSI `z` (n,) dei beacon ricevuti. Al primo beacon o dopo `reinit_gap` s riparte
     (``r = z``, ``s = 0``, ``P = diag(R, initial_slope_std²)``, senza innovazione); altrimenti predice con `Δt` effettivo e aggiorna (P in forma di Joseph).
-    NIS = ``(z - r⁻)² / S``. Ritorna (r, s, P (n, 2, 2), nis, reinit); i beacon persi non producono nulla (vedi `predict_links`).
+    NIS = ``(z - r⁻)² / S`` con ``S = P⁻₀₀ + R``. Con `nis_gate` finito, se la NIS lo supera l'aggiornamento (guadagno e Joseph) usa ``R·NIS/nis_gate``
+    al posto di `R`; la NIS riportata resta quella con `R`. Ritorna (r, s, P (n, 2, 2), nis, reinit); i beacon persi non producono nulla (vedi `predict_links`).
     """
     n = len(times)
     r_out = np.empty(n)
@@ -143,15 +152,19 @@ def filter_link(
             p11 = p11 + sa2 * dt
             innovation = zz - r
             innovation_var = p00 + R
+            nis = innovation * innovation / innovation_var
+            nis_out[idx] = nis
+            noise = R * nis / nis_gate if nis > nis_gate else R
+            if noise != R:
+                innovation_var = p00 + noise
             k0 = p00 / innovation_var
             k1 = p01 / innovation_var
-            nis_out[idx] = innovation * innovation / innovation_var
             r = r + k0 * innovation
             s = s + k1 * innovation
             a = 1.0 - k0
-            new_p00 = a * a * p00 + R * k0 * k0
-            new_p01 = a * (p01 - k1 * p00) + R * k0 * k1
-            new_p11 = k1 * k1 * p00 - 2.0 * k1 * p01 + p11 + R * k1 * k1
+            new_p00 = a * a * p00 + noise * k0 * k0
+            new_p01 = a * (p01 - k1 * p00) + noise * k0 * k1
+            new_p11 = k1 * k1 * p00 - 2.0 * k1 * p01 + p11 + noise * k1 * k1
             p00, p01, p11 = new_p00, new_p01, new_p11
         t_last = t_now
         r_out[idx] = r
@@ -170,7 +183,16 @@ def filter_all(
     sigma_a: float,
     kalman_cfg: dict,
 ) -> KalmanResult:
-    """Applica `filter_link` a ogni coppia `(i, j)` sui beacon di `i` ricevuti da `j`; `times` (N, K), `received` e `rssi` (N, K, N) come in `PacketResult`."""
+    """Applica `filter_link` a ogni coppia `(i, j)` sui beacon di `i` ricevuti da `j`; `times` (N, K), `received` e `rssi` (N, K, N) come in `PacketResult`.
+
+    `kalman_cfg["robust"]`: ``none`` (base), ``inflate`` (il filtro usa ``R·r_inflation``, anche all'avvio) o ``nis_gate`` (vedi `filter_link`).
+    Il risultato conserva `R` nominale; la NIS è quella del filtro (con ``R·r_inflation`` in ``inflate``).
+    """
+    robust = kalman_cfg["robust"]
+    if robust not in ROBUST_OPTIONS:
+        raise ValueError(f"kalman.robust deve essere uno fra {ROBUST_OPTIONS}, non {robust!r}")
+    R_filter = R * kalman_cfg["r_inflation"] if robust == "inflate" else R
+    gate = float(kalman_cfg["nis_gate"]) if robust == "nis_gate" else math.inf
     n_nodes, n_beacons = times.shape
     r = np.full((n_nodes, n_beacons, n_nodes), np.nan)
     s = np.full_like(r, np.nan)
@@ -187,10 +209,11 @@ def filter_all(
             rr, ss, pp, nn, ri = filter_link(
                 times[i, got],
                 rssi[i, got, j],
-                R,
+                R_filter,
                 sigma_a,
                 kalman_cfg["initial_slope_std"],
                 kalman_cfg["reinit_gap"],
+                gate,
             )
             r[i, got, j], s[i, got, j], P[i, got, j], nis[i, got, j], reinit[i, got, j] = rr, ss, pp, nn, ri
     return KalmanResult(times, received.copy(), r, s, P, nis, reinit, float(sigma_a), float(R))

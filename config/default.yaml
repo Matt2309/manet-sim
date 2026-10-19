@@ -119,6 +119,11 @@ kalman:
   sigma_a_sweep: [0.25, 0.5, 1.0, 2.0]
   initial_slope_std: 3.0         # dB/s; incertezza iniziale sulla pendenza
   reinit_gap: 10.0               # s; dopo un silenzio più lungo il filtro riparte da zero
+  # Blocco 5 (D): robustezza ai salti da corpo. I default riproducono il Blocco 4.
+  robust: none                   # "none" | "inflate" | "nis_gate"
+  r_inflation: 1.0               # "inflate": R moltiplicato per questo fattore
+  r_inflation_sweep: [2.0, 4.0]
+  nis_gate: 9.0                  # "nis_gate": oltre questa NIS l'aggiornamento usa R·NIS/nis_gate (9 = 3 sigma su chi quadro a 1 gdl)
 neighbour_table:                 # 5 byte per vicino: id, RSSI, pendenza, dev. std, età
   rssi_step: 1.0                 # dB (int8)
   slope_step: 0.1                # dB/s (int8)
@@ -127,6 +132,9 @@ neighbour_table:                 # 5 byte per vicino: id, RSSI, pendenza, dev. s
 fusion:
   max_age: 2.0                   # s; le voci più vecchie sono escluse
   max_age_own: true              # vale anche per la stima propria del link i→m (false = resta sempre, con varianza crescente)
+  # Blocco 5 (A): regola di fusione sull'indice di segnale (più alto = più vicino).
+  rule: weighted_mean            # "weighted_mean" | "median" | "max"
+  rule_sweep: [weighted_mean, median, max]
 detector:
   mode: both                     # "level" | "slope" | "both"
   scope: fused                   # "fused" | "pairwise"
@@ -140,6 +148,14 @@ detector:
   release_slope_margin: 0.5      # dB/s, idem per la pendenza
   min_observers: 1               # osservatori in allarme necessari per l'allarme di sistema
   warmup: 10.0                   # s iniziali esclusi
+  # Blocco 5 (B): livello relativo = calo rispetto alla linea di base.
+  reference: absolute            # "absolute" | "relative"
+  baseline_window: 30.0          # s; la base è la mediana dei campioni accettati in questa finestra
+  baseline_min_samples: 20       # campioni accettati minimi in finestra (10 s a 2 Hz); sotto, la base resta ferma
+  freeze_drop: 6.0               # dB sotto la base: un campione più basso non è accettato (la base si congela)
+  drop_threshold: 20.0           # dB; soglia del calo fuso (valore di default)
+  min_observers_sweep: [1, 2]
+  release_time_sweep: [5.0, 15.0, 30.0, 60.0]   # Blocco 5 (C)
 metrics:
   scenarios: [none, slowdown, stop]
   n_runs: 50                     # corse per scenario
@@ -152,3 +168,17 @@ metrics:
   target_false_alarms_per_hour: 1.0
   level_threshold_sweep: [-95.0, -60.0, 2.5]   # inizio, fine, passo (dBm)
   slope_threshold_sweep: [-4.0, -0.25, 0.25]   # inizio, fine, passo (dB/s)
+  drop_threshold_sweep: [6.0, 40.0, 1.0]       # Blocco 5: inizio, fine, passo (dB)
+  nis_histogram: [0.0, 12.0, 0.1]              # inizio, fine, passo dell'istogramma della NIS (solo grafico)
+  reference_runs:                # corse da seguire nei grafici e nei resoconti: scenario -> indici
+    stop: [26, 30]
+
+# Blocco 5: esperimento di rifinitura. Il punto di lavoro "base" e le regole di scelta.
+refinement:
+  base: {sigma_a: 0.25, mode: level, scope: fused, variant: both}   # punto di lavoro del Blocco 4
+  min_net_gain_runs: 3           # corse guadagnate - perse (slowdown + stop) per battere un'alternativa; meno = rumore
+  repass_distance: 30.0          # m; ritorno sotto questa distanza dopo il rilevamento = ripassaggio
+  shadowing_modes: [field, independent]
+  nis_quantile: 0.99             # percentile della NIS riportato nel gruppo
+  time_budget_minutes: 45        # stima oltre la quale l'esperimento si ferma e chiede (con 8 processi)
+  drop_histogram: [-10.0, 60.0, 1.0]   # inizio, fine, passo (dB) dell'istogramma del calo fuso (diagnostica)
