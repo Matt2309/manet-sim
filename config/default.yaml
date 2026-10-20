@@ -223,6 +223,56 @@ final:
     pessimista:  {packets.reception.sensitivity_dbm: -96.0, packets.reception.background_model: bursty, packets.reception.bursty.mean_loss: 0.05, packets.reception.bursty.mean_burst: 3.0}
   not_deaf_points: [base, bursty_2_1, bursty_2_3, bursty_5_3, pessimista]   # punti in cui si prova anche lost_rule: not_deaf
 
+# Blocco 7: routing verso il capogruppo. Non cambia i Blocchi 1-6.
+routing:
+  scenario_overrides:            # solo per l'esperimento del Blocco 7
+    group.n_nodes: 10
+    group.longitudinal_spread: 35.0
+    group.lateral_spread: 5.0    # 2 m non è raggiungibile con 10 nodi: sigma_lat va a ~0 e la larghezza p95 (4,4 m) viene dalla sola repulsione
+    track.start_offset: 35.0     # >= margin_sigmas * sigma_long (31,7 m)
+    track.end_margin: 35.0
+  channel_profile: heltec_run    # nominal | heltec_run; heltec_run è l'unico punto di lavoro in tesi, nominal resta come confronto
+  channel_profiles:              # sostituzioni di canale (solo Blocco 7), applicate dopo scenario_overrides
+    nominal: {}
+    heltec_run:                  # livelli misurati nella corsa con le Heltec del 13 ottobre
+      channel.tx_power: -17.0    # dBm EQUIVALENTI (EIRP con perdite di antenna, montaggio e corpi), non impostabili sull'ESP32. Tarato con scripts/calibrate_heltec_power.py: mediana RSSI nel gruppo da 5 = -78,0 dBm
+      packets.reception.sensitivity_dbm: -96.0
+      routing.candidate_threshold: -88.0   # 8 dB sopra la sensibilità, come -90 su -98,4
+  n_runs: 50
+  seed_keys: {runs: 12, separation: 13, leader: 14, unicast: 15, sos: 16}
+  strategies: [direct, best_rssi, dqrem, dqrem_no_slope]
+  neighbour_max_age: 2.0         # s
+  candidate_threshold: -90.0     # dBm
+  max_hops: 8
+  ttb_cap: 60.0                  # s
+  ahp_matrix: [[1, 1, 3, 5, 5], [1, 1, 3, 5, 5], [0.3333, 0.3333, 1, 2, 2],
+               [0.2, 0.2, 0.5, 1, 1], [0.2, 0.2, 0.5, 1, 1]]
+  ahp_random_index: {3: 0.58, 4: 0.90, 5: 1.12}   # indice casuale di Saaty per n criteri
+  reception_window: 10.0         # s, finestra di C4 (frazione di beacon ricevuti)
+  entropy_window: 60.0           # s
+  entropy_min_samples: 20
+  alpha: 0.5                     # peso AHP contro entropia
+  record_period: 1.0             # s
+  max_records: 10
+  max_packet_bytes: 250          # ESP-NOW v1; sweep informativo con 1470 (v2)
+  packet_bytes_sweep: [1470]
+  packet_header_bytes: 4
+  max_wait: 1.0                  # s
+  max_retries: 3
+  buffer_records: 600
+  degraded_period: 5.0           # s, 0,2 Hz a buffer pieno
+  sos_window: 120.0              # s
+  fresh_age: 5.0                 # s
+  oracle_distance: 30.0          # m, allarme oracolo: distanza del separato dal gruppo
+  warmup: 10.0                   # s iniziali esclusi dalle metriche
+  end_margin: 60.0               # s finali: i record creati dopo non entrano nella consegna
+  view_age_thresholds: [5.0, 10.0]   # s
+  distance_bins: [0.0, 10.0, 20.0, 30.0, 50.0, 1.0e+9]   # m, consegna per distanza dal capogruppo
+  airtime: {preamble_us: 192.0, us_per_byte: 8.0, ack_bytes: 14}   # 802.11b 1 Mbit/s
+  min_break_reduction: 0.2       # DQREM "ripaga" se riduce le rotture di almeno questa frazione rispetto a best_rssi
+  time_budget_minutes: 60        # stima oltre la quale l'esperimento si ferma e chiede (con 8 processi)
+  reference_run: {scenario: stop, index: 0}   # corsa di cui si salva la traccia per route_example.png
+
 # Configurazione del Blocco 4 (sostituzioni ai default del Blocco 6): serve agli script dei Blocchi 4-5 e ai test.
 history:
   block4:

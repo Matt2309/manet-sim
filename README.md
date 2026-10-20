@@ -79,27 +79,10 @@ costante è cablata nel codice.
   Ogni variante si confronta con la base a coppie (corse guadagnate e perse) sulle stesse 150 corse in cache; la
   regola di scelta è in `src/refinement.py`. Poi si combinano le vincenti (F).
 - [x] **Blocco 6 — Numeri finali, sensibilità e chiusura** (vedi sotto)
-- [ ] Blocco 7 — Routing (era il Blocco 5 nell'elenco originale: slitta dopo la rifinitura del rilevatore)
-
-### Nota sul Blocco 5 (da riportare nella tesi)
-
-Le varianti, le soglie e la configurazione finale del Blocco 5 sono scelte confrontando molte alternative
-sulle **stesse 150 corse**: i numeri di questo blocco sono quindi **ottimistici**. Con 50 corse per scenario una
-differenza di 1-2 corse sta dentro il rumore, e per questo una variante vince solo se guadagna almeno
-`refinement.min_net_gain_runs` corse nette. I numeri finali verranno dal Blocco 6, su **corse nuove** (altri semi).
+- [x] Blocco 7 — Routing
 
 `numba` è una dipendenza del solo livello relativo (`pip install -r requirements.txt`); senza numba il codice
 gira in Python puro, molto più lento.
-
-
-## Blocco 6 — Numeri finali, sensibilità e chiusura
-
-**Taratura e verifica.** Le soglie si scelgono *solo* sull'insieme di **taratura** (le 150 corse dei Blocchi 4-5, chiavi 6-7) e si scrivono in
-`results/block6/frozen_thresholds.yaml` (data, hash del commit, valori sulla taratura). La valutazione sulle **300 corse di verifica** (100 per scenario,
-chiavi 8-9, mai viste) le *legge* da quel file: nessun percorso del codice sceglie una soglia sulla verifica (`src/final.py`, `evaluate_at`; lo sweep sulla
-verifica serve solo a disegnare le curve). Il verdetto `media` contro `migliore` ha una regola fissata prima (`final.min_net_gain`, falsi allarmi non
-superiori) ed è in `results/block6/verdict.yaml`. La sensibilità al canale (sensibilità del ricevitore, perdite a raffiche di Gilbert-Elliott, regola
-`not_deaf`) usa le prime 50 corse per scenario della verifica e cambia solo il Blocco 3.
 
 **Riproduzione con un comando:** `python scripts/reproduce_all.py` (circa 1,5 minuti con la cache e i risultati già presenti; con `--clean`
 ricalcola tutto: cache, esperimenti dei Blocchi 4-6, vedi i tempi stampati; la cache occupa circa 5 GB).
