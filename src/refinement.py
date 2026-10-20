@@ -18,12 +18,12 @@ from __future__ import annotations
 import copy
 import itertools
 import math
-import pickle
 import time
 from pathlib import Path
 
 import numpy as np
 
+from src.common.io import load_pickle, save_pickle  # noqa: F401
 from src.common.parallel import parallel_map
 from src.detector import build_inputs
 from src.kalman import filter_all
@@ -331,18 +331,6 @@ def baseline_diagnostics(args: tuple) -> dict:
 # ---------------------------------------------------------------------------
 # Salvataggio
 # ---------------------------------------------------------------------------
-
-
-def save_pickle(path: Path, obj) -> None:
-    path = Path(path)
-    path.parent.mkdir(parents=True, exist_ok=True)
-    with open(path, "wb") as f:
-        pickle.dump(obj, f)
-
-
-def load_pickle(path: Path):
-    with open(path, "rb") as f:
-        return pickle.load(f)
 
 
 def best_threshold_index(summary: dict) -> int | None:

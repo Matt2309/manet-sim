@@ -23,12 +23,11 @@ from collections import defaultdict, deque
 import numpy as np
 
 from src.common.rng import spawn_rng
-from src.channel import simulate_channel
 from src.detector import _INT8, _SLOPE, _quantize
 from src.kalman import filter_all, measurement_noise, predict_links
 from src.metrics import min_distance_to_group
-from src.mobility import simulate_mobility
-from src.packets import _neighbour_tables, reception_probability, simulate_packets
+from src.packets import _neighbour_tables, reception_probability
+from src.simulator import off_diagonal_variance, separation_fields, simulate_pipeline
 
 ISOLATED = 255  # salti annunciati da un nodo isolato
 STRATEGIES = ("direct", "best_rssi", "dqrem", "dqrem_no_slope")
@@ -674,13 +673,11 @@ def prepare_run(config: dict, leader: int, sos_fraction: float) -> dict:
     Output: dizionario `rd` per `simulate_strategy`, con in più ``distances``, ``mean_offset``, ``rank``/``pos_class`` del capogruppo, ``wrong`` (`wrong_hops_episodes`), ``extent`` e i campi del distacco.
     """
     rcfg = config["routing"]
-    mob = simulate_mobility(config)
-    ch = simulate_channel(mob, config)
-    pk = simulate_packets(mob, ch, config)
+    mob, ch, pk = simulate_pipeline(config)
     t = mob.t
     n_nodes = mob.positions.shape[1]
     dt = config["simulation"]["dt"]
-    fading_var = float(np.var(ch.fading[:, ~np.eye(n_nodes, dtype=bool)]))
+    fading_var = off_diagonal_variance(ch.fading, n_nodes)
     R = measurement_noise(config, fading_var)
     kcfg, tcfg = config["kalman"], config["neighbour_table"]
     kres = filter_all(pk.beacon_times, pk.received, pk.rssi, R, kcfg["sigma_a"], kcfg)
@@ -695,10 +692,8 @@ def prepare_run(config: dict, leader: int, sos_fraction: float) -> dict:
     background = rc["background_loss"] if rc["background_model"] == "independent" else rc["bursty"]["mean_loss"] * rc["bursty"]["loss_bad"]
     p = np.nan_to_num(reception_probability(ch.rssi_true, rc) * (1.0 - background)).astype(np.float32)
 
-    sep = config["separation"]
-    sep_enabled = bool(sep["enabled"])
-    sep_node = int(sep["node_id"]) if sep_enabled else -1
-    sep_start = float(sep["start_time"]) if sep_enabled else float("nan")
+    sep = separation_fields(config)
+    sep_enabled, sep_node, sep_start = sep["sep_enabled"], sep["sep_node"], sep["sep_start"]
     offsets = mob.s_nodes - mob.s_centroid[:, None]
     before = slice(0, int(np.searchsorted(t, sep_start))) if sep_enabled else slice(None)
     mean_offset = offsets[before].mean(axis=0)

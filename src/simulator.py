@@ -23,6 +23,7 @@ from pathlib import Path
 
 import numpy as np
 
+from src.common.io import load_npz_run, save_npz_atomic
 from src.common.parallel import parallel_map
 from src.common.rng import seed_sequence, spawn_rng
 from src.channel import simulate_channel
@@ -97,20 +98,36 @@ def channel_cache_key(config: dict) -> str:
     return _hash_parts(config, tuple(n for n in CACHE_SECTIONS if n != "packets"))
 
 
+def simulate_pipeline(config: dict) -> tuple:
+    mob = simulate_mobility(config)
+    ch = simulate_channel(mob, config)
+    return mob, ch, simulate_packets(mob, ch, config)
+
+
 def simulate_run(config: dict) -> dict:
     """`simulate_mobility` → `simulate_channel` → `simulate_packets`, ridotti a ciò che serve al rilevatore.
 
     ``distances`` è float32; ``fading_var`` = varianza del fading fuori diagonale (dB²);
     senza separazione ``sep_node = -1`` e ``sep_start`` NaN.
     """
-    mob = simulate_mobility(config)
-    ch = simulate_channel(mob, config)
-    pk = simulate_packets(mob, ch, config)
-    return _reduce(config, mob.t, mob.distances, float(np.var(ch.fading[:, ~np.eye(mob.positions.shape[1], dtype=bool)])), pk)
+    mob, ch, pk = simulate_pipeline(config)
+    return _reduce(config, mob.t, mob.distances, off_diagonal_variance(ch.fading, mob.positions.shape[1]), pk)
+
+
+def off_diagonal_variance(fading, n_nodes: int) -> float:
+    return float(np.var(fading[:, ~np.eye(n_nodes, dtype=bool)]))
+
+
+def separation_fields(config: dict) -> dict:
+    sep = config["separation"]
+    return {
+        "sep_enabled": bool(sep["enabled"]),
+        "sep_node": int(sep["node_id"]) if sep["enabled"] else -1,
+        "sep_start": float(sep["start_time"]) if sep["enabled"] else float("nan"),
+    }
 
 
 def _reduce(config: dict, t, distances, fading_var: float, pk) -> dict:
-    sep = config["separation"]
     return {
         "t": t,
         "distances": np.asarray(distances).astype(np.float32),
@@ -118,9 +135,7 @@ def _reduce(config: dict, t, distances, fading_var: float, pk) -> dict:
         "received": pk.received,
         "rssi": pk.rssi,
         "fading_var": fading_var,
-        "sep_enabled": bool(sep["enabled"]),
-        "sep_node": int(sep["node_id"]) if sep["enabled"] else -1,
-        "sep_start": float(sep["start_time"]) if sep["enabled"] else float("nan"),
+        **separation_fields(config),
     }
 
 
@@ -133,16 +148,11 @@ def load_or_simulate_channel(config: dict, cache_dir: Path) -> dict:
     ``rssi_measured`` (salvato float32 solo se esatto), ``fading_var`` e i campi del distacco. Non dipende dalla sezione ``packets``."""
     path = channel_cache_path(config, cache_dir)
     if path.exists():
-        with np.load(path) as f:
-            ch = {k: f[k] for k in f.files}
+        ch = load_npz_run(path)
         ch["rssi_measured"] = ch["rssi_measured"].astype(np.float64)
-        for key in ("fading_var", "sep_start"):
-            ch[key] = float(ch[key])
-        ch["sep_enabled"], ch["sep_node"] = bool(ch["sep_enabled"]), int(ch["sep_node"])
         return ch
     mob = simulate_mobility(config)
     res = simulate_channel(mob, config)
-    sep = config["separation"]
     measured = res.rssi_measured
     narrow = measured.astype(np.float32)
     stored = narrow if np.array_equal(narrow.astype(measured.dtype), measured) else measured
@@ -151,15 +161,10 @@ def load_or_simulate_channel(config: dict, cache_dir: Path) -> dict:
         "distances": mob.distances.astype(np.float32),
         "rssi_true": res.rssi_true,
         "rssi_measured": stored,
-        "fading_var": float(np.var(res.fading[:, ~np.eye(mob.positions.shape[1], dtype=bool)])),
-        "sep_enabled": bool(sep["enabled"]),
-        "sep_node": int(sep["node_id"]) if sep["enabled"] else -1,
-        "sep_start": float(sep["start_time"]) if sep["enabled"] else float("nan"),
+        "fading_var": off_diagonal_variance(res.fading, mob.positions.shape[1]),
+        **separation_fields(config),
     }
-    path.parent.mkdir(parents=True, exist_ok=True)
-    tmp = path.with_suffix(".tmp.npz")
-    np.savez(tmp, **out)
-    tmp.replace(path)
+    save_npz_atomic(path, out)
     out["rssi_measured"] = measured
     return out
 
@@ -188,18 +193,9 @@ def load_or_simulate(config: dict, cache_dir: Path) -> dict:
     """Legge la corsa dalla cache o la simula e la salva (file temporaneo + rinomina: niente file a metà)."""
     path = cache_path(config, cache_dir)
     if path.exists():
-        with np.load(path) as f:
-            run = {k: f[k] for k in f.files}
-        for key in ("fading_var", "sep_start"):
-            run[key] = float(run[key])
-        run["sep_enabled"] = bool(run["sep_enabled"])
-        run["sep_node"] = int(run["sep_node"])
-        return run
+        return load_npz_run(path)
     run = simulate_run(config)
-    path.parent.mkdir(parents=True, exist_ok=True)
-    tmp = path.with_suffix(".tmp.npz")
-    np.savez(tmp, **run)
-    tmp.replace(path)
+    save_npz_atomic(path, run)
     return run
 
 
@@ -211,10 +207,7 @@ def _ensure_cached(args: tuple) -> str:
         if not path.exists():
             run = run_from_channel(config, cache_dir)
             run.pop("background_state", None)
-            path.parent.mkdir(parents=True, exist_ok=True)
-            tmp = path.with_suffix(".tmp.npz")
-            np.savez(tmp, **run)
-            tmp.replace(path)
+            save_npz_atomic(path, run)
     elif not path.exists():
         load_or_simulate(config, cache_dir)
     return str(path)
