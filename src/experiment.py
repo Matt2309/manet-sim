@@ -13,11 +13,11 @@ from __future__ import annotations
 import csv
 import math
 import time
-from concurrent.futures import ProcessPoolExecutor
 from pathlib import Path
 
 import numpy as np
 
+from src.common.parallel import parallel_map
 from src.detector import build_inputs
 from src.metrics import (
     MODES,
@@ -89,11 +89,7 @@ def run_sweep(config: dict, runs: list, cache_dir: Path, sigma_values: list, R: 
     rows, details = [], {}
     for sigma_a in sigma_values:
         tasks = [(r, config, cache_dir, sigma_a, R) for r in runs]
-        if jobs <= 1:
-            outs = [process_run(task) for task in tasks]
-        else:
-            with ProcessPoolExecutor(max_workers=jobs) as pool:
-                outs = list(pool.map(process_run, tasks))
+        outs = parallel_map(process_run, tasks, jobs)
         none = sorted((o for o in outs if o["scenario"] == "none"), key=lambda o: o["index"])
         separated = {
             s: sorted((o for o in outs if o["scenario"] == s), key=lambda o: o["index"])

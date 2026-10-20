@@ -30,8 +30,13 @@ from typing import Union
 import numpy as np
 from scipy.special import expit
 
+from src.common.rng import spawn_rng
 from src.channel import ChannelResult
 from src.mobility import MobilityResult, load_config
+
+SEED_KEY_TIMES = 4
+SEED_KEY_RECEPTION = 5
+SEED_KEY_BURST = 10
 
 
 # ---------------------------------------------------------------------------
@@ -265,8 +270,8 @@ def simulate_packets(
     n_nodes = channel.rssi_true.shape[1]
     t0 = time.perf_counter()
 
-    rng_times = np.random.default_rng(np.random.SeedSequence(seed, spawn_key=(4,)))
-    rng_rx = np.random.default_rng(np.random.SeedSequence(seed, spawn_key=(5,)))
+    rng_times = spawn_rng(seed, SEED_KEY_TIMES)
+    rng_rx = spawn_rng(seed, SEED_KEY_RECEPTION)
 
     times, steps = beacon_schedule(n_nodes, float(t[-1]), dt, pk, rng_times)
     n_beacons = times.shape[1]
@@ -290,7 +295,7 @@ def simulate_packets(
         background_loss = rc["background_loss"]
     elif background_model == "bursty":
         bcfg = rc["bursty"]
-        rng_burst = np.random.default_rng(np.random.SeedSequence(seed, spawn_key=(10,)))
+        rng_burst = spawn_rng(seed, SEED_KEY_BURST)
         shape = (n_nodes,) if bcfg["burst_scope"] == "receiver" else (n_nodes, n_nodes)
         if bcfg["burst_scope"] not in ("receiver", "link"):
             raise ValueError("packets.reception.bursty.burst_scope deve essere 'receiver' o 'link'")

@@ -12,7 +12,6 @@ import itertools
 import os
 import sys
 import time
-from concurrent.futures import ProcessPoolExecutor
 from pathlib import Path
 
 import numpy as np
@@ -20,6 +19,7 @@ import numpy as np
 _REPO_ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(_REPO_ROOT))
 
+from src.common.parallel import parallel_map  # noqa: E402
 from src.common.paths import block_dir  # noqa: E402
 from src.experiment import pooled_fading_variance  # noqa: E402
 from src.kalman import measurement_noise  # noqa: E402
@@ -366,8 +366,7 @@ def main() -> None:
             continue
         tasks = [(r, config, cache_dir, v, s["wp"]["threshold"], R, "fused") for r in runs if r["scenario"] == "none"]
         t0 = time.perf_counter()
-        with ProcessPoolExecutor(max_workers=jobs) as pool:
-            res = list(pool.map(baseline_diagnostics, tasks, chunksize=1))
+        res = parallel_map(baseline_diagnostics, tasks, jobs)
         timings[f"diag_{name}"] = time.perf_counter() - t0
         hist = sum(r["hist"] for r in res)
         edges = res[0]["edges"]

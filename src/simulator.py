@@ -19,11 +19,12 @@ from __future__ import annotations
 import copy
 import hashlib
 import json
-from concurrent.futures import ProcessPoolExecutor
 from pathlib import Path
 
 import numpy as np
 
+from src.common.parallel import parallel_map
+from src.common.rng import seed_sequence, spawn_rng
 from src.channel import simulate_channel
 from src.mobility import simulate_mobility
 from src.packets import simulate_packets
@@ -38,13 +39,13 @@ TUNING_KEYS = {"runs": 7, "separation": 6}  # Blocchi 4-5: insieme di taratura
 
 def run_seeds(config: dict, key: int = TUNING_KEYS["runs"], n_runs: int | None = None) -> np.ndarray:
     """Semi (n_runs,) da ``SeedSequence(simulation.seed, spawn_key=(key,))`` (default 7: taratura), uguali per tutti gli scenari."""
-    ss = np.random.SeedSequence(config["simulation"]["seed"], spawn_key=(key,))
+    ss = seed_sequence(config["simulation"]["seed"], key)
     return ss.generate_state(config["metrics"]["n_runs"] if n_runs is None else n_runs).astype(np.int64)
 
 
 def draw_separations(config: dict, key: int = TUNING_KEYS["separation"], n_runs: int | None = None) -> tuple:
     """Nodo (n_runs,) e istante d'inizio (n_runs,) s del distacco, uniformi, da un generatore dedicato (``spawn_key=(key,)``, default 6: taratura)."""
-    rng = np.random.default_rng(np.random.SeedSequence(config["simulation"]["seed"], spawn_key=(key,)))
+    rng = spawn_rng(config["simulation"]["seed"], key)
     n_runs = config["metrics"]["n_runs"] if n_runs is None else n_runs
     lo, hi = config["metrics"]["separation_start_range"]
     nodes = rng.integers(0, config["group"]["n_nodes"], size=n_runs)
@@ -250,9 +251,4 @@ def ensure_all_cached(runs: list, cache_dir: Path, jobs: int = 1, with_channel=N
     `with_channel` (funzione ``corsa -> bool``, Blocco 6) sceglie le corse per cui si salva anche la cache dei Blocchi 1-2 (`load_or_simulate_channel`).
     """
     tasks = [(r["config"], cache_dir, bool(with_channel and with_channel(r))) for r in runs]
-    if jobs <= 1:
-        for task in tasks:
-            _ensure_cached(task)
-        return
-    with ProcessPoolExecutor(max_workers=jobs) as pool:
-        list(pool.map(_ensure_cached, tasks))
+    parallel_map(_ensure_cached, tasks, jobs)

@@ -20,11 +20,11 @@ import itertools
 import math
 import pickle
 import time
-from concurrent.futures import ProcessPoolExecutor
 from pathlib import Path
 
 import numpy as np
 
+from src.common.parallel import parallel_map
 from src.detector import build_inputs
 from src.kalman import filter_all
 from src.metrics import (
@@ -167,10 +167,7 @@ def process_run(args: tuple) -> dict:
 def run_phase(config: dict, runs: list, cache_dir: Path, variants: list, R: float, jobs: int) -> list:
     """`process_run` su tutte le corse (in parallelo se ``jobs > 1``; il risultato non dipende da `jobs`)."""
     tasks = [(r, config, cache_dir, variants, R) for r in runs]
-    if jobs <= 1:
-        return [process_run(task) for task in tasks]
-    with ProcessPoolExecutor(max_workers=jobs) as pool:
-        return list(pool.map(process_run, tasks, chunksize=1))
+    return parallel_map(process_run, tasks, jobs)
 
 
 # ---------------------------------------------------------------------------

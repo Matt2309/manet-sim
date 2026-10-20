@@ -12,10 +12,11 @@ from __future__ import annotations
 
 import copy
 import time
-from concurrent.futures import ProcessPoolExecutor
 
 import numpy as np
 
+from src.common.parallel import parallel_map
+from src.common.rng import spawn_rng
 from src.final import bootstrap_rng
 from src.metrics import min_distance_to_group, nearest_rank
 from src.refinement import apply_overrides
@@ -67,14 +68,14 @@ def draw_leaders(config: dict, sep_nodes: np.ndarray) -> np.ndarray:
 
     Input: `config` (del Blocco 7), `sep_nodes` (n_runs,) nodi estratti per il distacco. Procedimento: indice uniforme fra ``N − 1`` posizioni, saltando il nodo del distacco. Output (n_runs,) int.
     """
-    rng = np.random.default_rng(np.random.SeedSequence(config["simulation"]["seed"], spawn_key=(config["routing"]["seed_keys"]["leader"],)))
+    rng = spawn_rng(config["simulation"]["seed"], config["routing"]["seed_keys"]["leader"])
     u = rng.integers(0, config["group"]["n_nodes"] - 1, size=len(sep_nodes))
     return (u + (u >= sep_nodes)).astype(int)
 
 
 def draw_sos_fractions(config: dict, n_runs: int) -> np.ndarray:
     """Istante del SOS come frazione di ``sos_window`` dopo il distacco: uniformi (0, 1) dal generatore ``spawn_key=(seed_keys.sos,)``, una per corsa (uguale nei tre scenari)."""
-    rng = np.random.default_rng(np.random.SeedSequence(config["simulation"]["seed"], spawn_key=(config["routing"]["seed_keys"]["sos"],)))
+    rng = spawn_rng(config["simulation"]["seed"], config["routing"]["seed_keys"]["sos"])
     return rng.random(n_runs)
 
 
@@ -259,11 +260,7 @@ def run_all(runs: list, strategies: list, byte_sweep: list, jobs: int, reference
     done = done or {}
     todo = [r for r in runs if (r["scenario"], r["index"]) not in done]
     tasks = [(r, strategies, byte_sweep, (r["scenario"], r["index"]) == reference) for r in todo]
-    if jobs <= 1:
-        outs = [process_run_routing(task) for task in tasks]
-    else:
-        with ProcessPoolExecutor(max_workers=jobs) as pool:
-            outs = list(pool.map(process_run_routing, tasks, chunksize=1))
+    outs = parallel_map(process_run_routing, tasks, jobs)
     allout = list(done.values()) + outs
     return sorted(allout, key=lambda o: (o["scenario"], o["index"]))
 

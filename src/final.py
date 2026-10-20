@@ -19,13 +19,14 @@ import datetime
 import math
 import subprocess
 import time
-from concurrent.futures import ProcessPoolExecutor
 from pathlib import Path
 
 import numpy as np
 import yaml
 from scipy.stats import binom
 
+from src.common.parallel import parallel_map
+from src.common.rng import spawn_rng
 from src.detector import build_inputs, lost_alarm, system_alarm
 from src.kalman import filter_all
 from src.metrics import (
@@ -193,10 +194,7 @@ def process_run_final(args: tuple) -> dict:
 def run_final_phase(config: dict, runs: list, cache_dir: Path, R: float, spec: dict, jobs: int) -> list:
     """`process_run_final` su tutte le corse (in parallelo se ``jobs > 1``; il risultato non dipende da `jobs`)."""
     tasks = [(r, config, cache_dir, R, spec) for r in runs]
-    if jobs <= 1:
-        return [process_run_final(task) for task in tasks]
-    with ProcessPoolExecutor(max_workers=jobs) as pool:
-        return list(pool.map(process_run_final, tasks, chunksize=1))
+    return parallel_map(process_run_final, tasks, jobs)
 
 
 # ---------------------------------------------------------------------------
@@ -319,7 +317,7 @@ def bootstrap_rate_interval(counts: np.ndarray, hours: np.ndarray, n_samples: in
 def bootstrap_rng(config: dict, seed: int | None = None) -> np.random.Generator:
     """Generatore del bootstrap: ``SeedSequence(simulation.seed, spawn_key=(final.seed_keys.bootstrap,))``, rifatto a ogni valutazione (non dipende dall'ordine)."""
     seed = config["simulation"]["seed"] if seed is None else seed
-    return np.random.default_rng(np.random.SeedSequence(seed, spawn_key=(config["final"]["seed_keys"]["bootstrap"],)))
+    return spawn_rng(seed, config["final"]["seed_keys"]["bootstrap"])
 
 
 def summarize_at(at: dict, config: dict) -> dict:

@@ -22,6 +22,7 @@ from collections import defaultdict, deque
 
 import numpy as np
 
+from src.common.rng import spawn_rng
 from src.channel import simulate_channel
 from src.detector import _INT8, _SLOPE, _quantize
 from src.kalman import filter_all, measurement_noise, predict_links
@@ -363,7 +364,7 @@ def simulate_strategy(rd: dict, strategy: str, rcfg: dict, max_packet_bytes: int
     p, valid, any_valid, lastk = rd["p"], rd["valid"], rd["any_valid"], rd["lastk"]
     c1, slope, c4, ann, ann_grid = rd["c1"], rd["slope"], rd["c4"], rd["ann"], rd["ann_grid"]
     fill = np.zeros(ann.shape, dtype=np.int16)  # riempimento della coda annunciato in ogni beacon (4 bit)
-    stream = UniformStream(np.random.default_rng(np.random.SeedSequence(rd["seed"], spawn_key=(rcfg["seed_keys"]["unicast"],))))
+    stream = UniformStream(spawn_rng(rd["seed"], rcfg["seed_keys"]["unicast"]))
     chooser = None if strategy in ("direct", "best_rssi") else Chooser(strategy, rcfg, n_nodes)
     ranker = Chooser("best_rssi", rcfg, n_nodes) if strategy == "best_rssi" else chooser
 
