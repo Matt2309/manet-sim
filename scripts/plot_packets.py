@@ -23,6 +23,7 @@ matplotlib.use("Agg")
 import matplotlib.pyplot as plt
 import numpy as np
 
+from src.common.paths import block_dir
 from src.channel import simulate_channel
 from src.mobility import load_config, simulate_mobility
 from src.packets import reception_probability, simulate_packets
@@ -333,8 +334,8 @@ def main() -> None:
         values[s] = beacon_values(runs[s], ch_sep, mob_sep)
     res_sep = runs[default_sens]
 
-    out_dir = _REPO_ROOT / "results"
-    out_dir.mkdir(exist_ok=True)
+    out_dir = block_dir(3)
+    out_dir.mkdir(parents=True, exist_ok=True)
     plot_reception_curve(runs, values, cfg_sep, out_dir)
     plot_separation_packets(mob_sep, ch_sep, res_sep, cfg_sep, out_dir)
     plot_loss_vs_distance(values, out_dir)

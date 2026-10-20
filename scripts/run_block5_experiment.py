@@ -20,6 +20,7 @@ import numpy as np
 _REPO_ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(_REPO_ROOT))
 
+from src.common.paths import block_dir  # noqa: E402
 from src.experiment import pooled_fading_variance  # noqa: E402
 from src.kalman import measurement_noise  # noqa: E402
 from src.mobility import load_config  # noqa: E402
@@ -228,7 +229,7 @@ def main() -> None:
     parser.add_argument("config", nargs="?", default=str(_REPO_ROOT / "config" / "default.yaml"))
     parser.add_argument("--jobs", type=int, default=os.cpu_count() or 1, help="processi paralleli")
     parser.add_argument("--cache-dir", default=str(_REPO_ROOT / "results" / "cache"))
-    parser.add_argument("--out-dir", default=str(_REPO_ROOT / "results" / "block5"))
+    parser.add_argument("--out-dir", default=str(block_dir(5)))
     parser.add_argument("--force", action="store_true", help="prosegue anche se la stima supera ``refinement.time_budget_minutes``")
     args = parser.parse_args()
 

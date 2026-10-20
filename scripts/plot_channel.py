@@ -21,6 +21,7 @@ matplotlib.use("Agg")
 import matplotlib.pyplot as plt
 import numpy as np
 
+from src.common.paths import block_dir
 from src.channel import (
     link_shadowing,
     link_variance_theory,
@@ -343,8 +344,8 @@ def main() -> None:
     res_field = _run(mob_sep, cfg_sep, "field", "separazione, field")
     res_indep = _run(mob_sep, cfg_sep, "independent", "separazione, independent")
 
-    out_dir = _REPO_ROOT / "results"
-    out_dir.mkdir(exist_ok=True)
+    out_dir = block_dir(2)
+    out_dir.mkdir(parents=True, exist_ok=True)
 
     idx_end = _group_window(mob_sep, cfg_sep)
     corrs = {}

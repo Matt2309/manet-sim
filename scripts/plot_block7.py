@@ -18,6 +18,7 @@ matplotlib.use("Agg")
 import matplotlib.pyplot as plt
 import numpy as np
 
+from src.common.paths import DEFAULT_CONFIG, block_dir
 from src.channel import path_loss_db
 from src.final import bootstrap_rng
 from src.mobility import load_config
@@ -300,7 +301,7 @@ def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--out-dir", default=None, help="default: results/block7/<routing.channel_profile>")
     args = parser.parse_args()
-    out = Path(args.out_dir) if args.out_dir else _REPO_ROOT / "results" / "block7" / load_config(_REPO_ROOT / "config" / "default.yaml")["routing"]["channel_profile"]
+    out = Path(args.out_dir) if args.out_dir else block_dir(7, load_config(DEFAULT_CONFIG)["routing"]["channel_profile"])
     res = load_pickle(out / "results.pkl")
     figure_delivery(res, out)
     figure_view_age(res, out)

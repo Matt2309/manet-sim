@@ -30,7 +30,7 @@ python scripts/plot_mobility.py                    # usa config/default.yaml
 python scripts/plot_mobility.py path/al/config.yaml # configurazione alternativa
 python scripts/plot_channel.py                     # Blocco 2: RSSI, shadowing, corpi (3 simulazioni)
 python scripts/plot_packets.py                     # Blocco 3: beacon, ricezione, conoscenza dei nodi
-python scripts/run_detection_experiment.py         # Blocco 4: corse, sweep, risultati in results/detection/
+python scripts/run_detection_experiment.py         # Blocco 4: corse, sweep, risultati in results/block4/
 python scripts/run_detection_experiment.py --jobs 4  # numero di processi (default: tutti i core)
 python scripts/plot_detector.py                    # Blocco 4: figure e riepilogo a console
 python scripts/run_block5_experiment.py            # Blocco 5: varianti A-F, risultati in results/block5/
@@ -48,7 +48,7 @@ descrivono dal Blocco 6 il rilevatore finale (soglia congelata, spegnimento 30 s
 `run_detection_experiment.py` mette in cache i Blocchi 1-3 di ogni corsa in `results/cache/`
 (chiave = seme + hash della configurazione usata): la prima esecuzione è lenta, le successive no.
 
-Le figure vengono salvate in `results/` (cartella ignorata da git).
+Le figure vengono salvate in `results/blockN/` (cartella ignorata da git).
 
 ## Configurazione
 
@@ -89,8 +89,8 @@ ricalcola tutto: cache, esperimenti dei Blocchi 4-6, vedi i tempi stampati; la c
 
 | Figura | Script |
 | --- | --- |
-| Blocchi 1-3 (mobilità, canale, pacchetti) | `plot_mobility.py`, `plot_channel.py`, `plot_packets.py` |
-| Blocco 4 (`results/*.png`) | `plot_detector.py` (dopo `run_detection_experiment.py`) |
+| Blocchi 1-3 (`results/block1/`, `block2/`, `block3/`) | `plot_mobility.py`, `plot_channel.py`, `plot_packets.py` |
+| Blocco 4 (`results/block4/*.png`) | `plot_detector.py` (dopo `run_detection_experiment.py`) |
 | Blocco 5 (`results/block5/*.png`) | `plot_block5.py` (dopo `run_block5_experiment.py`) |
 | `final_tradeoff.png`, `detection_distance.png`, `detection_delay.png`, `tuning_vs_test.png`, `sensitivity.png`, `burst_example.png` | `plot_block6.py` (dopo `run_block6_experiment.py`) |
 | `results/final_summary.md` | `reproduce_all.py` (generato dal codice) |

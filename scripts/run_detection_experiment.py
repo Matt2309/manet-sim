@@ -4,7 +4,7 @@
 Per ogni scenario (none, slowdown, stop) ``metrics.n_runs`` corse (Blocchi 1-3
 in cache in ``results/cache/``); per ogni ``sigma_a`` di
 ``kalman.sigma_a_sweep``, modalità, ambito e soglia calcola P_d e falsi
-allarmi/ora. Salva in ``results/detection/`` e stampa il riepilogo.
+allarmi/ora. Salva in ``results/block4/`` e stampa il riepilogo.
 Config: config/default.yaml se non indicata.
 """
 
@@ -17,6 +17,7 @@ from pathlib import Path
 _REPO_ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(_REPO_ROOT))
 
+from src.common.paths import block_dir  # noqa: E402
 from src.detector import count_episodes, build_inputs, lost_alarm, pre_alarm, system_alarm  # noqa: E402
 from src.experiment import (  # noqa: E402
     pooled_fading_variance,
@@ -49,7 +50,7 @@ def main() -> None:
     parser.add_argument("config", nargs="?", default=str(_REPO_ROOT / "config" / "default.yaml"))
     parser.add_argument("--jobs", type=int, default=os.cpu_count() or 1, help="processi paralleli")
     parser.add_argument("--cache-dir", default=str(_REPO_ROOT / "results" / "cache"))
-    parser.add_argument("--out-dir", default=str(_REPO_ROOT / "results" / "detection"))
+    parser.add_argument("--out-dir", default=str(block_dir(4)))
     args = parser.parse_args()
 
     config = block4_config(load_config(args.config))  # Blocco 6: i default sono cambiati, qui valgono quelli del Blocco 4

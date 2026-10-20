@@ -20,6 +20,7 @@ import matplotlib.pyplot as plt
 import numpy as np
 from scipy.stats import chi2
 
+from src.common.paths import block_dir
 from src.detector import build_inputs, lost_alarm, pre_alarm, system_alarm
 from src.metrics import min_distance_to_group
 from src.mobility import load_config
@@ -476,7 +477,7 @@ def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("config", nargs="?", default=str(_REPO_ROOT / "config" / "default.yaml"))
     parser.add_argument("--cache-dir", default=str(_REPO_ROOT / "results" / "cache"))
-    parser.add_argument("--out-dir", default=str(_REPO_ROOT / "results" / "block5"))
+    parser.add_argument("--out-dir", default=str(block_dir(5)))
     args = parser.parse_args()
     out = Path(args.out_dir)
     cache_dir = Path(args.cache_dir)

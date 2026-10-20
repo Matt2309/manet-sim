@@ -21,6 +21,7 @@ matplotlib.use("Agg")
 import matplotlib.pyplot as plt
 import numpy as np
 
+from src.common.paths import block_dir
 from src.mobility import (
     Track,
     lateral_offset_speed,
@@ -350,8 +351,8 @@ def main() -> None:
     track = load_track(cfg)
     result = simulate_mobility(cfg)
 
-    out_dir = _REPO_ROOT / "results"
-    out_dir.mkdir(exist_ok=True)
+    out_dir = block_dir(1)
+    out_dir.mkdir(parents=True, exist_ok=True)
     suffix = _suffix(cfg)
 
     plot_path_overview(track, result, out_dir, suffix)

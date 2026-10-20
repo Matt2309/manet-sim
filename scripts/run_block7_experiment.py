@@ -18,6 +18,7 @@ import numpy as np
 _REPO_ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(_REPO_ROOT))
 
+from src.common.paths import block_dir  # noqa: E402
 from src.mobility import load_config  # noqa: E402
 from src.refinement import load_pickle, save_pickle  # noqa: E402
 from src.routing import records_per_packet, airtime, record_bytes  # noqa: E402
@@ -56,7 +57,7 @@ def main() -> None:
     profile = args.profile or base["routing"]["channel_profile"]
     config = block7_config(base, profile)
     rcfg = config["routing"]
-    default_out = _REPO_ROOT / "results" / "block7" / ("" if profile == "nominal" else profile)
+    default_out = block_dir(7, profile)
     out_dir, jobs = Path(args.out_dir) if args.out_dir else default_out, args.jobs
     out_dir.mkdir(parents=True, exist_ok=True)
     t_start = time.perf_counter()
@@ -136,7 +137,7 @@ def main() -> None:
     verdict = predictive_verdict(outs, config)
     print(verdict_text(verdict, config))
 
-    nominal_pkl = _REPO_ROOT / "results" / "block7" / "results.pkl"
+    nominal_pkl = block_dir(7) / "results.pkl"
     if profile != "nominal" and nominal_pkl.exists():
         ref_res = load_pickle(nominal_pkl)
         if "connectivity" in ref_res["outs"][0]:

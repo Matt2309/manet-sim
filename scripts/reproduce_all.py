@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """Rigenera tutte le figure dei Blocchi 1-6 e ``results/final_summary.md`` con un solo comando.
 
-Usa la cache in ``results/cache/`` se c'è e salta gli esperimenti i cui risultati esistono già (``results/detection``, ``results/block5/results.pkl``,
+Usa la cache in ``results/cache/`` se c'è e salta gli esperimenti i cui risultati esistono già (``results/block4/sweep.csv``, ``results/block5/results.pkl``,
 ``results/block6/results.pkl``). Con ``--clean`` riparte da zero: cancella la cache e i risultati degli esperimenti, ma NON
 ``results/block6/frozen_thresholds.yaml`` (la taratura deve riconfermare le soglie congelate). Stampa la durata di ogni fase e il totale.
 """
@@ -19,11 +19,14 @@ from pathlib import Path
 _REPO_ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(_REPO_ROOT))
 
+from src.common.paths import RESULTS_DIR, block_dir  # noqa: E402
 from src.final import _git, load_frozen, write_final_summary  # noqa: E402
 from src.mobility import load_config  # noqa: E402
 from src.refinement import load_pickle  # noqa: E402
 
 LIBRARIES = ("numpy", "scipy", "matplotlib", "PyYAML", "numba", "llvmlite", "pytest")
+
+BLOCK4_DATA = ("runs.csv", "sweep.csv", "details.npz")
 
 
 def run(step: str, args: list, timings: dict) -> None:
@@ -39,13 +42,13 @@ def main() -> None:
     parser.add_argument("--clean", action="store_true", help="riparte senza cache né risultati degli esperimenti")
     parser.add_argument("--jobs", type=int, default=os.cpu_count() or 1, help="processi paralleli")
     args = parser.parse_args()
-    results = _REPO_ROOT / "results"
+    results = RESULTS_DIR
     jobs = str(args.jobs)
     t_start = time.perf_counter()
     timings: dict = {}
 
     if args.clean:
-        for path in (results / "cache", results / "detection", results / "block5" / "results.pkl", results / "block6" / "results.pkl"):
+        for path in (results / "cache", *(block_dir(4) / name for name in BLOCK4_DATA), block_dir(5) / "results.pkl", block_dir(6) / "results.pkl"):
             if path.is_dir():
                 shutil.rmtree(path)
             elif path.exists():
@@ -54,20 +57,20 @@ def main() -> None:
 
     for name in ("plot_mobility", "plot_channel", "plot_packets"):
         run(f"Blocchi 1-3: {name}", [f"scripts/{name}.py"], timings)
-    if not (results / "detection" / "sweep.csv").exists():
+    if not (block_dir(4) / "sweep.csv").exists():
         run("Blocco 4: esperimento", ["scripts/run_detection_experiment.py", "--jobs", jobs], timings)
     run("Blocco 4: figure", ["scripts/plot_detector.py"], timings)
-    if not (results / "block5" / "results.pkl").exists():
+    if not (block_dir(5) / "results.pkl").exists():
         run("Blocco 5: esperimento", ["scripts/run_block5_experiment.py", "--jobs", jobs, "--force"], timings)
     run("Blocco 5: figure", ["scripts/plot_block5.py"], timings)
-    if not (results / "block6" / "results.pkl").exists():
+    if not (block_dir(6) / "results.pkl").exists():
         run("Blocco 6: esperimento", ["scripts/run_block6_experiment.py", "--jobs", jobs], timings)
     run("Blocco 6: figure", ["scripts/plot_block6.py"], timings)
 
     print("\n=== Riepilogo finale ===", flush=True)
     config = load_config(_REPO_ROOT / "config" / "default.yaml")
-    res = load_pickle(results / "block6" / "results.pkl")
-    frozen = load_frozen(results / "block6" / "frozen_thresholds.yaml")
+    res = load_pickle(block_dir(6) / "results.pkl")
+    frozen = load_frozen(block_dir(6) / "frozen_thresholds.yaml")
     final = frozen["thresholds"][res["final_name"]]
     mismatches = []
     if abs(config["detector"]["level_threshold"] - final["threshold"]) > 1e-9:

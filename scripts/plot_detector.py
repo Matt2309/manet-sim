@@ -1,9 +1,9 @@
 #!/usr/bin/env python3
 """Script di ispezione visiva del Blocco 4 (rilevatore).
 
-Legge ``results/detection/`` (da ``run_detection_experiment.py``) e rifà una
+Legge ``results/block4/`` (da ``run_detection_experiment.py``) e rifà una
 corsa ``slowdown`` (Blocchi 1-3 dalla cache) per le figure di dettaglio.
-Salva le figure in ``results/`` e stampa R, NIS media, tabelle al punto di
+Salva le figure in ``results/block4/`` e stampa R, NIS media, tabelle al punto di
 lavoro e tempi. Config: config/default.yaml se non indicata.
 """
 
@@ -22,6 +22,7 @@ import matplotlib.pyplot as plt
 import numpy as np
 from scipy.stats import chi2
 
+from src.common.paths import block_dir
 from src.detector import build_inputs, lost_alarm, pre_alarm, system_alarm
 from src.experiment import load_results, print_summary
 from src.kalman import predict_links
@@ -306,8 +307,8 @@ def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("config", nargs="?", default=str(_REPO_ROOT / "config" / "default.yaml"))
     parser.add_argument("--cache-dir", default=str(_REPO_ROOT / "results" / "cache"))
-    parser.add_argument("--in-dir", default=str(_REPO_ROOT / "results" / "detection"))
-    parser.add_argument("--out-dir", default=str(_REPO_ROOT / "results"))
+    parser.add_argument("--in-dir", default=str(block_dir(4)))
+    parser.add_argument("--out-dir", default=str(block_dir(4)))
     args = parser.parse_args()
 
     config = block4_config(load_config(args.config))  # Blocco 6: i default sono cambiati, qui valgono quelli del Blocco 4
