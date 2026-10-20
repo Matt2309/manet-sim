@@ -6,7 +6,6 @@ ogni nodo a ogni istante. Parametri: file YAML (``config/default.yaml``).
 
 from __future__ import annotations
 
-import copy
 import logging
 import math
 import warnings
@@ -17,12 +16,13 @@ from pathlib import Path
 from typing import Union
 
 import numpy as np
-import yaml
 from scipy.integrate import quad
 from scipy.linalg import expm
 from scipy.ndimage import uniform_filter1d
 from scipy.optimize import brentq
 from scipy.stats import norm
+
+from src.common.config import load_config  # noqa: F401
 
 logger = logging.getLogger(__name__)
 
@@ -558,20 +558,6 @@ def lateral_offset_speed(result: MobilityResult, track: Track) -> np.ndarray:
     dt = result.metadata["dt"]
     offset = result.positions - track.query(result.s_nodes).position
     return np.linalg.norm(np.diff(offset, axis=0), axis=-1) / dt
-
-
-def load_config(config: Union[str, Path, dict]) -> dict:
-    """Carica la config da YAML o dizionario (copia profonda); `track.gpx_file` è risolto rispetto alla cartella del YAML."""
-    if isinstance(config, (str, Path)):
-        config_path = Path(config).resolve()
-        with open(config_path, "r") as f:
-            cfg = yaml.safe_load(f)
-        gpx_path = Path(cfg["track"]["gpx_file"])
-        if not gpx_path.is_absolute():
-            gpx_path = (config_path.parent / gpx_path).resolve()
-        cfg["track"]["gpx_file"] = str(gpx_path)
-        return cfg
-    return copy.deepcopy(config)
 
 
 def _integrate_centroid(

@@ -15,7 +15,6 @@ Parametri: sezioni ``refinement``, ``metrics``, ``detector``, ``fusion``, ``kalm
 
 from __future__ import annotations
 
-import copy
 import itertools
 import math
 import time
@@ -23,6 +22,7 @@ from pathlib import Path
 
 import numpy as np
 
+from src.common.config import apply_overrides  # noqa: F401
 from src.common.io import load_pickle, save_pickle  # noqa: F401
 from src.common.parallel import parallel_map
 from src.detector import build_inputs
@@ -51,20 +51,6 @@ PER_RUN_FIELDS = (
 # ---------------------------------------------------------------------------
 # Varianti
 # ---------------------------------------------------------------------------
-
-
-def apply_overrides(config: dict, overrides: dict) -> dict:
-    """Copia della config con le sostituzioni ``{"sezione.chiave": valore}`` (chiavi puntate)."""
-    cfg = copy.deepcopy(config)
-    for dotted, value in overrides.items():
-        node = cfg
-        *path, last = dotted.split(".")
-        for key in path:
-            node = node[key]
-        if last not in node:
-            raise KeyError(f"chiave di config sconosciuta: {dotted}")
-        node[last] = value
-    return cfg
 
 
 def block4_config(config: dict) -> dict:
