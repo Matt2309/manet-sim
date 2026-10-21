@@ -1,42 +1,33 @@
 #!/usr/bin/env python3
-"""Script di ispezione visiva del Blocco 2 (canale).
+"""Visual inspection script for Block 2 (channel).
 
-Tre simulazioni della corsa intera (senza separazione, separazione `field`,
-separazione `independent`); salva le figure in results/ e stampa le
-statistiche. Config: config/default.yaml se non indicata.
+Three simulations of the whole run (no separation, `field` separation,
+`independent` separation); saves the figures in results/ and prints the
+statistics. Config: config/default.yaml if not given.
 """
 
-import argparse
 import copy
-import sys
 import time
 from pathlib import Path
 
-_REPO_ROOT = Path(__file__).resolve().parent.parent
-sys.path.insert(0, str(_REPO_ROOT))
-
-import matplotlib
-
-matplotlib.use("Agg")
-import matplotlib.pyplot as plt
 import numpy as np
 
+from _cli import make_parser  # noqa: E402
+from src.channel import link_shadowing, link_variance_theory, path_loss_db, simulate_channel
+from src.common.config import separation_variants
 from src.common.paths import block_dir
-from src.channel import (
-    link_shadowing,
-    link_variance_theory,
-    path_loss_db,
-    simulate_channel,
-)
+from src.common.plotting import plt, save_figure
 from src.mobility import load_config, simulate_mobility
 
-# Finestra, dopo l'inizio della separazione, in cui il rilevamento deve
-# avvenire: serve solo alle statistiche e ai grafici, non è un parametro del modello.
+# Window, after the start of the separation, in which detection must
+# occur: only used for the statistics and the plots, not a model parameter.
+
+
 DETECTION_WINDOW_S = 60.0
 
 
 def _group_window(mobility, cfg: dict) -> int:
-    """Indice finale della finestra "gruppo intatto": l'inizio della separazione."""
+    """End index of the "intact group" window: the start of the separation."""
     return max(int(np.searchsorted(mobility.t, cfg["separation"]["start_time"])), 1)
 
 
@@ -45,7 +36,7 @@ def _offdiag(arr: np.ndarray) -> np.ndarray:
 
 
 def plot_rssi_vs_distance(mob, res, cfg: dict, out_dir: Path) -> None:
-    """RSSI misurato di tutte le coppie vs distanza, con attenuazione, fascia ±sigma, saturazione e sensibilità (decimato nel tempo)."""
+    """Measured RSSI of all pairs vs distance, with path loss, ±sigma band, saturation and sensitivity (decimated in time)."""
     ch = cfg["channel"]
     step = max(len(mob.t) // 3000, 1)
     d = _offdiag(mob.distances[::step]).ravel()
@@ -68,13 +59,11 @@ def plot_rssi_vs_distance(mob, res, cfg: dict, out_dir: Path) -> None:
     ax.set_ylabel("RSSI [dBm]")
     ax.set_title("RSSI misurato di tutte le coppie in funzione della distanza")
     ax.legend(fontsize=8, loc="lower left")
-    fig.tight_layout()
-    fig.savefig(out_dir / "rssi_vs_distance.png", dpi=150)
-    plt.close(fig)
+    save_figure(fig, out_dir / "rssi_vs_distance.png", 150)
 
 
 def plot_link_components(mob, res, cfg: dict, out_dir: Path, window_s: float = 120.0) -> None:
-    """Un link del gruppo su 120 s: RSSI della sola distanza, un pannello per contributo (shadowing, torso, altri corridori, fast fading) e RSSI misurato."""
+    """One group link over 120 s: distance-only RSSI, one panel per contribution (shadowing, torso, other runners, fast fading) and measured RSSI."""
     dt = cfg["simulation"]["dt"]
     i, j = 0, 1
     idx_end = _group_window(mob, cfg)
@@ -91,7 +80,7 @@ def plot_link_components(mob, res, cfg: dict, out_dir: Path, window_s: float = 1
         ("altri corridori [dB]", -res.body_others[lo:hi, i, j], "tab:brown"),
         ("variazioni rapide [dB]", res.fading[lo:hi, i, j], "tab:green"),
     ]
-    min_span = 2.0  # dB; intervallo minimo, per i contributi quasi costanti
+    min_span = 2.0  # dB; minimum span, for nearly constant contributions
 
     fig, axes = plt.subplots(len(panels) + 1, 1, figsize=(10, 12), sharex=True)
     for ax, (label, y, color) in zip(axes, panels):
@@ -107,13 +96,11 @@ def plot_link_components(mob, res, cfg: dict, out_dir: Path, window_s: float = 1
     ax.set_xlabel("t [s]")
     ax.grid(alpha=0.3)
     fig.suptitle(f"Componenti del link {i}→{j} — finestra di {window_s:.0f} s")
-    fig.tight_layout()
-    fig.savefig(out_dir / "link_components.png", dpi=150)
-    plt.close(fig)
+    save_figure(fig, out_dir / "link_components.png", 150)
 
 
 def plot_separation_rssi(mob, res, cfg: dict, out_dir: Path, before_s: float = 60.0, after_s: float = 300.0) -> None:
-    """I 4 link verso il nodo separato (da -1 a +5 min dalla separazione): RSSI misurato e da sola attenuazione, distanza su secondo asse."""
+    """The 4 links towards the separated node (from -1 to +5 min from the separation): measured RSSI and path-loss-only RSSI, distance on a second axis."""
     sep = cfg["separation"]
     node, t0, dt = sep["node_id"], sep["start_time"], cfg["simulation"]["dt"]
     others = [k for k in range(cfg["group"]["n_nodes"]) if k != node]
@@ -135,13 +122,11 @@ def plot_separation_rssi(mob, res, cfg: dict, out_dir: Path, before_s: float = 6
         ax.set_xlabel("tempo dall'inizio della separazione [s]")
     axes[0, 0].legend(fontsize=7, loc="lower left")
     fig.suptitle("RSSI dei link verso il nodo separato")
-    fig.tight_layout()
-    fig.savefig(out_dir / "separation_rssi.png", dpi=150)
-    plt.close(fig)
+    save_figure(fig, out_dir / "separation_rssi.png", 150)
 
 
 def plot_shadow_field(mob, res, cfg: dict, out_dir: Path, zoom_half_m: float = 300.0) -> None:
-    """Mappa di shadowing con il percorso dei nodi: vista intera e zoom sul punto di separazione."""
+    """Shadowing map with the nodes' path: full view and zoom on the separation point."""
     sf = res.shadow_field
     nx, ny = sf.values.shape
     x0, y0 = sf.origin
@@ -168,12 +153,11 @@ def plot_shadow_field(mob, res, cfg: dict, out_dir: Path, zoom_half_m: float = 3
         ax.set_ylabel("y [m]")
     axes[0].legend(fontsize=8, loc="upper left")
     fig.colorbar(im, ax=axes, shrink=0.6, label="p(x) [dB/√m]")
-    fig.savefig(out_dir / "shadow_field.png", dpi=150, bbox_inches="tight")
-    plt.close(fig)
+    save_figure(fig, out_dir / "shadow_field.png", 150, tight_layout=False, bbox_inches="tight")
 
 
 def empirical_std_vs_length(res, cfg: dict, lengths: np.ndarray, n_seg: int, rng: np.random.Generator) -> np.ndarray:
-    """Deviazione standard empirica dello shadowing su segmenti casuali di data lunghezza, interamente dentro la mappa `res`."""
+    """Empirical standard deviation of the shadowing on random segments of given length, entirely inside the `res` map."""
     sf = res.shadow_field
     nx, ny = sf.values.shape
     x0, y0 = sf.origin
@@ -191,7 +175,7 @@ def empirical_std_vs_length(res, cfg: dict, lengths: np.ndarray, n_seg: int, rng
 
 
 def plot_shadowing_vs_length(res, cfg: dict, out_dir: Path) -> None:
-    """Deviazione standard dello shadowing vs lunghezza del link: empirica contro formula teorica."""
+    """Shadowing standard deviation vs link length: empirical against theoretical formula."""
     sh = cfg["channel"]["shadowing"]
     lengths = np.logspace(0, 3, 16)
     rng = np.random.default_rng(cfg["simulation"]["seed"])
@@ -208,13 +192,11 @@ def plot_shadowing_vs_length(res, cfg: dict, out_dir: Path) -> None:
     ax.set_ylabel("deviazione standard dello shadowing [dB]")
     ax.set_title("Shadowing in funzione della lunghezza del link")
     ax.legend()
-    fig.tight_layout()
-    fig.savefig(out_dir / "shadowing_vs_length.png", dpi=150)
-    plt.close(fig)
+    save_figure(fig, out_dir / "shadowing_vs_length.png", 150)
 
 
 def separated_link_correlation(mob, res, cfg: dict, window_s: float = None) -> np.ndarray:
-    """Correlazione dello shadowing fra i 4 link verso il nodo separato: su tutti gli istanti dopo la separazione o solo i primi `window_s` s."""
+    """Shadowing correlation between the 4 links towards the separated node: over all instants after the separation or only the first `window_s` s."""
     sep = cfg["separation"]
     node = sep["node_id"]
     others = [k for k in range(cfg["group"]["n_nodes"]) if k != node]
@@ -225,7 +207,7 @@ def separated_link_correlation(mob, res, cfg: dict, window_s: float = None) -> n
 
 
 def plot_link_correlation(corrs: dict, cfg: dict, out_dir: Path) -> None:
-    """Matrici di correlazione fra i 4 link verso il nodo separato (motiva la mappa condivisa); `corrs` indicizzato (riga, colonna) con riga in {"all", "window"}, colonna in {"field", "independent"}."""
+    """Correlation matrices between the 4 links towards the separated node (motivates the shared map); `corrs` indexed (row, column) with row in {"all", "window"}, column in {"field", "independent"}."""
     node = cfg["separation"]["node_id"]
     labels = [f"{k}→{node}" for k in range(cfg["group"]["n_nodes"]) if k != node]
     rows = (("all", "tutto il periodo dopo la separazione"), ("window", f"primi {DETECTION_WINDOW_S:.0f} s"))
@@ -243,12 +225,11 @@ def plot_link_correlation(corrs: dict, cfg: dict, out_dir: Path) -> None:
             ax.set_title(f"{col_title}\n{row_title}", fontsize=10)
     fig.colorbar(im, ax=axes, shrink=0.8, label="correlazione")
     fig.suptitle("Correlazione dello shadowing fra i link verso il nodo separato")
-    fig.savefig(out_dir / "link_correlation.png", dpi=150, bbox_inches="tight")
-    plt.close(fig)
+    save_figure(fig, out_dir / "link_correlation.png", 150, tight_layout=False, bbox_inches="tight")
 
 
 def blocked_fraction(res, cfg: dict) -> np.ndarray:
-    """Frazione di tempo con almeno un corridore in mezzo al link (perdita degli altri corridori ≥ metà di `loss`)."""
+    """Fraction of time with at least one runner in the middle of the link (loss from other runners ≥ half of `loss`)."""
     threshold = cfg["channel"]["body"]["others"]["loss"] / 2.0
     n = res.body_others.shape[1]
     blocked = np.nan_to_num(res.body_others) >= threshold
@@ -258,7 +239,7 @@ def blocked_fraction(res, cfg: dict) -> np.ndarray:
 
 
 def plot_body_loss(res, cfg: dict, out_dir: Path) -> None:
-    """A sinistra il lobo del torso in polari (marcia verso destra, angoli antiorari), a destra la frazione di tempo con un corridore in mezzo."""
+    """Left: the torso lobe in polar coordinates (marching to the right, counter-clockwise angles), right: the fraction of time with a runner in between."""
     own = cfg["channel"]["body"]["own"]
     phi_b = np.pi / 2 if own["mount_side"] == "right" else -np.pi / 2
     phi = np.linspace(-np.pi, np.pi, 361)
@@ -285,13 +266,11 @@ def plot_body_loss(res, cfg: dict, out_dir: Path) -> None:
     ax2.set_ylabel("nodo i")
     ax2.set_title("Tempo con almeno un corridore in mezzo [%]")
     fig.colorbar(im, ax=ax2, shrink=0.8)
-    fig.tight_layout()
-    fig.savefig(out_dir / "body_loss.png", dpi=150)
-    plt.close(fig)
+    save_figure(fig, out_dir / "body_loss.png", 150)
 
 
 def plot_rssi_histogram(res, sat_fraction: float, out_dir: Path, idx_end: int, cfg: dict) -> None:
-    """Distribuzione dell'RSSI misurato nel gruppo prima della separazione, con la frazione di campioni saturati."""
+    """Distribution of the measured RSSI in the group before the separation, with the fraction of saturated samples."""
     r = _offdiag(res.rssi_measured[:idx_end]).ravel()
     fig, ax = plt.subplots(figsize=(8, 5))
     ax.hist(r, bins=np.arange(r.min() - 0.5, r.max() + 1.5, 1.0), color="tab:blue", alpha=0.8)
@@ -301,44 +280,33 @@ def plot_rssi_histogram(res, sat_fraction: float, out_dir: Path, idx_end: int, c
     ax.set_ylabel("conteggio")
     ax.set_title(f"Distribuzione dell'RSSI nel gruppo, prima della separazione ({len(r)} campioni)")
     ax.legend(loc="upper left", bbox_to_anchor=(0.03, 0.88))
-    fig.tight_layout()
-    fig.savefig(out_dir / "rssi_histogram.png", dpi=150)
-    plt.close(fig)
+    save_figure(fig, out_dir / "rssi_histogram.png", 150)
 
 
 def _run(mob, cfg: dict, mode: str, label: str):
-    """Esegue e cronometra una simulazione di canale."""
+    """Run and time a channel simulation."""
     c = copy.deepcopy(cfg)
     c["channel"]["shadowing"]["mode"] = mode
     t0 = time.perf_counter()
     res = simulate_channel(mob, c)
     elapsed = time.perf_counter() - t0
-    print(f"[{label}] simulazione di canale: {elapsed:.1f} s  {res.metadata['timings']}")
+    print(f"[{label}] channel simulation: {elapsed:.1f} s  {res.metadata['timings']}")
     return res
 
 
 def main() -> None:
-    parser = argparse.ArgumentParser(description="Genera le figure di ispezione del modulo di canale")
-    parser.add_argument(
-        "config",
-        nargs="?",
-        default=str(_REPO_ROOT / "config" / "default.yaml"),
-        help="percorso del file di configurazione YAML",
-    )
+    parser = make_parser("Generate the inspection figures of the channel module", config_help="path to the YAML configuration file")
     args = parser.parse_args()
 
     cfg = load_config(args.config)
     mode_main = cfg["channel"]["shadowing"]["mode"]
 
-    cfg_nosep = copy.deepcopy(cfg)
-    cfg_nosep["separation"]["enabled"] = False
-    cfg_sep = copy.deepcopy(cfg)
-    cfg_sep["separation"]["enabled"] = True
+    cfg_nosep, cfg_sep = separation_variants(cfg)
 
     t0 = time.perf_counter()
     mob_nosep = simulate_mobility(cfg_nosep)
     mob_sep = simulate_mobility(cfg_sep)
-    print(f"mobilità (2 corse): {time.perf_counter() - t0:.1f} s")
+    print(f"mobility (2 runs): {time.perf_counter() - t0:.1f} s")
 
     res_nosep = _run(mob_nosep, cfg_nosep, mode_main, "senza separazione")
     res_field = _run(mob_sep, cfg_sep, "field", "separazione, field")
@@ -370,15 +338,15 @@ def main() -> None:
     frac_blocked = blocked_fraction(res_nosep, cfg_nosep)
     any_blocked = float(np.nanmean(frac_blocked))
 
-    print(f"\nGruppo prima della separazione (t < {cfg['separation']['start_time']:.0f} s):")
-    print(f"  frazione di campioni saturati: {100 * sat_fraction:.3f} %")
-    print(f"  RSSI misurato: mediana {np.median(group_meas):.1f} dBm, 95° percentile {np.percentile(group_meas, 95):.1f} dBm")
-    print(f"  frazione di tempo (media sulle coppie) con almeno un corridore in mezzo: {100 * any_blocked:.2f} %")
-    for row_key, title in (("all", "tutto il periodo dopo la separazione"), ("window", f"primi {DETECTION_WINDOW_S:.0f} s dopo la separazione")):
-        print(f"Correlazione media dello shadowing fra i link del nodo separato ({title}):")
+    print(f"\nGroup before the separation (t < {cfg['separation']['start_time']:.0f} s):")
+    print(f"  fraction of saturated samples: {100 * sat_fraction:.3f} %")
+    print(f"  measured RSSI: median {np.median(group_meas):.1f} dBm, 95th percentile {np.percentile(group_meas, 95):.1f} dBm")
+    print(f"  fraction of time (mean over pairs) with at least one runner in between: {100 * any_blocked:.2f} %")
+    for row_key, title in (("all", "whole period after the separation"), ("window", f"first {DETECTION_WINDOW_S:.0f} s after the separation")):
+        print(f"Mean shadowing correlation between the separated node's links ({title}):")
         print(f"  field:       {corrs[(row_key, 'field')][iu].mean():.3f}")
         print(f"  independent: {corrs[(row_key, 'independent')][iu].mean():.3f}")
-    print(f"Figure salvate in {out_dir}")
+    print(f"Figures saved in {out_dir}")
 
 
 if __name__ == "__main__":

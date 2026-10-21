@@ -1,57 +1,37 @@
 #!/usr/bin/env python3
-"""Ispezione visiva del Blocco 5 (rilevatore rifinito).
+"""Visual inspection of Block 5 (refined detector).
 
-Legge ``results/block5/results.pkl`` (da ``run_block5_experiment.py``) e rifà alcune corse dalla cache (corse 26 e 30 di ``stop``,
-la corsa con lo spegnimento a torto più lungo a release_time = 5 s, la corsa ``none`` con il congelamento più lungo). Salva sette figure in ``results/block5/``.
-Config: config/default.yaml se non indicata.
+Reads ``results/block5/results.pkl`` (from ``run_block5_experiment.py``) and redoes some runs from the cache (runs 26 and 30 of ``stop``,
+the run with the longest wrong turn-off at release_time = 5 s, the ``none`` run with the longest freeze). Saves seven figures in ``results/block5/``.
+Config: config/default.yaml if not specified.
 """
 
-import argparse
-import sys
 from pathlib import Path
 
-_REPO_ROOT = Path(__file__).resolve().parent.parent
-sys.path.insert(0, str(_REPO_ROOT))
-
-import matplotlib
-
-matplotlib.use("Agg")
-import matplotlib.pyplot as plt
 import numpy as np
 from scipy.stats import chi2
 
+from _cli import make_parser  # noqa: E402
+from src.common.config import apply_overrides
+from src.common.io import load_pickle
 from src.common.paths import block_dir
+from src.common.plotting import INK, INK_2, plt, save_figure, style_axes, ZERO_FA_PLOT
 from src.detector import build_inputs, lost_alarm, pre_alarm, system_alarm
-from src.metrics import min_distance_to_group
-from src.mobility import load_config
-from src.refinement import SEPARATED, apply_overrides, load_pickle
+from src.metrics import SEPARATED, min_distance_to_group
 from src.relative import relative_trace
 from src.simulator import experiment_runs, load_or_simulate
 
 BLUE, ORANGE, TEAL, YELLOW = "#2a78d6", "#eb6834", "#1baf7a", "#eda100"
+
+
 GREY = "#9a9892"
-INK, INK_2, GRID = "#0b0b0b", "#52514e", "#e3e2dd"
-BEFORE_S = 60.0  # s prima del distacco nelle figure di dettaglio
-AFTER_S = 700.0  # s dopo il distacco nelle figure di dettaglio
-ZERO_FA_PLOT = 0.03  # un'ascissa log non rappresenta zero: i falsi allarmi nulli si disegnano qui (solo grafica)
+BEFORE_S = 60.0  # s before the separation in the detail figures
+AFTER_S = 700.0  # s after the separation in the detail figures
 LABELS = {"slowdown": "slowdown", "stop": "stop"}
 
 
-def style_axes(ax):
-    ax.grid(True, color=GRID, linewidth=0.6)
-    ax.set_axisbelow(True)
-    for side in ("top", "right"):
-        ax.spines[side].set_visible(False)
-    for side in ("left", "bottom"):
-        ax.spines[side].set_color(INK_2)
-    ax.tick_params(colors=INK_2, labelsize=9)
-    ax.xaxis.label.set_color(INK_2)
-    ax.yaxis.label.set_color(INK_2)
-    ax.title.set_color(INK)
-
-
 def curve(summary, scenario):
-    """(falsi allarmi/h, P_d) lungo la soglia, per una variante e uno scenario."""
+    """(false alarms/h, P_d) along the threshold, for a variant and a scenario."""
     rows = sorted((r for r in summary["rows"] if r["scenario"] == scenario), key=lambda r: r["threshold"])
     fa = np.array([max(r["fa_per_hour"], ZERO_FA_PLOT) for r in rows])
     return fa, np.array([r["p_detect"] for r in rows])
@@ -64,7 +44,7 @@ def tradeoff_axes(ax, config, scenario):
     ax.set_ylabel(f"P_d entro {config['metrics']['success_distance']:g} m")
     ax.set_title(LABELS[scenario], fontsize=11)
     ax.set_ylim(-0.02, 1.03)
-    style_axes(ax)
+    style_axes(ax, title_color=True)
 
 
 def plot_curves(ax, summaries, scenario, items, config):
@@ -78,7 +58,7 @@ def plot_curves(ax, summaries, scenario, items, config):
 
 
 # ---------------------------------------------------------------------------
-# Figura 1
+# Figure 1
 # ---------------------------------------------------------------------------
 
 
@@ -95,13 +75,11 @@ def fig_fusion_rules(res, path):
         plot_curves(ax, S, scenario, items, config)
     axes[0].legend(frameon=False, fontsize=8, loc="lower right")
     fig.suptitle("Regole di fusione (grigio = base: media pesata); linea verticale = target falsi allarmi/h; punto = punto di lavoro", color=INK, fontsize=10)
-    fig.tight_layout()
-    fig.savefig(path, dpi=140)
-    plt.close(fig)
+    save_figure(fig, path, 140)
 
 
 # ---------------------------------------------------------------------------
-# Corse di dettaglio
+# Detail runs
 # ---------------------------------------------------------------------------
 
 
@@ -120,7 +98,7 @@ def window(t, start, end=None):
 
 
 def fused_series(res, config, cache_dir, index):
-    """Per la corsa `index` di ``stop``: indice fuso assoluto e calo fuso relativo (per osservatore) e distanza dal gruppo."""
+    """For run `index` of ``stop``: absolute fused index and relative fused drop (per observer) and distance from the group."""
     info, run = stop_run(config, cache_dir, index)
     node = run["sep_node"]
     R = res["R"]
@@ -136,7 +114,7 @@ def fused_series(res, config, cache_dir, index):
 
 
 def repass_interval(t, distance, start, edge):
-    """Primo ripassaggio dopo il distacco: (inizio, fine) in s, o None."""
+    """First re-pass after the separation: (start, end) in s, or None."""
     k = int(np.searchsorted(t, start))
     far = np.flatnonzero(distance[k:] > edge)
     if not len(far):
@@ -151,7 +129,7 @@ def repass_interval(t, distance, start, edge):
 
 
 # ---------------------------------------------------------------------------
-# Figura 2
+# Figure 2
 # ---------------------------------------------------------------------------
 
 
@@ -179,7 +157,7 @@ def fig_relative_vs_absolute(res, cache_dir, path):
             ax.axhline(thr_line, color=color, linestyle="--", linewidth=1.0)
             ax.axvline(start, color=INK, linestyle=":", linewidth=1.0)
             ax.set_ylabel(ylabel)
-            style_axes(ax)
+            style_axes(ax, title_color=True)
             ax2 = ax.twinx()
             ax2.plot(t[sel], distance[sel], color=INK_2, linewidth=1.2)
             ax2.axhline(edge, color=INK_2, linestyle=":", linewidth=0.8)
@@ -191,13 +169,11 @@ def fig_relative_vs_absolute(res, cache_dir, path):
             else:
                 ax.set_xlabel("tempo (s)")
     fig.suptitle("Livello relativo contro assoluto: curve (sopra) e corse di riferimento (sotto, un tratto per osservatore; linea tratteggiata = soglia del punto di lavoro)", color=INK, fontsize=10)
-    fig.tight_layout()
-    fig.savefig(path, dpi=140)
-    plt.close(fig)
+    save_figure(fig, path, 140)
 
 
 # ---------------------------------------------------------------------------
-# Figura 3
+# Figure 3
 # ---------------------------------------------------------------------------
 
 
@@ -233,7 +209,7 @@ def fig_baseline_example(res, cache_dir, path):
     ax.set_xlabel("tempo (s)")
     ax.set_ylabel("RSSI (dBm)")
     ax.legend(frameon=False, fontsize=9)
-    style_axes(ax)
+    style_axes(ax, title_color=True)
 
     diag = res["diag"].get("B:relative")
     ax = axes[1]
@@ -253,10 +229,8 @@ def fig_baseline_example(res, cache_dir, path):
         ax.set_xlabel("tempo (s)")
         ax.set_ylabel("RSSI (dBm)")
         ax.legend(frameon=False, fontsize=9)
-    style_axes(ax)
-    fig.tight_layout()
-    fig.savefig(path, dpi=140)
-    plt.close(fig)
+    style_axes(ax, title_color=True)
+    save_figure(fig, path, 140)
 
 
 def _longest(flag):
@@ -268,12 +242,12 @@ def _longest(flag):
 
 
 # ---------------------------------------------------------------------------
-# Figura 4
+# Figure 4
 # ---------------------------------------------------------------------------
 
 
 def system_alarm_for(res, run, name):
-    """Allarme di sistema (T,) sul nodo separato per la variante `name`, alla soglia del suo punto di lavoro."""
+    """System alarm (T,) on the separated node for variant `name`, at the threshold of its working point."""
     vcfg = apply_overrides(res["config"], res["variants"][name]["overrides"])
     inputs, _ = build_inputs(run, vcfg, vcfg["kalman"]["sigma_a"], res["R"])
     sliced = inputs.target_slice(run["sep_node"])
@@ -285,9 +259,9 @@ def system_alarm_for(res, run, name):
 
 
 def longest_wrong_off(res, cache_dir):
-    """Fra le corse con spegnimenti a torto della variante base: quella con lo spegnimento più lungo.
+    """Among the runs with wrong turn-offs of the base variant: the one with the longest turn-off.
 
-    Restituisce (scenario, indice, t_spegnimento, t_riaccensione, durata) in s; la riaccensione è la fine della corsa se l'allarme non riparte.
+    Returns (scenario, index, t_off, t_on, duration) in s; the turn-on is the end of the run if the alarm does not restart.
     """
     config = res["config"]
     per_run = res["summaries"][("base", "fused", 1)]["per_run"]
@@ -308,7 +282,7 @@ def longest_wrong_off(res, cache_dir):
             for f in falls:
                 on = np.flatnonzero(alarm[f:])
                 t_on = t[f + int(on[0])] if len(on) else t[-1]
-                print(f"  spegnimento a torto: {scenario} {index}: {t[f]:.0f} -> {t_on:.0f} s ({t_on - t[f]:.0f} s)")
+                print(f"  wrong turn-off: {scenario} {index}: {t[f]:.0f} -> {t_on:.0f} s ({t_on - t[f]:.0f} s)")
                 if best is None or t_on - t[f] > best[4]:
                     best = (scenario, index, float(t[f]), float(t_on), float(t_on - t[f]))
     return best
@@ -346,19 +320,17 @@ def fig_release_turnaround(res, cache_dir, path):
         ax.set_ylabel(f"{vcfg['detector']['release_time']:g} s", rotation=0, ha="right", va="center")
         ax.axvline(start, color=INK, linestyle=":", linewidth=1.0)
     for ax in axes:
-        style_axes(ax)
+        style_axes(ax, title_color=True)
     axes[0].axvline(start, color=INK, linestyle=":", linewidth=1.0)
     for ax in axes:
         ax.axvline(t_off, color=ORANGE, linestyle="--", linewidth=1.2)
     axes[-1].set_xlabel("tempo (s)")
     fig.suptitle("Allarme di sistema per ogni release_time (soglia del punto di lavoro di ciascuno)", color=INK, fontsize=10)
-    fig.tight_layout()
-    fig.savefig(path, dpi=140)
-    plt.close(fig)
+    save_figure(fig, path, 140)
 
 
 # ---------------------------------------------------------------------------
-# Figura 5
+# Figure 5
 # ---------------------------------------------------------------------------
 
 
@@ -381,7 +353,7 @@ def fig_robust(res, path):
         ax.set_ylim(1e-5, 10)
         ax.set_title(f"{label}: media {nis['stats'][label]['mean']:.2f}, p99 {nis['stats'][label]['q']:.1f}", fontsize=10)
         ax.set_xlabel("NIS")
-        style_axes(ax)
+        style_axes(ax, title_color=True)
         if col == 0:
             ax.legend(frameon=False, fontsize=8)
             ax.set_ylabel("densità")
@@ -396,13 +368,11 @@ def fig_robust(res, path):
         ax.set_title(f"{ref}, {scenario}", fontsize=10)
         if col == 0:
             ax.legend(frameon=False, fontsize=8, loc="lower right")
-    fig.tight_layout()
-    fig.savefig(path, dpi=140)
-    plt.close(fig)
+    save_figure(fig, path, 140)
 
 
 # ---------------------------------------------------------------------------
-# Figura 6
+# Figure 6
 # ---------------------------------------------------------------------------
 
 
@@ -431,15 +401,13 @@ def fig_shadowing_mode(res, path):
         ax.set_ylim(0, 1.08)
         ax.set_title(scenario, fontsize=11)
         ax.set_ylabel(f"P_d entro {config['metrics']['success_distance']:g} m al punto di lavoro")
-        style_axes(ax)
+        style_axes(ax, title_color=True)
     axes[0].legend(frameon=False, fontsize=8, loc="lower right")
-    fig.tight_layout()
-    fig.savefig(path, dpi=140)
-    plt.close(fig)
+    save_figure(fig, path, 140)
 
 
 # ---------------------------------------------------------------------------
-# Figura 7
+# Figure 7
 # ---------------------------------------------------------------------------
 
 
@@ -465,19 +433,14 @@ def fig_final_comparison(res, path):
         ax.set_ylabel("frazione cumulata di corse")
         ax.set_title(f"{scenario}: distanza al rilevamento (ECDF)", fontsize=11)
         ax.set_ylim(0, 1.03)
-        style_axes(ax)
+        style_axes(ax, title_color=True)
         if col == 0:
             ax.legend(frameon=False, fontsize=9, loc="lower right")
-    fig.tight_layout()
-    fig.savefig(path, dpi=140)
-    plt.close(fig)
+    save_figure(fig, path, 140)
 
 
 def main() -> None:
-    parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("config", nargs="?", default=str(_REPO_ROOT / "config" / "default.yaml"))
-    parser.add_argument("--cache-dir", default=str(_REPO_ROOT / "results" / "cache"))
-    parser.add_argument("--out-dir", default=str(block_dir(5)))
+    parser = make_parser(__doc__, cache_dir=True, out_dir=block_dir(5))
     args = parser.parse_args()
     out = Path(args.out_dir)
     cache_dir = Path(args.cache_dir)
@@ -489,7 +452,7 @@ def main() -> None:
     fig_robust(res, out / "robust.png")
     fig_shadowing_mode(res, out / "shadowing_mode.png")
     fig_final_comparison(res, out / "final_comparison.png")
-    print(f"Figure salvate in {out}")
+    print(f"Figures saved to {out}")
 
 
 if __name__ == "__main__":

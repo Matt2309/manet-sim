@@ -1,49 +1,45 @@
 #!/usr/bin/env python3
-"""Script di ispezione visiva del Blocco 3 (pacchetti).
+"""Visual inspection script for Block 3 (packets).
 
-Due simulazioni di mobilità e canale (senza separazione, per le statistiche
-del gruppo, e con separazione); sulla seconda i pacchetti con tre
-sensibilità (-92, -95 dBm e quella di default), a parità di seme. Salva le
-figure in results/ e stampa le statistiche. Config: config/default.yaml se
-non indicata.
+Two mobility and channel simulations (without separation, for the group
+statistics, and with separation); on the second one the packets with three
+sensitivities (-92, -95 dBm and the default one), with the same seed. Saves
+the figures in results/ and prints the statistics. Config: config/default.yaml
+if not given.
 """
 
-import argparse
 import copy
-import sys
 import time
 from pathlib import Path
 
-_REPO_ROOT = Path(__file__).resolve().parent.parent
-sys.path.insert(0, str(_REPO_ROOT))
-
-import matplotlib
-
-matplotlib.use("Agg")
-import matplotlib.pyplot as plt
 import numpy as np
 
-from src.common.paths import block_dir
+from _cli import make_parser  # noqa: E402
 from src.channel import simulate_channel
+from src.common.config import separation_variants
+from src.common.paths import block_dir
+from src.common.plotting import plt, save_figure
 from src.mobility import load_config, simulate_mobility
 from src.packets import reception_probability, simulate_packets
 
-# Sensibilità alternative confrontate negli script (solo per l'ispezione, non
-# parametri del modello); la terza è quella di config/default.yaml.
+# Alternative sensitivities compared in the scripts (inspection only, not
+# model parameters); the third is the one in config/default.yaml.
+
+
 ALT_SENSITIVITIES = (-92.0, -95.0)
 COLORS = ("tab:red", "tab:orange", "tab:blue")
 
-# Finestre dei grafici attorno all'inizio della separazione, in secondi.
+# Plot windows around the start of the separation, in seconds.
 BEFORE_S = 60.0
 AFTER_S = 300.0
 
-# Larghezza della media mobile con cui si liscia la distanza per individuare il rientro.
+# Width of the moving average used to smooth the distance to find the return.
 RETURN_SMOOTHING_S = 10.0
-RETURN_SEARCH_S = (60.0, 300.0)  # intervallo, dopo l'inizio, in cui cercare il rientro geometrico
+RETURN_SEARCH_S = (60.0, 300.0)  # interval, after the start, in which to look for the geometric return
 
 
 # ---------------------------------------------------------------------------
-# Utilità
+# Utilities
 # ---------------------------------------------------------------------------
 
 
@@ -52,9 +48,9 @@ def _sens_label(s: float) -> str:
 
 
 def beacon_values(res, ch, mob):
-    """Per ogni (i, k, j) valido: RSSI vero, distanza e ricezione.
+    """For each valid (i, k, j): true RSSI, distance and reception.
 
-    Restituisce array 1D (solo elementi con i != j e beacon esistente).
+    Returns 1D arrays (only elements with i != j and an existing beacon).
     """
     n = res.beacon_steps.shape[0]
     valid = res.beacon_steps >= 0
@@ -73,7 +69,7 @@ def beacon_values(res, ch, mob):
 
 
 def loss_run_lengths(res) -> list:
-    """Lunghezze delle serie di beacon consecutivi persi, per ogni link i→j."""
+    """Lengths of the runs of consecutive lost beacons, for each link i→j."""
     n = res.received.shape[0]
     out = []
     for i in range(n):
@@ -88,7 +84,7 @@ def loss_run_lengths(res) -> list:
 
 
 def forwarded_ages(res) -> np.ndarray:
-    """Età delle informazioni inoltrate: osservatore m, link i→j con j != m, i != j."""
+    """Age of the forwarded information: observer m, link i→j with j != m, i != j."""
     n = res.knowledge_age.shape[1]
     m, i, j = np.meshgrid(np.arange(n), np.arange(n), np.arange(n), indexing="ij")
     mask = (j != m) & (i != j)
@@ -97,7 +93,7 @@ def forwarded_ages(res) -> np.ndarray:
 
 
 def direct_ages(res) -> np.ndarray:
-    """Età dei link diretti: osservatore m = j, i != j."""
+    """Age of the direct links: observer m = j, i != j."""
     n = res.knowledge_age.shape[1]
     out = [res.knowledge_age[:, m, i, m] for m in range(n) for i in range(n) if i != m]
     ages = np.concatenate(out)
@@ -105,9 +101,9 @@ def direct_ages(res) -> np.ndarray:
 
 
 def return_window(mob, cfg: dict) -> tuple:
-    """Finestra (t_inizio, t_fine) del rientro geometrico del nodo separato.
+    """Window (t_start, t_end) of the geometric return of the separated node.
 
-    Minimo della distanza media lisciata entro `RETURN_SEARCH_S` dall'inizio; l'intervallo contiguo attorno ad esso con distanza sotto la metà fra il massimo precedente e il minimo.
+    Minimum of the smoothed mean distance within `RETURN_SEARCH_S` of the start; the contiguous interval around it with distance below the midpoint between the previous maximum and the minimum.
     """
     sep = cfg["separation"]
     node, t0, dt = sep["node_id"], sep["start_time"], cfg["simulation"]["dt"]
@@ -131,12 +127,12 @@ def return_window(mob, cfg: dict) -> tuple:
 
 
 # ---------------------------------------------------------------------------
-# Figure
+# Figures
 # ---------------------------------------------------------------------------
 
 
 def plot_reception_curve(runs: dict, values: dict, cfg: dict, out_dir: Path) -> None:
-    """Curva teorica con le tre sensibilità e frazione empirica di beacon ricevuti per intervalli di `rssi_true` (1 dB), dalla corsa con separazione."""
+    """Theoretical curve with the three sensitivities and empirical fraction of received beacons per `rssi_true` bin (1 dB), from the run with separation."""
     rc = cfg["packets"]["reception"]
     bg = rc["background_loss"]
     x = np.linspace(-125.0, -80.0, 1000)
@@ -162,13 +158,11 @@ def plot_reception_curve(runs: dict, values: dict, cfg: dict, out_dir: Path) -> 
     ax.set_ylabel("frazione di beacon ricevuti")
     ax.set_title("Curva di ricezione: teoria (curva × fondo) ed empirica")
     ax.legend(fontsize=8, loc="upper left")
-    fig.tight_layout()
-    fig.savefig(out_dir / "reception_curve.png", dpi=150)
-    plt.close(fig)
+    save_figure(fig, out_dir / "reception_curve.png", 150)
 
 
 def plot_separation_packets(mob, ch, res, cfg: dict, out_dir: Path) -> None:
-    """I 4 link dal nodo separato (da -1 a +5 min dalla separazione): `rssi_true`, beacon ricevuti (punti) e persi (segni in basso), sensibilità, distanza su secondo asse."""
+    """The 4 links from the separated node (from -1 to +5 min from the separation): `rssi_true`, received beacons (dots) and lost ones (marks at the bottom), sensitivity, distance on a second axis."""
     sep = cfg["separation"]
     node, t0, dt = sep["node_id"], sep["start_time"], cfg["simulation"]["dt"]
     sens = cfg["packets"]["reception"]["sensitivity_dbm"]
@@ -203,13 +197,11 @@ def plot_separation_packets(mob, ch, res, cfg: dict, out_dir: Path) -> None:
         ax.set_xlabel("tempo dall'inizio della separazione [s]")
     axes[0, 0].legend(fontsize=7, loc="lower left")
     fig.suptitle("Beacon dal nodo separato verso il gruppo")
-    fig.tight_layout()
-    fig.savefig(out_dir / "separation_packets.png", dpi=150)
-    plt.close(fig)
+    save_figure(fig, out_dir / "separation_packets.png", 150)
 
 
 def plot_loss_vs_distance(values: dict, out_dir: Path) -> None:
-    """Frazione di beacon persi in funzione della distanza, per tutte le coppie."""
+    """Fraction of lost beacons as a function of distance, for all pairs."""
     edges = np.logspace(0, np.log10(900.0), 40)
     centres = np.sqrt(edges[:-1] * edges[1:])
     fig, ax = plt.subplots(figsize=(9, 6))
@@ -227,13 +219,11 @@ def plot_loss_vs_distance(values: dict, out_dir: Path) -> None:
     ax.set_title("Beacon persi in funzione della distanza (tutte le coppie)")
     ax.legend()
     ax.grid(alpha=0.3)
-    fig.tight_layout()
-    fig.savefig(out_dir / "loss_vs_distance.png", dpi=150)
-    plt.close(fig)
+    save_figure(fig, out_dir / "loss_vs_distance.png", 150)
 
 
 def plot_link_age(mob, runs: dict, res_nosep, cfg: dict, out_dir: Path) -> None:
-    """A sinistra l'età dei link diretti verso il nodo separato (media sui 4 link) per le tre sensibilità; a destra i beacon consecutivi persi nel gruppo senza separazione."""
+    """Left: age of the direct links towards the separated node (mean over the 4 links) for the three sensitivities; right: consecutive lost beacons in the group without separation."""
     sep = cfg["separation"]
     node, t0 = sep["node_id"], sep["start_time"]
     others = [k for k in range(cfg["group"]["n_nodes"]) if k != node]
@@ -246,7 +236,7 @@ def plot_link_age(mob, runs: dict, res_nosep, cfg: dict, out_dir: Path) -> None:
         age = np.nanmean(res.knowledge_age[lo:hi, node, others, node], axis=1)
         ax.plot(t, age, color=color, linewidth=1.0, label=f"sensibilità {_sens_label(s)}")
     ax.axvline(0.0, color="k", linestyle="--", linewidth=0.8)
-    ax.set_yscale("symlog", linthresh=2.0 * cfg["packets"]["beacon_period"])  # soglia: due periodi
+    ax.set_yscale("symlog", linthresh=2.0 * cfg["packets"]["beacon_period"])  # threshold: two periods
     ax.set_ylim(bottom=0.0)
     ax.set_xlabel("tempo dall'inizio della separazione [s]")
     ax.set_ylabel("età media dei link diretti verso il nodo separato [s]")
@@ -264,19 +254,17 @@ def plot_link_age(mob, runs: dict, res_nosep, cfg: dict, out_dir: Path) -> None:
     ax2.set_ylabel("numero di serie")
     ax2.set_title("Serie di beacon persi nel gruppo (senza separazione)")
     ax2.grid(alpha=0.3, axis="y")
-    fig.tight_layout()
-    fig.savefig(out_dir / "link_age.png", dpi=150)
-    plt.close(fig)
+    save_figure(fig, out_dir / "link_age.png", 150)
 
 
 def plot_knowledge_delay(res_nosep, cfg: dict, out_dir: Path) -> None:
-    """Distribuzione dell'età delle informazioni inoltrate nel gruppo, a confronto con i link diretti."""
+    """Distribution of the age of the forwarded information in the group, compared with the direct links."""
     fwd = forwarded_ages(res_nosep)
-    dire = direct_ages(res_nosep)
+    direct = direct_ages(res_nosep)
     period = cfg["packets"]["beacon_period"]
-    bins = np.arange(0.0, 8.0 * period + period / 10.0, period / 10.0)  # 8 periodi, 10 classi per periodo
+    bins = np.arange(0.0, 8.0 * period + period / 10.0, period / 10.0)  # 8 periods, 10 bins per period
     fig, ax = plt.subplots(figsize=(9, 5.5))
-    ax.hist(dire, bins=bins, density=True, alpha=0.55, color="tab:green", label="link diretti")
+    ax.hist(direct, bins=bins, density=True, alpha=0.55, color="tab:green", label="link diretti")
     ax.hist(fwd, bins=bins, density=True, alpha=0.55, color="tab:blue", label="informazioni inoltrate")
     ax.axvline(fwd.mean(), color="tab:blue", linestyle="--", label=f"media inoltrate {fwd.mean():.2f} s")
     ax.axvline(np.percentile(fwd, 95), color="crimson", linestyle="--",
@@ -285,40 +273,29 @@ def plot_knowledge_delay(res_nosep, cfg: dict, out_dir: Path) -> None:
     ax.set_ylabel("densità")
     ax.set_title("Ritardo con cui un nodo sa cosa vedono gli altri (gruppo senza separazione)")
     ax.legend()
-    fig.tight_layout()
-    fig.savefig(out_dir / "knowledge_delay.png", dpi=150)
-    plt.close(fig)
+    save_figure(fig, out_dir / "knowledge_delay.png", 150)
 
 
 # ---------------------------------------------------------------------------
-# Principale
+# Main
 # ---------------------------------------------------------------------------
 
 
 def main() -> None:
-    parser = argparse.ArgumentParser(description="Genera le figure di ispezione del modulo dei pacchetti")
-    parser.add_argument(
-        "config",
-        nargs="?",
-        default=str(_REPO_ROOT / "config" / "default.yaml"),
-        help="percorso del file di configurazione YAML",
-    )
+    parser = make_parser("Generate the inspection figures of the packets module", config_help="path to the YAML configuration file")
     args = parser.parse_args()
 
     cfg = load_config(args.config)
-    cfg_nosep = copy.deepcopy(cfg)
-    cfg_nosep["separation"]["enabled"] = False
-    cfg_sep = copy.deepcopy(cfg)
-    cfg_sep["separation"]["enabled"] = True
+    cfg_nosep, cfg_sep = separation_variants(cfg)
 
     t0 = time.perf_counter()
     mob_nosep = simulate_mobility(cfg_nosep)
     mob_sep = simulate_mobility(cfg_sep)
-    print(f"mobilità (2 corse): {time.perf_counter() - t0:.1f} s")
+    print(f"mobility (2 runs): {time.perf_counter() - t0:.1f} s")
     t0 = time.perf_counter()
     ch_nosep = simulate_channel(mob_nosep, cfg_nosep)
     ch_sep = simulate_channel(mob_sep, cfg_sep)
-    print(f"canale (2 corse): {time.perf_counter() - t0:.1f} s")
+    print(f"channel (2 runs): {time.perf_counter() - t0:.1f} s")
 
     t0 = time.perf_counter()
     res_nosep = simulate_packets(mob_nosep, ch_nosep, cfg_nosep)
@@ -342,29 +319,29 @@ def main() -> None:
     plot_link_age(mob_sep, runs, res_nosep, cfg_sep, out_dir)
     plot_knowledge_delay(res_nosep, cfg_sep, out_dir)
 
-    # --- statistiche del gruppo -------------------------------------------
+    # --- group statistics -------------------------------------------
     md = res_nosep.metadata
     n = cfg["group"]["n_nodes"]
     n_links = n * (n - 1)
     hours = mob_nosep.t[-1] / 3600.0
-    print(f"\nGruppo senza separazione ({mob_nosep.t[-1]:.0f} s, {n_links} link, "
-          f"beacon ogni {cfg['packets']['beacon_period']:g} s):")
-    print(f"  beacon ricevuti: {100 * md['received_fraction']:.2f} %")
-    print(f"  persi per segnale debole: {100 * md['lost_signal_fraction']:.2f} %")
-    print(f"  persi per fondo (segnale sufficiente): {100 * md['lost_background_only_fraction']:.2f} %")
+    print(f"\nGroup without separation ({mob_nosep.t[-1]:.0f} s, {n_links} links, "
+          f"beacon every {cfg['packets']['beacon_period']:g} s):")
+    print(f"  beacons received: {100 * md['received_fraction']:.2f} %")
+    print(f"  lost due to weak signal: {100 * md['lost_signal_fraction']:.2f} %")
+    print(f"  lost due to background (sufficient signal): {100 * md['lost_background_only_fraction']:.2f} %")
     lengths = np.concatenate(loss_run_lengths(res_nosep))
     for label, count in (("2", np.sum(lengths == 2)), ("3", np.sum(lengths == 3)), ("≥5", np.sum(lengths >= 5))):
-        print(f"  serie di {label} beacon persi consecutivi: {count} totali, "
-              f"{count / hours / n_links:.2f} per ora per link")
+        print(f"  runs of {label} consecutive lost beacons: {count} total, "
+              f"{count / hours / n_links:.2f} per hour per link")
     fwd = forwarded_ages(res_nosep)
-    print(f"Età delle informazioni inoltrate: media {fwd.mean():.2f} s, 95° percentile {np.percentile(fwd, 95):.2f} s")
+    print(f"Age of the forwarded information: mean {fwd.mean():.2f} s, 95th percentile {np.percentile(fwd, 95):.2f} s")
 
-    # --- distacco, per ogni sensibilità ------------------------------------
+    # --- separation, for each sensitivity ------------------------------------
     sep = cfg["separation"]
     node, t_sep = sep["node_id"], sep["start_time"]
     others = [k for k in range(n) if k != node]
     w_lo, w_hi = return_window(mob_sep, cfg_sep)
-    print(f"\nRientro geometrico del nodo {node}: da {w_lo - t_sep:.0f} s a {w_hi - t_sep:.0f} s dopo l'inizio della separazione")
+    print(f"\nGeometric return of node {node}: from {w_lo - t_sep:.0f} s to {w_hi - t_sep:.0f} s after the start of the separation")
     for s in sensitivities:
         res = runs[s]
         bt = res.beacon_times[node]
@@ -377,13 +354,13 @@ def main() -> None:
             rx_last = [k for k in others if res.received[node, k_last, k]]
             step = res.beacon_steps[node, k_last]
             dist = float(np.mean(mob_sep.distances[step, node, rx_last]))
-            print(f"  sensibilità {s:g} dBm: ultimo beacon ricevuto da un compagno {bt[k_last] - t_sep:.1f} s "
-                  f"dopo l'inizio, a {dist:.0f} m; beacon ricevuti durante il rientro: {n_ret_rx} su {n_ret_tx}")
+            print(f"  sensitivity {s:g} dBm: last beacon received by a teammate {bt[k_last] - t_sep:.1f} s "
+                  f"after the start, at {dist:.0f} m; beacons received during the return: {n_ret_rx} out of {n_ret_tx}")
         else:
-            print(f"  sensibilità {s:g} dBm: nessun beacon ricevuto dopo l'inizio")
+            print(f"  sensitivity {s:g} dBm: no beacon received after the start")
 
-    print(f"\nTempo di esecuzione del solo Blocco 3 (corsa intera, senza separazione): {block3_time:.1f} s")
-    print(f"Figure salvate in {out_dir}")
+    print(f"\nExecution time of Block 3 alone (full run, without separation): {block3_time:.1f} s")
+    print(f"Figures saved in {out_dir}")
 
 
 if __name__ == "__main__":

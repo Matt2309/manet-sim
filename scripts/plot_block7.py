@@ -1,55 +1,43 @@
 #!/usr/bin/env python3
-"""Figure del Blocco 7 per la tesi (``results/block7/``).
+"""Block 7 figures for the thesis (``results/block7/``).
 
-Legge ``results/block7/results.pkl`` (da ``run_block7_experiment.py``). Etichette in italiano, leggibili in bianco e nero (stili di linea e marcatori diversi oltre al colore).
+Reads ``results/block7/results.pkl`` (from ``run_block7_experiment.py``). Labels in Italian, readable in black and white (different line styles and markers besides colour).
 Figure: ``routing_delivery``, ``leader_view_age``, ``separated_contact``, ``route_example``, ``routing_load``, ``predictive_gain``, ``leader_connectivity``, ``range``.
 """
 
-import argparse
-import sys
 from pathlib import Path
 
-_REPO_ROOT = Path(__file__).resolve().parent.parent
-sys.path.insert(0, str(_REPO_ROOT))
-
-import matplotlib
-
-matplotlib.use("Agg")
-import matplotlib.pyplot as plt
 import numpy as np
 
-from src.common.paths import DEFAULT_CONFIG, block_dir
+from _cli import make_parser  # noqa: E402
 from src.channel import path_loss_db
-from src.final import bootstrap_rng
+from src.common.io import load_pickle
+from src.common.paths import block_dir, DEFAULT_CONFIG
+from src.common.plotting import INK, INK_2, plt, save_figure, SCEN_LABEL, style_axes
+from src.common.rng import bootstrap_rng
 from src.mobility import load_config
-from src.metrics import nearest_rank
-from src.refinement import load_pickle
-from src.routing import STRATEGIES
-from src.routing_experiment import POSITIONS, connectivity_by_rank, connectivity_summary, delivery_stats, distance_range, median_curve, per_run_values, pooled, select
+from src.routing_experiment import (
+    connectivity_by_rank,
+    connectivity_summary,
+    delivery_stats,
+    distance_range,
+    median_curve,
+    per_run_values,
+    pooled,
+    POSITIONS,
+    select,
+)
 
-INK, INK_2, GRID = "#0b0b0b", "#52514e", "#e3e2dd"
+
 COLORS = {"direct": "#52514e", "best_rssi": "#eb6834", "dqrem": "#2a78d6", "dqrem_no_slope": "#2a9d6b"}
 STYLES = {"direct": ":", "best_rssi": "--", "dqrem": "-", "dqrem_no_slope": "-."}
 MARKERS = {"direct": "^", "best_rssi": "s", "dqrem": "o", "dqrem_no_slope": "D"}
 SCEN = ("none", "slowdown", "stop")
-SCEN_LABEL = {"none": "nessun distacco", "slowdown": "rallenta", "stop": "si ferma"}
 DPI = 200
 
 
-def style_axes(ax):
-    ax.grid(True, color=GRID, linewidth=0.6)
-    ax.set_axisbelow(True)
-    for side in ("top", "right"):
-        ax.spines[side].set_visible(False)
-    for side in ("left", "bottom"):
-        ax.spines[side].set_color(INK_2)
-    ax.tick_params(colors=INK_2, labelsize=9)
-    ax.xaxis.label.set_color(INK_2)
-    ax.yaxis.label.set_color(INK_2)
-
-
 def _bars(ax, values, labels, names, ylabel, errors=None):
-    """Barre raggruppate: una per strategia dentro ogni gruppo `labels`; `values[nome][gruppo]`."""
+    """Grouped bars: one per strategy inside each group of `labels`; `values[name][group]`."""
     width = 0.8 / len(names)
     for k, name in enumerate(names):
         x = np.arange(len(labels)) + (k - (len(names) - 1) / 2) * width
@@ -71,7 +59,7 @@ def figure_delivery(res, out):
         med = {n: [x[1] for x in stats[n]] for n in names}
         p95 = {n: [x[2] for x in stats[n]] for n in names}
         _bars(axes[row, 1], med, [SCEN_LABEL[s] for s in scens], names, "ritardo mediano (s)")
-        for k, n in enumerate(names):  # p95 come trattino
+        for k, n in enumerate(names):  # p95 as a dash
             width = 0.8 / len(names)
             x = np.arange(len(scens)) + (k - (len(names) - 1) / 2) * width
             axes[row, 1].plot(x, p95[n], "_", color=INK, markersize=10, markeredgewidth=1.5)
@@ -79,9 +67,7 @@ def figure_delivery(res, out):
         axes[row, 1].set_title("ritardo (barra = mediana, trattino = p95)", fontsize=10, color=INK, loc="left")
         axes[row, 1].set_yscale("symlog", linthresh=1.0)
     axes[0, 0].legend(frameon=False, fontsize=8, loc="lower left")
-    fig.tight_layout()
-    fig.savefig(out / "routing_delivery.png", dpi=DPI)
-    plt.close(fig)
+    save_figure(fig, out / "routing_delivery.png", DPI)
 
 
 def figure_view_age(res, out):
@@ -97,7 +83,7 @@ def figure_view_age(res, out):
                 total = hist.sum()
                 if total == 0:
                     continue
-                ccdf = 1.0 - np.concatenate([[0.0], np.cumsum(hist)]) / total  # frazione di tempo con età > x
+                ccdf = 1.0 - np.concatenate([[0.0], np.cumsum(hist)]) / total  # fraction of time with age > x
                 if cls == "group":
                     ax.plot(xs, np.maximum(ccdf, 1e-6), STYLES[n], color=COLORS[n], linewidth=1.8, label=n)
                 else:
@@ -110,9 +96,7 @@ def figure_view_age(res, out):
         ax.set_title(f"capogruppo in {POSITIONS[pos]} ({len(sub)} corse)", fontsize=10, color=INK)
     axes[0].set_ylabel("frazione di tempo con età maggiore")
     axes[0].legend(frameon=False, fontsize=8, loc="lower left", title="linea spessa: nodi nel gruppo; sottile: separato", title_fontsize=7)
-    fig.tight_layout()
-    fig.savefig(out / "leader_view_age.png", dpi=DPI)
-    plt.close(fig)
+    save_figure(fig, out / "leader_view_age.png", DPI)
 
 
 def figure_separated_contact(res, out):
@@ -132,16 +116,14 @@ def figure_separated_contact(res, out):
         ax.set_title(SCEN_LABEL[scen], fontsize=10, color=INK)
         ax.tick_params(axis="x", labelsize=8)
     axes[0].set_ylabel("distanza del separato dal gruppo all'ultimo record fresco (m)")
-    fig.tight_layout()
-    fig.savefig(out / "separated_contact.png", dpi=DPI)
-    plt.close(fig)
+    save_figure(fig, out / "separated_contact.png", DPI)
 
 
 def figure_route_example(res, out):
     outs = res["outs"]
     ref = next((o for o in outs if o["trace"] is not None), None)
     if ref is None:
-        print("route_example: nessuna traccia salvata")
+        print("route_example: no trace saved")
         return
     tr = ref["trace"]
     fig, axes = plt.subplots(4, 1, figsize=(10, 9), sharex=True)
@@ -178,9 +160,7 @@ def figure_route_example(res, out):
     ax.set_ylabel("segnale verso il ponte (dBm)")
     ax.set_xlabel("tempo (s); righe arancioni = rotture")
     ax.set_xlim(max(tr["sep_start"] - 60.0, 0.0), min(tr["sep_start"] + 600.0, t[-1]))
-    fig.tight_layout()
-    fig.savefig(out / "route_example.png", dpi=DPI)
-    plt.close(fig)
+    save_figure(fig, out / "route_example.png", DPI)
 
 
 def figure_load(res, out):
@@ -199,9 +179,7 @@ def figure_load(res, out):
         ax.set_xlabel("distanza mediana dal capogruppo (salti annunciati)")
         ax.set_ylabel(label)
     axes[0].legend(frameon=False, fontsize=9)
-    fig.tight_layout()
-    fig.savefig(out / "routing_load.png", dpi=DPI)
-    plt.close(fig)
+    save_figure(fig, out / "routing_load.png", DPI)
 
 
 def _boot_mean(values, config):
@@ -243,9 +221,7 @@ def figure_predictive_gain(res, out):
     ax.axvline(0, color=INK, linewidth=0.8)
     ax.axvline(100 * config["routing"]["min_break_reduction"], color=INK, linestyle=":", linewidth=1.0)
     ax.set_xlabel("riduzione rotture di dqrem (%), IC bootstrap")
-    fig.tight_layout()
-    fig.savefig(out / "predictive_gain.png", dpi=DPI)
-    plt.close(fig)
+    save_figure(fig, out / "predictive_gain.png", DPI)
 
 
 def figure_connectivity(res, out):
@@ -270,9 +246,7 @@ def figure_connectivity(res, out):
     ax.set_xticklabels(labels, fontsize=9)
     ax.set_ylim(0, 1.02)
     ax.set_ylabel("frazione di tempo con il gruppo spezzato")
-    fig.tight_layout()
-    fig.savefig(out / "leader_connectivity.png", dpi=DPI)
-    plt.close(fig)
+    save_figure(fig, out / "leader_connectivity.png", DPI)
 
 
 def figure_range(res, out):
@@ -292,13 +266,11 @@ def figure_range(res, out):
     ax.set_xlabel("distanza (m)")
     ax.set_ylabel("RSSI (dBm, senza shadowing e fading)")
     ax.legend(frameon=False, fontsize=8)
-    fig.tight_layout()
-    fig.savefig(out / "range.png", dpi=DPI)
-    plt.close(fig)
+    save_figure(fig, out / "range.png", DPI)
 
 
 def main() -> None:
-    parser = argparse.ArgumentParser(description=__doc__)
+    parser = make_parser(__doc__)
     parser.add_argument("--out-dir", default=None, help="default: results/block7/<routing.channel_profile>")
     args = parser.parse_args()
     out = Path(args.out_dir) if args.out_dir else block_dir(7, load_config(DEFAULT_CONFIG)["routing"]["channel_profile"])
@@ -312,7 +284,7 @@ def main() -> None:
     if "connectivity" in res["outs"][0]:
         figure_connectivity(res, out)
         figure_range(res, out)
-    print(f"Figure salvate in {out}")
+    print(f"Figures saved in {out}")
 
 
 if __name__ == "__main__":
