@@ -1,17 +1,17 @@
-"""Test del Blocco 7: routing verso il capogruppo (salti, AHP/entropia, punteggio, tempo alla rottura, unicast, pacchetti, carry, duplicati, `direct`, riproducibilità).
+"""Block 7 tests: routing to the group leader (hops, AHP/entropy, score, time to break, unicast, packets, carry, duplicates, `direct`, reproducibility).
 
-Ogni test verifica un fatto noto (calcolo a mano, formula chiusa, confronto con un calcolo indipendente). Le topologie sono sintetiche: la rete è descritta da una funzione
-``up(i, j, t)`` (il collegamento ``i → j`` esiste a quell'istante) e da qui si costruiscono beacon, stime dei link e probabilità di ricezione con le stesse funzioni dell'esperimento.
+Each test checks a known fact (hand calculation, closed formula, comparison with an independent calculation). The topologies are synthetic: the network is described by a function
+``up(i, j, t)`` (link ``i → j`` exists at that instant) and from it beacons, link estimates and reception probabilities are built with the same functions as the experiment.
 """
 
 import copy
 import math
-from pathlib import Path
 
 import numpy as np
 import pytest
 
-from src.mobility import load_config
+from src.common.paths import REPO_ROOT as ROOT
+from tests.helpers import short_config
 from src.packets import beacon_schedule
 from src.routing import (
     ISOLATED,
@@ -36,22 +36,9 @@ from src.routing import (
     unicast_attempts,
 )
 
-ROOT = Path(__file__).resolve().parent.parent
-CONFIG_PATH = ROOT / "config" / "default.yaml"
-
-
-@pytest.fixture(scope="session")
-def base_config():
-    return load_config(CONFIG_PATH)
-
-
-@pytest.fixture
-def cfg(base_config):
-    return copy.deepcopy(base_config)
-
 
 def synthetic_rd(cfg, n, duration, leader, up, events=(), seed=3, p_override=None):
-    """Corsa sintetica: beacon veri (`beacon_schedule`), ricevuti se ``up(i, j, t)``; stima -60 dBm sui link che esistono, -120 sugli altri; pendenza 0; ``p`` = 1 dove il link esiste."""
+    """Synthetic run: real beacons (`beacon_schedule`), received if ``up(i, j, t)``; estimate -60 dBm on the links that exist, -120 on the others; slope 0; ``p`` = 1 where the link exists."""
     rcfg = cfg["routing"]
     dt = cfg["simulation"]["dt"]
     t = np.arange(0.0, duration, dt)
@@ -88,12 +75,12 @@ def chain(i, j, tt):
 
 
 # ---------------------------------------------------------------------------
-# 1. Nessuna regressione
+# 1. No regression
 # ---------------------------------------------------------------------------
 
 
 def test_default_config_is_the_block6_detector_and_block7_does_not_change_cache_keys(cfg):
-    """La config di default resta quella del rilevatore finale a 5 nodi; la sezione ``routing`` non entra nelle chiavi di cache dei Blocchi 1-3."""
+    """The default config remains the final 5-node detector one; the ``routing`` section does not enter the cache keys of Blocks 1-3."""
     from src.simulator import cache_key, channel_cache_key
 
     assert cfg["group"]["n_nodes"] == 5 and cfg["group"]["longitudinal_spread"] == 10.0
@@ -104,17 +91,15 @@ def test_default_config_is_the_block6_detector_and_block7_does_not_change_cache_
     from src.routing_experiment import block7_config
 
     long = block7_config(cfg)
-    assert long["group"]["n_nodes"] == 10 and cache_key(long) != cache_key(cfg)  # il gruppo lungo ha una cache propria (mai quella da 5 nodi)
+    assert long["group"]["n_nodes"] == 10 and cache_key(long) != cache_key(cfg)  # the long group has its own cache (never the 5-node one)
 
 
 def test_block6_results_identical_with_or_without_routing_section(cfg, tmp_path):
-    """`process_run_final` dà lo stesso risultato con e senza la sezione ``routing``: il Blocco 7 non tocca i Blocchi 1-6."""
+    """`process_run_final` gives the same result with and without the ``routing`` section: Block 7 does not touch Blocks 1-6."""
     from src.final import process_run_final
     from src.simulator import scenario_config
 
-    cfg["simulation"]["duration"] = 120.0
-    cfg["metrics"]["level_threshold_sweep"] = [-90.0, -65.0, 5.0]
-    cfg["detector"]["warmup"] = 5.0
+    short_config(cfg, 120.0)
     without = copy.deepcopy(cfg)
     del without["routing"]
     spec = {"mode": "cache", "point": {}, "configs": ["media"], "rules": ["any"]}
@@ -128,7 +113,7 @@ def test_block6_results_identical_with_or_without_routing_section(cfg, tmp_path)
 
 
 def test_real_run_reproducible_and_writes_nothing_to_run_cache(cfg):
-    """Una corsa reale corta (gruppo lungo): stesso seme, stesso risultato; la cache delle corse (``results/cache``) non cambia."""
+    """A short real run (long group): same seed, same result; the run cache (``results/cache``) does not change."""
     from src.routing_experiment import block7_config, process_run_routing
     from src.simulator import scenario_config
 
@@ -151,12 +136,12 @@ def test_real_run_reproducible_and_writes_nothing_to_run_cache(cfg):
 
 
 # ---------------------------------------------------------------------------
-# 2. Salti
+# 2. Hops
 # ---------------------------------------------------------------------------
 
 
 def test_hops_on_a_chain_and_isolation_when_a_link_is_cut(cfg):
-    """Catena 0-1-2-3: salti 0, 1, 2, 3. Tolto il collegamento 1-2, i nodi 2 e 3 diventano isolati entro ``max_hops`` periodi di beacon (conteggio all'infinito limitato)."""
+    """Chain 0-1-2-3: hops 0, 1, 2, 3. With link 1-2 removed, nodes 2 and 3 become isolated within ``max_hops`` beacon periods (bounded count to infinity)."""
     rcfg = cfg["routing"]
     rd = synthetic_rd(cfg, 4, 80.0, 0, chain)
     times, ann = rd["times"], rd["ann"]
@@ -173,29 +158,29 @@ def test_hops_on_a_chain_and_isolation_when_a_link_is_cut(cfg):
     for node in (2, 3):
         ks = np.flatnonzero(~np.isnan(times[node]))
         ok = ks[(ann[node, ks] == ISOLATED) & (times[node, ks] > cut)]
-        assert times[node, ok[0]] <= bound, f"nodo {node}: isolato solo a {times[node, ok[0]]:.1f} s (limite {bound:.1f} s)"
-    # nel frattempo il valore sbagliato non supera mai max_hops
+        assert times[node, ok[0]] <= bound, f"node {node}: isolated only at {times[node, ok[0]]:.1f} s (limit {bound:.1f} s)"
+    # in the meantime the wrong value never exceeds max_hops
     finite = ann[2:, :][(ann[2:, :] != ISOLATED)]
     assert finite.max() <= rcfg["max_hops"]
 
 
 def test_no_ttl_drops_on_a_still_topology(cfg):
-    """Su una topologia ferma nessun pacchetto viene scartato per TTL e tutti i record arrivano."""
+    """On a still topology no packet is dropped by TTL and all records arrive."""
     rd = synthetic_rd(cfg, 4, 60.0, 0, chain)
     out = simulate_strategy(rd, "best_rssi", cfg["routing"])
     assert out["ttl_drops"] == 0
     assert set(np.unique(out["log"]["origin"])) == {1, 2, 3}
     hops = {o: out["log"]["hops"][out["log"]["origin"] == o] for o in (1, 2, 3)}
-    assert all(np.all(h == o) for o, h in hops.items())  # il nodo a `o` salti dal capogruppo ci mette esattamente `o` salti
+    assert all(np.all(h == o) for o, h in hops.items())  # the node `o` hops from the leader takes exactly `o` hops
 
 
 # ---------------------------------------------------------------------------
-# 3. AHP, entropia
+# 3. AHP, entropy
 # ---------------------------------------------------------------------------
 
 
 def test_ahp_weights_equal_independent_eigenvector_and_consistent(cfg):
-    """Pesi AHP = autovettore principale calcolato a parte (iterazione di potenza), CR < 0,1, valori attesi del brief."""
+    """AHP weights = principal eigenvector computed separately (power iteration), CR < 0.1, expected values from the brief."""
     rcfg = cfg["routing"]
     a = np.array(rcfg["ahp_matrix"], dtype=float)
     w, cr = ahp_weights(a, rcfg["ahp_random_index"])
@@ -209,29 +194,29 @@ def test_ahp_weights_equal_independent_eigenvector_and_consistent(cfg):
 
 
 def test_entropy_weight_zero_for_constant_criterion_and_known_case():
-    """Un criterio costante ha peso 0; con colonne note il peso va a chi varia di più (calcolo a mano: 3 righe, colonna A concentrata, colonna B uniforme)."""
+    """A constant criterion has weight 0; with known columns the weight goes to the one that varies most (hand calculation: 3 rows, column A concentrated, column B uniform)."""
     benefit = np.array([True, True, True])
     x = np.array([[1.0, 5.0, 3.0], [2.0, 5.0, 9.0], [3.0, 5.0, 4.0], [4.0, 5.0, 8.0]])
     w = entropy_weights(x, benefit)
     assert w[1] == 0.0 and w.sum() == pytest.approx(1.0) and np.all(w >= 0)
-    # a mano per una colonna: v = (x - min)/(max - min) = [0, 1/3, 2/3, 1] -> p = [0, 1/6, 2/6, 3/6], E = -Σ p ln p / ln 4
+    # by hand for one column: v = (x - min)/(max - min) = [0, 1/3, 2/3, 1] -> p = [0, 1/6, 2/6, 3/6], E = -Σ p ln p / ln 4
     p = np.array([1 / 6, 2 / 6, 3 / 6])
     e = -(p * np.log(p)).sum() / math.log(4)
     only = entropy_weights(x[:, [0, 1]], benefit[:2])
-    assert only[0] == pytest.approx(1.0) and 1 - e > 0  # una sola colonna che varia: tutto il peso
+    assert only[0] == pytest.approx(1.0) and 1 - e > 0  # a single varying column: all the weight
     two = entropy_weights(np.column_stack([x[:, 0], [0.0, 0.0, 0.0, 9.0]]), benefit[:2])
-    assert two[1] > two[0]  # la colonna concentrata su un solo valore ha entropia più bassa, quindi peso maggiore
+    assert two[1] > two[0]  # the column concentrated on a single value has lower entropy, hence higher weight
     assert np.all(entropy_weights(np.ones((5, 3)), benefit) == 0)
     np.testing.assert_allclose(combine_weights(np.array([0.6, 0.4]), np.array([0.0, 0.0]), 0.5), [0.6, 0.4])
 
 
 # ---------------------------------------------------------------------------
-# 4. Punteggio
+# 4. Score
 # ---------------------------------------------------------------------------
 
 
 def test_score_dominant_candidate_wins_and_directions(cfg):
-    """Un candidato migliore in tutti i criteri vince sempre; con uno solo viene scelto; benefici alti e costi bassi alzano il punteggio."""
+    """A candidate better in all criteria always wins; with only one it is chosen; high benefits and low costs raise the score."""
     benefit = np.array([True, True, False, True, False])
     rng = np.random.default_rng(0)
     for _ in range(200):
@@ -244,25 +229,25 @@ def test_score_dominant_candidate_wins_and_directions(cfg):
     assert dqrem_scores(np.array([[-70.0, 10.0, 2.0, 0.9, 3.0]]), np.full(5, 0.2), benefit)[0] == pytest.approx(1.0)
     w = np.array([1.0, 0, 0, 0, 0])
     x = np.array([[-80.0, 0, 1, 1, 0], [-60.0, 0, 1, 1, 0]])
-    assert dqrem_scores(x, w, benefit)[1] > dqrem_scores(x, w, benefit)[0]  # beneficio: segnale più alto è meglio
+    assert dqrem_scores(x, w, benefit)[1] > dqrem_scores(x, w, benefit)[0]  # benefit: higher signal is better
     w = np.array([0, 0, 0, 0, 1.0])
     x = np.array([[-70.0, 0, 1, 1, 2.0], [-70.0, 0, 1, 1, 9.0]])
-    assert dqrem_scores(x, w, benefit)[0] > dqrem_scores(x, w, benefit)[1]  # costo: coda più corta è meglio
+    assert dqrem_scores(x, w, benefit)[0] > dqrem_scores(x, w, benefit)[1]  # cost: shorter queue is better
 
 
 # ---------------------------------------------------------------------------
-# 5. Tempo alla rottura
+# 5. Time to break
 # ---------------------------------------------------------------------------
 
 
 def test_time_to_break(cfg):
-    """Pendenza ≥ 0 → cap; −80 dBm con −0,5 dB/s e soglia −90 → (−80 − (−90)) / 0,5 = 20 s; limitato al cap e mai negativo."""
+    """Slope ≥ 0 → cap; −80 dBm with −0.5 dB/s and threshold −90 → (−80 − (−90)) / 0.5 = 20 s; clipped to the cap and never negative."""
     rcfg = cfg["routing"]
     thr, cap = rcfg["candidate_threshold"], rcfg["ttb_cap"]
     assert time_to_break(-70.0, 0.0, thr, cap) == cap and time_to_break(-70.0, 0.4, thr, cap) == cap
     assert time_to_break(-80.0, -0.5, thr, cap) == pytest.approx(20.0)
-    assert time_to_break(-60.0, -0.1, thr, cap) == cap  # 300 s limitato a 60
-    assert time_to_break(-95.0, -0.5, thr, cap) == 0.0  # già sotto la soglia
+    assert time_to_break(-60.0, -0.1, thr, cap) == cap  # 300 s clipped to 60
+    assert time_to_break(-95.0, -0.5, thr, cap) == 0.0  # already below the threshold
 
 
 # ---------------------------------------------------------------------------
@@ -272,7 +257,7 @@ def test_time_to_break(cfg):
 
 @pytest.mark.parametrize("p_fwd,p_ret,retries", [(0.7, 0.8, 3), (0.5, 0.5, 1), (0.9, 0.6, 0)])
 def test_unicast_delivery_matches_closed_form(p_fwd, p_ret, retries):
-    """Con probabilità ``p = andata × ritorno`` per tentativo, la consegna Monte Carlo vale ``1 − (1 − p)^(r + 1)`` entro 4 errori standard."""
+    """With probability ``p = forward × return`` per attempt, the Monte Carlo delivery equals ``1 − (1 − p)^(r + 1)`` within 4 standard errors."""
     stream = UniformStream(np.random.default_rng(5))
     n = 40000
     ok = sum(unicast_attempts(p_fwd, p_ret, retries, stream)[0] for _ in range(n))
@@ -282,12 +267,12 @@ def test_unicast_delivery_matches_closed_form(p_fwd, p_ret, retries):
 
 
 # ---------------------------------------------------------------------------
-# 7. Aggregazione
+# 7. Aggregation
 # ---------------------------------------------------------------------------
 
 
 def test_packet_sizes_and_priority(cfg):
-    """Mai oltre ``max_packet_bytes`` (4 record con 250 B e 10 nodi, 10 con 1470 B); un SOS parte prima dei record normali; tempo d'aria di 250 B ≈ 2,5 ms con la conferma."""
+    """Never beyond ``max_packet_bytes`` (4 records with 250 B and 10 nodes, 10 with 1470 B); an SOS goes before normal records; airtime of 250 B ≈ 2.5 ms with the ack."""
     rcfg = cfg["routing"]
     assert record_bytes(10) == 53
     assert records_per_packet(rcfg, 10) == 4 and records_per_packet(rcfg, 10, 1470) == 10
@@ -297,21 +282,21 @@ def test_packet_sizes_and_priority(cfg):
     queue.append([7.0, 1, 2_000_000, KIND_SOS, 8, 0, False, 7.0])
     pkt = select_packet(queue, 4, 1)
     assert pkt[0][3] == KIND_SOS and [r[2] for r in pkt[1:]] == [0, 1, 2] and len(pkt) == 4
-    assert [r[2] for r in select_packet(queue[:6], 4, 0)] == [0, 1, 2, 3]  # senza prioritari: i più vecchi
-    # nella simulazione: nessun pacchetto oltre il limite, e un record solo parte dopo ``max_wait``
+    assert [r[2] for r in select_packet(queue[:6], 4, 0)] == [0, 1, 2, 3]  # without priority records: the oldest
+    # in the simulation: no packet beyond the limit, and a lone record leaves after ``max_wait``
     rd = synthetic_rd(cfg, 3, 60.0, 0, chain)
     out = simulate_strategy(rd, "best_rssi", rcfg)
     assert out["max_packet_bytes_sent"] <= rcfg["max_packet_bytes"]
     delay = out["log"]["t_arrive"] - out["log"]["t_create"]
     one_hop = delay[out["log"]["hops"] == 1]
-    assert one_hop.max() == pytest.approx(rcfg["max_wait"], abs=1e-6)  # un record solo aspetta ``max_wait`` e poi parte
-    assert delay.max() <= 2 * rcfg["max_wait"] + 1e-6  # a ogni salto al più ``max_wait`` di attesa
+    assert one_hop.max() == pytest.approx(rcfg["max_wait"], abs=1e-6)  # a lone record waits ``max_wait`` and then leaves
+    assert delay.max() <= 2 * rcfg["max_wait"] + 1e-6  # at most ``max_wait`` of waiting per hop
 
 
 def test_sos_leaves_immediately(cfg):
-    """Un SOS non aspetta ``max_wait``: arriva al capogruppo nello stesso passo in cui nasce (collegamento diretto, p = 1)."""
+    """An SOS does not wait ``max_wait``: it reaches the leader in the same step it is born (direct link, p = 1)."""
     rcfg = cfg["routing"]
-    step = 355  # 35,5 s: lontano dall'istante dei record (interi)
+    step = 355  # 35.5 s: far from the instant of the records (integers)
     rd = synthetic_rd(cfg, 3, 60.0, 0, chain, events=[(step, 1, KIND_SOS)])
     out = simulate_strategy(rd, "best_rssi", rcfg)
     sel = out["log"]["kind"] == KIND_SOS
@@ -324,40 +309,40 @@ def test_sos_leaves_immediately(cfg):
 
 
 def test_isolated_node_fills_buffer_degrades_keeps_sos_and_delivers_in_time_order(cfg):
-    """Nodo 2 isolato fino a 100 s: riempie il buffer (30), poi crea record a 0,2 Hz sovrascrivendo i più vecchi non-SOS e tiene l'SOS; al ritorno consegna in ordine di tempo."""
+    """Node 2 isolated until 100 s: fills the buffer (30), then creates records at 0.2 Hz overwriting the oldest non-SOS and keeps the SOS; on return it delivers in time order."""
     cfg["routing"]["buffer_records"] = 30
     rcfg = cfg["routing"]
     back = 100.0
     topo = lambda i, j, tt: chain(i, j, tt) & ~(({i, j} == {1, 2}) & (tt < back))  # noqa: E731
-    rd = synthetic_rd(cfg, 3, 140.0, 0, topo, events=[(100, 2, KIND_SOS)])  # SOS a 10 s, durante l'isolamento
+    rd = synthetic_rd(cfg, 3, 140.0, 0, topo, events=[(100, 2, KIND_SOS)])  # SOS at 10 s, during the isolation
     out = simulate_strategy(rd, "best_rssi", rcfg)
     created = out["created"]
     mine = created[(created[:, 0] == 2) & (created[:, 3] == KIND_NORMAL)]
     during = mine[mine[:, 2] < back]
-    # 29 record al secondo (con l'SOS il buffer da 30 è pieno), poi uno ogni 5 s da 30 a 95 s: 14 record
+    # 29 records at 1 per second (with the SOS the 30-record buffer is full), then one every 5 s from 30 to 95 s: 14 records
     assert len(during) == 29 + 14
     late = during[during[:, 2] > 40.0]
-    assert np.all(np.diff(late[:, 2]) >= 5.0 - 1e-9)  # a buffer pieno: 0,2 Hz
+    assert np.all(np.diff(late[:, 2]) >= 5.0 - 1e-9)  # with a full buffer: 0.2 Hz
     assert out["max_occupancy"][2] == 30 and out["lost_buffer"][2] > 0
     log = out["log"]
     sos = log["kind"] == KIND_SOS
-    assert sos.sum() == 1 and log["t_arrive"][sos][0] >= back  # l'SOS sopravvive e parte al ritorno
+    assert sos.sum() == 1 and log["t_arrive"][sos][0] >= back  # the SOS survives and leaves on return
     arrive = (log["origin"] == 2) & (log["kind"] == KIND_NORMAL) & (log["t_arrive"] >= back)
     assert arrive.sum() >= 20
     tc = log["t_create"][arrive]
-    assert np.all(np.diff(tc) > 0)  # ordine di tempo
+    assert np.all(np.diff(tc) > 0)  # time order
     buffered = arrive & (log["t_create"] < back)
-    assert buffered.sum() >= 20 and np.all(log["carry"][buffered])  # i record del buffer sono arrivati via carry
-    assert not log["carry"][(log["origin"] == 2) & (log["t_create"] > back + 5.0)].any()  # quelli nati dopo il ritorno no
+    assert buffered.sum() >= 20 and np.all(log["carry"][buffered])  # the buffered records arrived via carry
+    assert not log["carry"][(log["origin"] == 2) & (log["t_create"] > back + 5.0)].any()  # those born after the return did not
 
 
 # ---------------------------------------------------------------------------
-# 9. Duplicati
+# 9. Duplicates
 # ---------------------------------------------------------------------------
 
 
 def test_duplicate_records_counted_once(cfg):
-    """Con conferma sempre persa (ritorno 0) il capogruppo riceve ogni record più volte, ma ogni (nodo, progressivo) compare una volta sola nel registro."""
+    """With the ack always lost (return 0) the leader receives each record several times, but each (node, sequence) appears only once in the log."""
 
     def kill_ack(rd):
         rd["p"][:, 0, 1] = 0.0
@@ -366,8 +351,8 @@ def test_duplicate_records_counted_once(cfg):
     out = simulate_strategy(rd, "best_rssi", cfg["routing"])
     keys = list(zip(out["log"]["origin"].tolist(), out["log"]["seq"].tolist()))
     cap = records_per_packet(cfg["routing"], 2)
-    assert out["duplicates"] > 0 and len(keys) == len(set(keys)) == cap  # senza conferma il mittente rimanda sempre i `cap` record più vecchi
-    assert out["fail_both"] > 0  # il mittente le considera fallite
+    assert out["duplicates"] > 0 and len(keys) == len(set(keys)) == cap  # without the ack the sender keeps resending the `cap` oldest records
+    assert out["fail_both"] > 0  # the sender considers them failed
 
 
 # ---------------------------------------------------------------------------
@@ -376,23 +361,23 @@ def test_duplicate_records_counted_once(cfg):
 
 
 def test_direct_delivers_only_on_the_direct_link(cfg):
-    """Catena 0-1-2-3: `direct` consegna solo i record del nodo 1 (vicino del capogruppo); `best_rssi` anche quelli di 2 e 3 (via ponte)."""
+    """Chain 0-1-2-3: `direct` delivers only the records of node 1 (neighbour of the leader); `best_rssi` also those of 2 and 3 (via bridge)."""
     rd = synthetic_rd(cfg, 4, 60.0, 0, chain)
     d = simulate_strategy(rd, "direct", cfg["routing"])
     assert set(np.unique(d["log"]["origin"])) == {1}
     assert np.all(d["log"]["hops"] == 1) and d["bridge_changes"] == 0
     b = simulate_strategy(rd, "best_rssi", cfg["routing"])
     assert set(np.unique(b["log"]["origin"])) == {1, 2, 3}
-    assert d["max_occupancy"][3] > 0 and max(d["queue_lengths"][2:]) > 30  # senza ponte i record dei nodi lontani restano in coda (carry)
+    assert d["max_occupancy"][3] > 0 and max(d["queue_lengths"][2:]) > 30  # without a bridge the records of the far nodes stay in the queue (carry)
 
 
 # ---------------------------------------------------------------------------
-# 11. Riproducibilità
+# 11. Reproducibility
 # ---------------------------------------------------------------------------
 
 
 def test_reproducible_same_seed_same_result_and_position_class(cfg):
-    """Stesso seme, stesso risultato per tutte le strategie, con ricezioni probabilistiche; un seme diverso cambia gli unicast."""
+    """Same seed, same result for all strategies, with probabilistic receptions; a different seed changes the unicasts."""
 
     def lossy(rd):
         rd["p"][:] = np.where(rd["p"] > 0, 0.6, 0.0)
@@ -405,13 +390,13 @@ def test_reproducible_same_seed_same_result_and_position_class(cfg):
         assert a["breaks"] == b["breaks"] and a["bridge_changes"] == b["bridge_changes"]
     other = dict(rd, seed=12)
     assert not np.array_equal(simulate_strategy(rd, "dqrem", cfg["routing"])["log"]["t_arrive"], simulate_strategy(other, "dqrem", cfg["routing"])["log"]["t_arrive"])
-    # posizione del capogruppo: terzi del rango (10 nodi: coda 0-2, centro 3-6, testa 7-9)
+    # leader position: thirds of the rank (10 nodes: tail 0-2, centre 3-6, head 7-9)
     offsets = np.arange(10, dtype=float)[::-1]
     assert [position_class(offsets, 9)[1], position_class(offsets, 6)[1], position_class(offsets, 0)[1]] == [0, 1, 2]
 
 
 # ---------------------------------------------------------------------------
-# 12. Profili di canale, connettività, portata
+# 12. Channel profiles, connectivity, range
 # ---------------------------------------------------------------------------
 
 
@@ -423,7 +408,7 @@ def _flatten(d, prefix=""):
 
 
 def test_nominal_profile_is_the_previous_block7_config_and_heltec_changes_three_keys(cfg):
-    """`nominal` = solo ``scenario_overrides`` (la config del primo punto di lavoro, quindi risultati identici); `heltec_run` cambia soltanto potenza, sensibilità e soglia dei candidati."""
+    """`nominal` = only ``scenario_overrides`` (the first operating point config, hence identical results); `heltec_run` changes only power, sensitivity and candidate threshold."""
     from src.refinement import apply_overrides
     from src.routing_experiment import block7_config
 
@@ -438,11 +423,11 @@ def test_nominal_profile_is_the_previous_block7_config_and_heltec_changes_three_
     assert b["routing.candidate_threshold"] - b["packets.reception.sensitivity_dbm"] == pytest.approx(8.0)
     assert block7_config(cfg)["channel"]["tx_power"] == heltec["channel"]["tx_power"]  # default = routing.channel_profile
     with pytest.raises(KeyError):
-        block7_config(cfg, "inesistente")
+        block7_config(cfg, "nonexistent")
 
 
 def test_heltec_profile_median_rssi_in_compact_group_of_five(cfg):
-    """Con la potenza equivalente del profilo ``heltec_run`` la mediana dell'RSSI nel gruppo da 5 compatti (scenario none, canale base) è −78 ± 1 dBm; a 10 dBm è −51."""
+    """With the equivalent power of the ``heltec_run`` profile the median RSSI in the compact 5-node group (scenario none, base channel) is −78 ± 1 dBm; at 10 dBm it is −51."""
     from src.refinement import apply_overrides
     from src.routing_experiment import group_median_rssi
 
@@ -452,7 +437,7 @@ def test_heltec_profile_median_rssi_in_compact_group_of_five(cfg):
 
 
 def test_connectivity_on_a_cut_chain(cfg):
-    """Catena 0-1-2-3 con il capogruppo 0; da metà il collegamento 1-2 cade. Prima tutti connessi e gruppo intero; dopo, i nodi 2 e 3 senza strada e gruppo spezzato in 2 parti (campioni a 1 s)."""
+    """Chain 0-1-2-3 with leader 0; halfway through, link 1-2 drops. Before, all connected and group whole; after, nodes 2 and 3 have no path and the group is split in 2 parts (1 s samples)."""
     from src.routing import connectivity_stats
 
     t = np.arange(0.0, 100.0, 0.1)
@@ -463,26 +448,26 @@ def test_connectivity_on_a_cut_chain(cfg):
     c = connectivity_stats(t, rssi, 0, -1, float("nan"), cfg["routing"], 10)
     np.testing.assert_allclose(c["in"] / c["n"], [1.0, 1.0, 0.5, 0.5])
     assert c["split"] == 50 and c["split_n"] == 100
-    # un solo senso sopra soglia non basta (serve anche la conferma)
+    # a single direction above threshold is not enough (the ack is needed too)
     rssi[:, 0, 1] = -120.0
     c = connectivity_stats(t, rssi, 0, -1, float("nan"), cfg["routing"], 10)
     assert c["in"][1] == 0
 
 
 def test_connectivity_excludes_separated_node_from_the_group(cfg):
-    """Dopo il distacco il nodo separato esce dal gruppo: non rompe la connettività del gruppo e viene contato a parte sul grafo completo."""
+    """After the detachment the separated node leaves the group: it does not break the group's connectivity and is counted separately on the full graph."""
     from src.routing import connectivity_stats
 
     t = np.arange(0.0, 100.0, 0.1)
     rssi = np.full((len(t), 3, 3), -70.0)
-    rssi[t >= 60.0, 2, :] = rssi[t >= 60.0, :, 2] = -120.0  # il nodo 2 si stacca a 60 s
+    rssi[t >= 60.0, 2, :] = rssi[t >= 60.0, :, 2] = -120.0  # node 2 detaches at 60 s
     c = connectivity_stats(t, rssi, 0, 2, 60.0, cfg["routing"], 10)
     assert c["split"] == 0 and c["n"][2] == 60 and c["in"][2] == 60
     assert c["sep_n"] == 40 and c["sep_in"] == 0
 
 
 def test_range_inversion_matches_path_loss(cfg):
-    """La portata solo-distanza inverte `path_loss_db`: a quella distanza il livello vale il valore richiesto."""
+    """The distance-only range inverts `path_loss_db`: at that distance the level equals the requested value."""
     from src.channel import path_loss_db
     from src.routing_experiment import block7_config, distance_range
 

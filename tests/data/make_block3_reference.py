@@ -1,8 +1,8 @@
-"""Genera `block3_reference.npz`: uscite del Blocco 3 su tre corse brevi (una per scenario).
+"""Generate `block3_reference.npz`: Block 3 outputs on three short runs (one per scenario).
 
-Va eseguito con il codice del Blocco 3 PRIMA dell'opzione ``background_model`` (commit 0b8c38d);
-`tests/test_block6.py::test_independent_model_reproduces_block3` confronta bit per bit.
-Uso: python tests/data/make_block3_reference.py
+Must be run with the Block 3 code BEFORE the ``background_model`` option (commit 0b8c38d);
+`tests/test_block6.py::test_independent_model_reproduces_block3` compares bit for bit.
+Usage: python tests/data/make_block3_reference.py
 """
 
 import copy
@@ -52,4 +52,4 @@ if __name__ == "__main__":
         for name, arr in reference_outputs(scenario, copy.deepcopy(config)).items():
             arrays[f"{scenario}/{name}"] = arr
     np.savez_compressed(Path(__file__).with_name("block3_reference.npz"), **arrays)
-    print(f"{len(arrays)} array salvati")
+    print(f"{len(arrays)} arrays saved")

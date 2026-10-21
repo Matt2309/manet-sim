@@ -1,33 +1,33 @@
-"""Blocco 4 — Metriche del rilevatore (versione di base).
+"""Block 4 — Detector metrics (base version).
 
-- **Tempo di rilevamento**: primo istante dall'inizio del distacco
-  (``t[idx_start]``) con l'allarme di sistema attivo sul nodo separato;
-  ritardo = differenza (0 = **rilevamento fortuito**, contato a parte).
-  Distanza = minima dal resto del gruppo (ground truth) in quell'istante.
-- **Rilevamento riuscito**: l'allarme precede il primo istante in cui la
-  distanza minima supera ``success_distance``. ``P_d`` = frazione di corse
-  riuscite; ``p_detect_window`` (ritardo ``<= success_window``) è solo
-  informativa.
-- **Falsi allarmi** (corse ``none``, tutti i bersagli): episodi per ora
-  (fronti di salita dopo il ``warmup`` / ore dopo il ``warmup``) e frazione
-  del tempo in allarme.
-- **Punto ammissibile** (σ_a, ambito, modalità, soglia): falsi allarmi/ora
-  ``<= target_false_alarms_per_hour`` E frazione in allarme
-  ``<= max_alarm_time_fraction``. Il punto di lavoro è fra gli ammissibili.
-- **Intervalli di confidenza**: Wilson per ``P_d``, Poisson esatto (Garwood)
-  per gli episodi/ora (ottimistico: i bersagli di una corsa non sono
-  indipendenti).
-- Varianti: pre-allarme (``pre``), solo "nodo perso" (``lost``), entrambi
-  (``both``: osservatore in allarme se lo è uno dei due).
+- **Detection time**: first instant since the start of the separation
+  (``t[idx_start]``) with the system alarm active on the separated node;
+  delay = difference (0 = **fortuitous detection**, counted separately).
+  Distance = minimum from the rest of the group (ground truth) at that instant.
+- **Successful detection**: the alarm precedes the first instant at which the
+  minimum distance exceeds ``success_distance``. ``P_d`` = fraction of
+  successful runs; ``p_detect_window`` (delay ``<= success_window``) is
+  informative only.
+- **False alarms** (``none`` runs, all targets): episodes per hour
+  (rising edges after ``warmup`` / hours after ``warmup``) and fraction
+  of time in alarm.
+- **Feasible point** (σ_a, scope, mode, threshold): false alarms/hour
+  ``<= target_false_alarms_per_hour`` AND fraction in alarm
+  ``<= max_alarm_time_fraction``. The working point is among the feasible ones.
+- **Confidence intervals**: Wilson for ``P_d``, exact Poisson (Garwood)
+  for episodes/hour (optimistic: the targets of a run are not
+  independent).
+- Variants: pre-alarm (``pre``), "lost node" only (``lost``), both
+  (``both``: observer in alarm if either of the two is).
 
-Monotonia rispetto alla soglia: allargandola, gli accendimenti sono un
-sovrainsieme e gli spegnimenti un sottoinsieme, quindi l'insieme degli
-istanti in allarme cresce sempre (osservatori, allarme di sistema, frazione
-in allarme, ritardo non crescente, ``P_d``). Gli **episodi** possono invece
-CALARE (due episodi si fondono, o un allarme già acceso prima del ``warmup``
-non è un fronte): monotoni solo senza fusioni.
+Monotonicity with respect to the threshold: widening it, the turn-ons are a
+superset and the turn-offs a subset, so the set of
+instants in alarm always grows (observers, system alarm, fraction
+in alarm, non-increasing delay, ``P_d``). The **episodes** can instead
+DECREASE (two episodes merge, or an alarm already on before ``warmup``
+is not an edge): monotonic only without merges.
 
-Parametri: sezioni ``metrics`` e ``detector`` della config.
+Parameters: ``metrics`` and ``detector`` sections of the config.
 """
 
 from __future__ import annotations
@@ -37,6 +37,7 @@ import math
 import numpy as np
 from scipy.stats import chi2, norm
 
+from src.common.enums import DetectorMode, Reference, Scenario
 from src.detector import (
     DetectionInputs,
     count_episodes,
@@ -47,41 +48,42 @@ from src.detector import (
 from src.relative import relative_alarms
 
 VARIANTS = ("pre", "lost", "both")
-MODES = ("level", "slope", "both")
+MODES = tuple(m.value for m in DetectorMode)
 SCOPES = ("fused", "pairwise")
-SEPARATED = ("slowdown", "stop")
+RANK_TOLERANCE = 1e-12
+SEPARATED = (Scenario.SLOWDOWN.value, Scenario.STOP.value)
 
 
 # ---------------------------------------------------------------------------
-# Soglie e statistiche elementari
+# Thresholds and elementary statistics
 # ---------------------------------------------------------------------------
 
 
 def threshold_grid(spec: list) -> np.ndarray:
-    """Griglia crescente da ``[inizio, fine, passo]`` (estremi inclusi)."""
+    """Increasing grid from ``[start, stop, step]`` (endpoints included)."""
     start, stop, step = spec
     n = int(round((stop - start) / step)) + 1
     return start + step * np.arange(n)
 
 
 def nearest_rank(values: np.ndarray, q: float) -> float:
-    """Percentile a rango più vicino (elemento ``ceil(q·n)``-esimo ordinato, `q` in [0, 1]); NaN se vuoto. Ammette ``inf``."""
+    """Nearest-rank percentile (the ``ceil(q·n)``-th sorted element, `q` in [0, 1]); NaN if empty. Allows ``inf``."""
     values = np.sort(np.asarray(values, dtype=float))
     if len(values) == 0:
         return float("nan")
-    rank = max(int(math.ceil(q * len(values) - 1e-12)), 1)
+    rank = max(int(math.ceil(q * len(values) - RANK_TOLERANCE)), 1)
     return float(values[rank - 1])
 
 
 # ---------------------------------------------------------------------------
-# Riassunti di una corsa
+# Summaries of a run
 # ---------------------------------------------------------------------------
 
 
 def summarize_none(system: np.ndarray, t: np.ndarray, warmup: float) -> dict:
-    """Falsi allarmi di una corsa senza distacco (allarme di sistema (T, I)).
+    """False alarms of a run without separation (system alarm (T, I)).
 
-    Restituisce ``episodes``, ``active`` (campioni in allarme), ``samples`` (bersagli × istanti), ``hours`` dopo il ``warmup``.
+    Returns ``episodes``, ``active`` (samples in alarm), ``samples`` (targets × instants), ``hours`` after ``warmup``.
     """
     first = int(np.searchsorted(t, warmup))
     dt = float(t[1] - t[0])
@@ -97,10 +99,10 @@ def summarize_none(system: np.ndarray, t: np.ndarray, warmup: float) -> dict:
 def summarize_separated(
     system: np.ndarray, t: np.ndarray, idx_start: int, distance: np.ndarray, success_distance: float
 ) -> dict:
-    """Rilevamento in una corsa con distacco (allarme (T,) sul nodo separato, `distance` (T,) in m).
+    """Detection in a run with separation (alarm (T,) on the separated node, `distance` (T,) in m).
 
-    Con `k` primo campione in allarme ``>= idx_start`` e `c` primo con ``distance > success_distance``:
-    riuscito se ``k < c``. Restituisce ``delay`` (s, ``inf`` se mai), ``distance`` (m, NaN se mai),
+    With `k` the first sample in alarm ``>= idx_start`` and `c` the first with ``distance > success_distance``:
+    successful if ``k < c``. Returns ``delay`` (s, ``inf`` if never), ``distance`` (m, NaN if never),
     ``fortuitous``, ``success``.
     """
     exceeded = np.flatnonzero(distance[idx_start:] > success_distance)
@@ -118,13 +120,37 @@ def summarize_separated(
 
 
 def min_distance_to_group(distances: np.ndarray, node: int) -> np.ndarray:
-    """Distanza minima del nodo dal resto del gruppo, a ogni istante (ground truth)."""
+    """Minimum distance of the node from the rest of the group, at each instant (ground truth)."""
     others = [j for j in range(distances.shape[1]) if j != node]
     return distances[:, node, others].min(axis=1).astype(float)
 
 
+def separation_target(run: dict) -> tuple:
+    node = run["sep_node"]
+    return node, int(np.searchsorted(run["t"], run["sep_start"])), min_distance_to_group(run["distances"], node)
+
+
+def run_summarizer(run: dict, config: dict, is_none: bool, extended: bool = False) -> tuple:
+    t = run["t"]
+    if is_none:
+        warmup = config["detector"]["warmup"]
+        return (lambda s: summarize_none(s, t, warmup)), None
+    node, idx_start, distance = separation_target(run)
+    success_distance = config["metrics"]["success_distance"]
+    if extended:
+        repass = config["refinement"]["repass_distance"]
+        return (lambda s: summarize_separated_ext(s, t, idx_start, distance, success_distance, repass)), node
+    return (lambda s: summarize_separated(s, t, idx_start, distance, success_distance)), node
+
+
+def split_by_scenario(outs: list, scenarios=SEPARATED) -> tuple:
+    none = sorted((o for o in outs if o["scenario"] == Scenario.NONE), key=lambda o: o["index"])
+    separated = {s: sorted((o for o in outs if o["scenario"] == s), key=lambda o: o["index"]) for s in scenarios}
+    return none, separated
+
+
 def wilson_interval(successes: int, n: int, level: float) -> tuple:
-    """Intervallo di Wilson (inferiore, superiore) in [0, 1] per `successes` su `n` prove, al livello `level`."""
+    """Wilson interval (lower, upper) in [0, 1] for `successes` out of `n` trials, at level `level`."""
     z = float(norm.ppf(0.5 + level / 2.0))
     p = successes / n
     denom = 1.0 + z * z / n
@@ -134,7 +160,7 @@ def wilson_interval(successes: int, n: int, level: float) -> tuple:
 
 
 def poisson_interval(count: int, hours: float, level: float) -> tuple:
-    """Intervallo esatto (Garwood) per una frequenza di Poisson: (inferiore, superiore) in eventi/ora."""
+    """Exact (Garwood) interval for a Poisson rate: (lower, upper) in events/hour."""
     alpha = 1.0 - level
     lower = 0.0 if count == 0 else float(chi2.ppf(alpha / 2.0, 2 * count)) / 2.0
     upper = float(chi2.ppf(1.0 - alpha / 2.0, 2 * count + 2)) / 2.0
@@ -142,45 +168,45 @@ def poisson_interval(count: int, hours: float, level: float) -> tuple:
 
 
 # ---------------------------------------------------------------------------
-# Valutazione di una corsa su tutta la griglia di parametri
+# Evaluation of a run over the whole parameter grid
 # ---------------------------------------------------------------------------
 
 
 def _grid_for(mode: str, metrics_cfg: dict) -> np.ndarray:
-    key = "slope_threshold_sweep" if mode == "slope" else "level_threshold_sweep"
+    key = "slope_threshold_sweep" if mode == DetectorMode.SLOPE else "level_threshold_sweep"
     return threshold_grid(metrics_cfg[key])
 
 
 def evaluate_run(inputs: DetectionInputs, config: dict, summarize) -> dict:
-    """Valuta una corsa per ogni (ambito, modalità, variante, soglia) applicando `summarize(system) -> dict`.
+    """Evaluates a run for each (scope, mode, variant, threshold) by applying `summarize(system) -> dict`.
 
-    `inputs` è intero (corse ``none``) o ritagliato sul bersaglio. L'allarme "perso" non dipende da
-    soglia, modalità né ambito (chiave ``("-", "-", "lost")``). ``level``/``both`` variano la soglia di
-    livello (pendenza fissa), ``slope`` quella di pendenza. Restituisce ``chiave -> {"threshold",
-    chiavi di summarize}`` con un elemento per soglia.
+    `inputs` is whole (``none`` runs) or cropped to the target. The "lost" alarm does not depend on
+    threshold, mode or scope (key ``("-", "-", "lost")``). ``level``/``both`` vary the level
+    threshold (fixed slope), ``slope`` the slope one. Returns ``key -> {"threshold",
+    summarize keys}`` with one element per threshold.
     """
     dcfg = config["detector"]
     mcfg = config["metrics"]
     t = inputs.t
     lost_obs = lost_alarm(inputs.silence, inputs.rx_ok, t, dcfg, inputs.valid, **inputs.lost_kwargs())
-    results = {("-", "-", "lost"): _stack([math.nan], [summarize(system_alarm(lost_obs, dcfg["min_observers"]))])}
+    results = {("-", "-", "lost"): stack_summaries([math.nan], [summarize(system_alarm(lost_obs, dcfg["min_observers"]))])}
     for scope in SCOPES:
         for mode in MODES:
             grid = _grid_for(mode, mcfg)
             rows = {"pre": [], "both": []}
             for thr in grid:
-                kwargs = {"slope_threshold": thr} if mode == "slope" else {"level_threshold": thr}
+                kwargs = {"slope_threshold": thr} if mode == DetectorMode.SLOPE else {"level_threshold": thr}
                 pre_obs = pre_alarm(
                     inputs.level[scope], inputs.slope[scope], inputs.rx_ok, t, dcfg, mode, valid=inputs.valid, **kwargs
                 )
                 rows["pre"].append(summarize(system_alarm(pre_obs, dcfg["min_observers"])))
                 rows["both"].append(summarize(system_alarm(pre_obs | lost_obs, dcfg["min_observers"])))
             for variant, summaries in rows.items():
-                results[(scope, mode, variant)] = _stack(grid, summaries)
+                results[(scope, mode, variant)] = stack_summaries(grid, summaries)
     return results
 
 
-def _stack(thresholds, summaries: list) -> dict:
+def stack_summaries(thresholds, summaries: list) -> dict:
     out = {"threshold": np.asarray(thresholds, dtype=float)}
     for key in summaries[0]:
         out[key] = np.array([s[key] for s in summaries])
@@ -188,16 +214,16 @@ def _stack(thresholds, summaries: list) -> dict:
 
 
 # ---------------------------------------------------------------------------
-# Aggregazione sulle corse
+# Aggregation over runs
 # ---------------------------------------------------------------------------
 
 
 def aggregate(none_runs: list, separated_runs: dict, config: dict) -> list:
-    """Righe di metriche per ogni (ambito, modalità, variante, soglia, scenario).
+    """Metric rows for each (scope, mode, variant, threshold, scenario).
 
-    Ingressi: `evaluate_run` delle corse ``none`` (lista) e con distacco (scenario → lista). Falsi
-    allarmi/ora = episodi totali / ore totali; mediana e p90 con rango più vicino (mancati = ``inf``).
-    Colonne: scope, mode, variant, threshold, scenario, p_detect, p_lo, p_hi, p_detect_window, n_runs,
+    Inputs: `evaluate_run` of the ``none`` runs (list) and of the separation runs (scenario → list). False
+    alarms/hour = total episodes / total hours; median and p90 with nearest rank (missed = ``inf``).
+    Columns: scope, mode, variant, threshold, scenario, p_detect, p_lo, p_hi, p_detect_window, n_runs,
     fortuitous, delay_*/distance_* (median, p90), fa_per_hour, fa_lo, fa_hi, active_fraction, feasible.
     """
     mcfg = config["metrics"]
@@ -252,16 +278,16 @@ def aggregate(none_runs: list, separated_runs: dict, config: dict) -> list:
 
 
 def working_point(rows: list, scope: str, mode: str, variant: str) -> dict | None:
-    """Soglia ammissibile con ``P_d`` (media sugli scenari) più alta, da righe di `aggregate` di un solo ``sigma_a``.
+    """Feasible threshold with the highest ``P_d`` (mean over scenarios), from `aggregate` rows of a single ``sigma_a``.
 
-    A parità: meno falsi allarmi/ora, poi soglia più bassa. ``{"threshold", "p_detect", "fa_per_hour"}``
-    o None se nessuna è ammissibile.
+    On ties: fewer false alarms/hour, then lower threshold. ``{"threshold", "p_detect", "fa_per_hour"}``
+    or None if none is feasible.
     """
     by_threshold: dict = {}
     for row in rows:
         if (row["scope"], row["mode"], row["variant"]) != (scope, mode, variant) or not row["feasible"]:
             continue
-        thr = None if math.isnan(row["threshold"]) else row["threshold"]  # "perso": nessuna soglia
+        thr = None if math.isnan(row["threshold"]) else row["threshold"]  # "lost": no threshold
         entry = by_threshold.setdefault(thr, {"p": [], "fa": row["fa_per_hour"]})
         entry["p"].append(row["p_detect"])
     candidates = [
@@ -274,9 +300,9 @@ def working_point(rows: list, scope: str, mode: str, variant: str) -> dict | Non
 
 
 def best_over_sigma(rows: list, scope: str, mode: str, variant: str) -> dict | None:
-    """Miglior ``σ_a`` (campo ``sigma_a`` delle righe): `working_point` con ``P_d`` più alta, poi meno falsi allarmi, poi ``σ_a`` minore.
+    """Best ``σ_a`` (``sigma_a`` field of the rows): `working_point` with the highest ``P_d``, then fewer false alarms, then lower ``σ_a``.
 
-    Punto di lavoro con in più ``sigma_a``, o None.
+    Working point with ``sigma_a`` added, or None.
     """
     best = None
     for sigma_a in sorted({row["sigma_a"] for row in rows}):
@@ -291,22 +317,22 @@ def best_over_sigma(rows: list, scope: str, mode: str, variant: str) -> dict | N
 
 
 # ---------------------------------------------------------------------------
-# Blocco 5: metriche aggiuntive e valutazione di una configurazione
+# Block 5: additional metrics and evaluation of a configuration
 # ---------------------------------------------------------------------------
 
 
 def summarize_separated_ext(
     system: np.ndarray, t: np.ndarray, idx_start: int, distance: np.ndarray, success_distance: float, repass_distance: float
 ) -> dict:
-    """`summarize_separated` più spegnimenti a torto e ripassaggi (Blocco 5, sezione C).
+    """`summarize_separated` plus wrong turn-offs and re-passes (Block 5, section C).
 
-    Input: allarme di sistema (T,) sul nodo separato, `distance` (T,) in m dal gruppo (ground truth), `idx_start` primo campione del distacco.
-    Procedimento: in ``slowdown`` e ``stop`` il nodo separato non rientra mai, quindi ogni spegnimento dell'allarme DOPO il rilevamento
-    (primo campione in allarme `k`) è a torto. Ripassaggio: dopo `k` la distanza supera `repass_distance` e poi torna sotto (il gruppo
-    ripassa accanto al nodo fermo).
-    Output: le chiavi di `summarize_separated` più ``n_wrong_off`` (spegnimenti a torto), ``wrong_off_dist_sum`` e ``wrong_off_dist_min``
-    (m, distanza dal gruppo negli spegnimenti; NaN se nessuno), ``repass`` (bool), ``repass_off`` (l'allarme si è spento durante il
-    ripassaggio), ``alarm_on_end`` (acceso alla fine della corsa).
+    Input: system alarm (T,) on the separated node, `distance` (T,) in m from the group (ground truth), `idx_start` first sample of the separation.
+    Procedure: in ``slowdown`` and ``stop`` the separated node never returns, so every alarm turn-off AFTER detection
+    (first sample in alarm `k`) is wrong. Re-pass: after `k` the distance exceeds `repass_distance` and then drops below it (the group
+    passes by the stopped node again).
+    Output: the keys of `summarize_separated` plus ``n_wrong_off`` (wrong turn-offs), ``wrong_off_dist_sum`` and ``wrong_off_dist_min``
+    (m, distance from the group at the turn-offs; NaN if none), ``repass`` (bool), ``repass_off`` (the alarm turned off during the
+    re-pass), ``alarm_on_end`` (on at the end of the run).
     """
     out = summarize_separated(system, t, idx_start, distance, success_distance)
     out.update(n_wrong_off=0, wrong_off_dist_sum=0.0, wrong_off_dist_min=math.nan, repass=False, repass_off=False)
@@ -333,17 +359,17 @@ def summarize_separated_ext(
 
 
 def observer_states(inputs: DetectionInputs, config: dict, scope: str) -> tuple:
-    """Pre-allarme di ogni osservatore per ogni soglia: (soglie, stati) con stati ``(soglie, T, M[, I])``.
+    """Pre-alarm of each observer for each threshold: (thresholds, states) with states ``(thresholds, T, M[, I])``.
 
-    ``detector.reference``: ``absolute`` = `pre_alarm` in modalità ``level`` sulla griglia ``level_threshold_sweep`` (dBm);
-    ``relative`` = `relative_alarms` sulla griglia ``drop_threshold_sweep`` (dB).
+    ``detector.reference``: ``absolute`` = `pre_alarm` in ``level`` mode on the ``level_threshold_sweep`` grid (dBm);
+    ``relative`` = `relative_alarms` on the ``drop_threshold_sweep`` grid (dB).
     """
     dcfg, mcfg = config["detector"], config["metrics"]
-    if dcfg["reference"] == "relative":
+    if dcfg["reference"] == Reference.RELATIVE:
         grid = threshold_grid(mcfg["drop_threshold_sweep"])
         return grid, relative_alarms(inputs, config, scope, grid)
-    if dcfg["reference"] != "absolute":
-        raise ValueError(f"detector.reference deve essere 'absolute' o 'relative', non {dcfg['reference']!r}")
+    if dcfg["reference"] != Reference.ABSOLUTE:
+        raise ValueError(f"detector.reference must be 'absolute' or 'relative', not {dcfg['reference']!r}")
     grid = threshold_grid(mcfg["level_threshold_sweep"])
     states = np.stack(
         [
@@ -355,25 +381,25 @@ def observer_states(inputs: DetectionInputs, config: dict, scope: str) -> tuple:
 
 
 def observer_stats(observer: np.ndarray, t: np.ndarray, warmup: float) -> dict:
-    """Somme per la correlazione fra gli allarmi degli osservatori sullo stesso bersaglio (corse ``none``).
+    """Sums for the correlation between the alarms of observers on the same target (``none`` runs).
 
-    Input: allarmi degli osservatori ``(soglie, T, M, I)``. Dopo il `warmup`: ``n`` (istanti), ``n1[s, m, i]`` (istanti in allarme),
-    ``n11[s, m, m', i]`` (in allarme insieme), ``hist[s, c]`` (istanti-bersaglio con `c` osservatori in allarme). Sommabili fra corse.
+    Input: observer alarms ``(thresholds, T, M, I)``. After `warmup`: ``n`` (instants), ``n1[s, m, i]`` (instants in alarm),
+    ``n11[s, m, m', i]`` (in alarm together), ``hist[s, c]`` (target-instants with `c` observers in alarm). Summable across runs.
     """
     first = int(np.searchsorted(t, warmup))
     a = observer[:, first:].astype(np.float32)
     n_thr, n_steps, n_obs, n_tgt = a.shape
     n11 = np.stack([np.einsum("tmi,tni->mni", a[s], a[s]) for s in range(n_thr)])
-    counts = a.sum(axis=2).astype(int)  # (soglie, T, I)
+    counts = a.sum(axis=2).astype(int)  # (thresholds, T, I)
     hist = np.stack([np.bincount(counts[s].ravel(), minlength=n_obs + 1) for s in range(n_thr)])
     return {"n": np.array(n_steps), "n1": a.sum(axis=1).astype(np.float64), "n11": n11.astype(np.float64), "hist": hist}
 
 
 def observer_correlation(stats: dict, index: int) -> dict:
-    """Correlazione (phi) media fra gli allarmi di coppie di osservatori sullo stesso bersaglio, alla soglia `index`.
+    """Mean correlation (phi) between the alarms of pairs of observers on the same target, at threshold `index`.
 
-    `stats`: somma di `observer_stats` sulle corse. Phi di ogni terna (osservatore, osservatore', bersaglio) con entrambi diversi dal
-    bersaglio e varianza non nulla; media sulle terne (``phi``, ``n_triples``). Inoltre ``p_two_given_one`` = P(≥2 osservatori | ≥1).
+    `stats`: sum of `observer_stats` over runs. Phi of each triple (observer, observer', target) with both different from the
+    target and non-zero variance; mean over triples (``phi``, ``n_triples``). Also ``p_two_given_one`` = P(≥2 observers | ≥1).
     """
     n = float(stats["n"])
     n1, n11 = stats["n1"][index], stats["n11"][index]
@@ -400,26 +426,32 @@ def observer_correlation(stats: dict, index: int) -> dict:
 def evaluate_config(
     inputs: DetectionInputs, config: dict, scope: str, summarize, min_observers: list, corr_warmup: float | None = None
 ) -> dict:
-    """Variante ``both`` (pre-allarme + perso) di una configurazione, su tutta la griglia di soglie, per ogni `min_observers`.
+    """``both`` variant (pre-alarm + lost) of a configuration, over the whole threshold grid, for each `min_observers`.
 
-    Input: `inputs` (intero o ritagliato su un bersaglio), `scope`, `summarize(system) -> dict`, lista di `min_observers`.
-    Procedimento: `observer_states` (assoluto o relativo secondo ``detector.reference``), allarme "perso" (non dipende dalla soglia),
-    `system_alarm` e `summarize` a ogni soglia. Con `corr_warmup` aggiunge ``"corr"`` = `observer_stats` degli osservatori.
-    Output: ``{min_observers: {"threshold", chiavi di summarize}}``.
+    Input: `inputs` (whole or cropped to a target), `scope`, `summarize(system) -> dict`, list of `min_observers`.
+    Procedure: `observer_states` (absolute or relative according to ``detector.reference``), "lost" alarm (does not depend on the threshold),
+    `system_alarm` and `summarize` at each threshold. With `corr_warmup` adds ``"corr"`` = `observer_stats` of the observers.
+    Output: ``{min_observers: {"threshold", summarize keys}}``.
     """
     dcfg = config["detector"]
     grid, states = observer_states(inputs, config, scope)
     lost_obs = lost_alarm(inputs.silence, inputs.rx_ok, inputs.t, dcfg, inputs.valid, **inputs.lost_kwargs())
     out = {}
     for mo in min_observers:
-        out[mo] = _stack(grid, [summarize(system_alarm(states[n] | lost_obs, mo)) for n in range(len(grid))])
+        out[mo] = stack_summaries(grid, [summarize(system_alarm(states[n] | lost_obs, mo)) for n in range(len(grid))])
     if corr_warmup is not None:
         out["corr"] = observer_stats(states | lost_obs, inputs.t, corr_warmup)
     return out
 
 
 def paired_counts(success: np.ndarray, base_success: np.ndarray) -> tuple:
-    """Confronto a coppie con la base: (corse guadagnate, corse perse) = riuscite solo nella variante, riuscite solo nella base."""
+    """Paired comparison with the base: (runs gained, runs lost) = successful only in the variant, successful only in the base."""
     success = np.asarray(success, dtype=bool)
     base_success = np.asarray(base_success, dtype=bool)
     return int((success & ~base_success).sum()), int((~success & base_success).sum())
+
+
+def gain_loss_counts(success: dict, base_success: dict) -> dict:
+    out = {s: paired_counts(success[s], base_success[s]) for s in SEPARATED}
+    out["total"] = tuple(sum(out[s][k] for s in SEPARATED) for k in (0, 1))
+    return out

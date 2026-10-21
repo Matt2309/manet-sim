@@ -1,47 +1,45 @@
-"""Esperimento del Blocco 5: varianti A-F del rilevatore, confrontate con la base sulle stesse corse.
+"""Block 5 experiment: detector variants A-F, compared with the base on the same runs.
 
-Una VARIANTE è un insieme di sostituzioni della config (chiavi puntate, es. ``fusion.rule``). Per ogni
-corsa (in cache, `src/simulator.py`) si valutano tutte le varianti di una fase: Kalman → fusione →
-rilevatore su tutta la griglia di soglie, variante ``both`` (pre-allarme + perso). Poi, per ogni
-variante: sweep → punto di lavoro (regola del Blocco 4: P_d massima con falsi allarmi/h e tempo in
-allarme ammissibili) → confronto A COPPIE con la base (corse guadagnate e perse).
+A VARIANT is a set of config overrides (dotted keys, e.g. ``fusion.rule``). For each
+run (cached, `src/simulator.py`) all the variants of a phase are evaluated: Kalman → fusion →
+detector over the whole threshold grid, ``both`` variant (pre-alarm + lost). Then, for each
+variant: sweep → working point (Block 4 rule: maximum P_d with feasible false alarms/h and time in
+alarm) → PAIRED comparison with the base (runs gained and lost).
 
-Regola di scelta (`is_better`): una variante batte la migliore corrente se guadagna almeno
-``refinement.min_net_gain_runs`` corse nette (slowdown + stop); se è equivalente in P_d, se riduce di
-altrettante le corse con spegnimenti a torto. Altrimenti si tiene la più semplice (l'ordine delle liste).
+Selection rule (`is_better`): a variant beats the current best if it gains at least
+``refinement.min_net_gain_runs`` net runs (slowdown + stop); if equivalent in P_d, if it reduces by
+as many the runs with wrong turn-offs. Otherwise the simplest is kept (the order of the lists).
 
-Parametri: sezioni ``refinement``, ``metrics``, ``detector``, ``fusion``, ``kalman`` della config.
+Parameters: ``refinement``, ``metrics``, ``detector``, ``fusion``, ``kalman`` sections of the config.
 """
 
 from __future__ import annotations
 
-import itertools
-import math
 import time
 from pathlib import Path
 
 import numpy as np
 
+from src.common.arrays import nearest_index, run_bounds
 from src.common.config import apply_overrides  # noqa: F401
-from src.common.io import load_pickle, save_pickle  # noqa: F401
 from src.common.parallel import parallel_map
 from src.detector import build_inputs
 from src.kalman import filter_all
+from src.common.enums import Scenario
 from src.metrics import (
     aggregate,
+    SEPARATED,
     evaluate_config,
-    min_distance_to_group,
+    gain_loss_counts,
+    run_summarizer,
+    split_by_scenario,
     observer_correlation,
-    paired_counts,
-    summarize_none,
-    summarize_separated_ext,
     threshold_grid,
     working_point,
 )
 from src.relative import relative_trace
-from src.simulator import experiment_runs, load_or_simulate
+from src.simulator import load_or_simulate
 
-SEPARATED = ("slowdown", "stop")
 PER_RUN_FIELDS = (
     "success", "delay", "distance", "fortuitous", "n_wrong_off", "wrong_off_dist_sum", "wrong_off_dist_min",
     "repass", "repass_off", "alarm_on_end",
@@ -49,13 +47,13 @@ PER_RUN_FIELDS = (
 
 
 # ---------------------------------------------------------------------------
-# Varianti
+# Variants
 # ---------------------------------------------------------------------------
 
 
 def block4_config(config: dict) -> dict:
-    """Copia della config con i valori del Blocco 4 (`history.block4`): i default sono quelli del rilevatore finale (Blocco 6),
-    gli script dei Blocchi 4-5 li rimettono per rifare i numeri di allora."""
+    """Copy of the config with the Block 4 values (`history.block4`): the defaults are those of the final detector (Block 6),
+    the Block 4-5 scripts restore them to reproduce the numbers of that time."""
     return apply_overrides(config, config["history"]["block4"])
 
 
@@ -71,13 +69,13 @@ def make_variant(name: str, group: str, overrides: dict, scopes=("fused",), min_
 
 
 def mode_label(overrides: dict, config: dict) -> str:
-    """``level`` (assoluto) o ``drop`` (relativo): è il campo ``mode`` delle righe di `aggregate`."""
+    """``level`` (absolute) or ``drop`` (relative): it is the ``mode`` field of the `aggregate` rows."""
     ref = overrides.get("detector.reference", config["detector"]["reference"])
     return "drop" if ref == "relative" else "level"
 
 
 def phase1_variants(config: dict) -> list:
-    """Varianti A-D (una modifica alla volta, tutte rispetto alla base). La base è ``base`` (regola ``weighted_mean``, assoluto, 5 s, nessuna robustezza)."""
+    """Variants A-D (one change at a time, all relative to the base). The base is ``base`` (``weighted_mean`` rule, absolute, 5 s, no robustness)."""
     base = config["refinement"]["base"]
     sigma = {"kalman.sigma_a": base["sigma_a"]}
     mos = config["detector"]["min_observers_sweep"]
@@ -99,7 +97,7 @@ def phase1_variants(config: dict) -> list:
 
 
 # ---------------------------------------------------------------------------
-# Lavoro per corsa
+# Per-run work
 # ---------------------------------------------------------------------------
 
 
@@ -109,26 +107,17 @@ def _kalman_key(vcfg: dict) -> tuple:
 
 
 def process_run(args: tuple) -> dict:
-    """Valuta tutte le `variants` su una corsa; `args` = (corsa, config, cartella di cache, varianti, ``R``).
+    """Evaluates all the `variants` on a run; `args` = (run, config, cache directory, variants, ``R``).
 
-    Restituisce ``scenario``, ``index``, ``results`` (``(nome, ambito)`` → `evaluate_config`), ``elapsed`` (s per variante) e, per
-    le corse ``none``, ``nis`` (chiave del Kalman → NIS finite, float32).
+    Returns ``scenario``, ``index``, ``results`` (``(name, scope)`` → `evaluate_config`), ``elapsed`` (s per variant) and, for
+    the ``none`` runs, ``nis`` (Kalman key → finite NIS, float32).
     """
     run_info, config, cache_dir, variants, R = args
     run = load_or_simulate(run_info["config"], cache_dir)
-    t = run["t"]
-    is_none = run_info["scenario"] == "none"
+    is_none = run_info["scenario"] == Scenario.NONE
     out = {"scenario": run_info["scenario"], "index": run_info["index"], "results": {}, "elapsed": {}, "nis": {}}
     warmup = config["detector"]["warmup"]
-    if not is_none:
-        node = run["sep_node"]
-        idx_start = int(np.searchsorted(t, run["sep_start"]))
-        distance = min_distance_to_group(run["distances"], node)
-        success_distance = config["metrics"]["success_distance"]
-        repass = config["refinement"]["repass_distance"]
-        summarize = lambda s: summarize_separated_ext(s, t, idx_start, distance, success_distance, repass)  # noqa: E731
-    else:
-        summarize = lambda s: summarize_none(s, t, warmup)  # noqa: E731
+    summarize, node = run_summarizer(run, config, is_none, extended=True)
     kcache = {}
     for v in variants:
         t0 = time.perf_counter()
@@ -151,27 +140,26 @@ def process_run(args: tuple) -> dict:
 
 
 def run_phase(config: dict, runs: list, cache_dir: Path, variants: list, R: float, jobs: int) -> list:
-    """`process_run` su tutte le corse (in parallelo se ``jobs > 1``; il risultato non dipende da `jobs`)."""
+    """`process_run` on all the runs (in parallel if ``jobs > 1``; the result does not depend on `jobs`)."""
     tasks = [(r, config, cache_dir, variants, R) for r in runs]
     return parallel_map(process_run, tasks, jobs)
 
 
 # ---------------------------------------------------------------------------
-# Aggregazione e punto di lavoro
+# Aggregation and working point
 # ---------------------------------------------------------------------------
 
 
 def summarize_variant(outs: list, variant: dict, scope: str, mo: int, config: dict) -> dict:
-    """Sweep e punto di lavoro di una variante (`aggregate` + `working_point`), con i dati per corsa al punto di lavoro.
+    """Sweep and working point of a variant (`aggregate` + `working_point`), with the per-run data at the working point.
 
-    Restituisce ``rows`` (tutte le soglie), ``wp`` (None se nessun punto è ammissibile), ``point`` (scenario → riga), ``per_run``
-    (scenario → campo → array sulle corse), ``corr`` (correlazione fra osservatori al punto di lavoro), ``elapsed`` (s totali).
+    Returns ``rows`` (all thresholds), ``wp`` (None if no point is feasible), ``point`` (scenario → row), ``per_run``
+    (scenario → field → array over runs), ``corr`` (correlation between observers at the working point), ``elapsed`` (total s).
     """
     name = variant["name"]
     mode = mode_label(variant["overrides"], config)
     key = (scope, mode, "both")
-    none = sorted((o for o in outs if o["scenario"] == "none"), key=lambda o: o["index"])
-    sep = {s: sorted((o for o in outs if o["scenario"] == s), key=lambda o: o["index"]) for s in SEPARATED}
+    none, sep = split_by_scenario(outs)
     pick = lambda o: {key: o["results"][(name, scope)][mo]}  # noqa: E731
     rows = aggregate([pick(o) for o in none], {s: [pick(o) for o in v] for s, v in sep.items()}, config)
     wp = working_point(rows, scope, mode, "both")
@@ -182,7 +170,7 @@ def summarize_variant(outs: list, variant: dict, scope: str, mo: int, config: di
     if wp is None:
         return out
     grid = rows and sorted({r["threshold"] for r in rows})
-    n = int(np.argmin(np.abs(np.asarray(grid) - wp["threshold"])))
+    n = nearest_index(grid, wp["threshold"])
     for scenario, runs in sep.items():
         out["point"][scenario] = next(r for r in rows if r["scenario"] == scenario and r["threshold"] == wp["threshold"])
         out["per_run"][scenario] = {
@@ -199,21 +187,19 @@ def summarize_variant(outs: list, variant: dict, scope: str, mo: int, config: di
 
 
 def gain_loss(variant: dict, base: dict) -> dict:
-    """Corse guadagnate e perse rispetto a `base`, per scenario e totale; None se uno dei due non ha punto di lavoro."""
+    """Runs gained and lost with respect to `base`, per scenario and in total; empty if either has no working point."""
     if variant["wp"] is None or base["wp"] is None:
         return {}
-    out = {s: paired_counts(variant["per_run"][s]["success"], base["per_run"][s]["success"]) for s in SEPARATED}
-    out["total"] = tuple(sum(out[s][k] for s in SEPARATED) for k in (0, 1))
-    return out
+    return gain_loss_counts({s: variant["per_run"][s]["success"] for s in SEPARATED}, {s: base["per_run"][s]["success"] for s in SEPARATED})
 
 
 def wrong_off_runs(summary: dict) -> int:
-    """Corse (slowdown + stop) con almeno uno spegnimento a torto."""
+    """Runs (slowdown + stop) with at least one wrong turn-off."""
     return int(sum((summary["per_run"][s]["n_wrong_off"] > 0).sum() for s in SEPARATED))
 
 
 def is_better(cand: dict, best: dict, min_net: int) -> bool:
-    """`cand` batte `best`? P_d a coppie: ≥ `min_net` corse nette; se equivalente, ≥ `min_net` corse con spegnimenti a torto in meno."""
+    """Does `cand` beat `best`? Paired P_d: ≥ `min_net` net runs; if equivalent, ≥ `min_net` fewer runs with wrong turn-offs."""
     if cand["wp"] is None:
         return False
     if best["wp"] is None:
@@ -227,7 +213,7 @@ def is_better(cand: dict, best: dict, min_net: int) -> bool:
 
 
 def choose(candidates: list, base: dict, min_net: int) -> dict:
-    """Scorre i candidati in ordine di semplicità: ognuno deve battere il migliore corrente (partendo da `base`) oltre il rumore."""
+    """Scans the candidates in order of simplicity: each must beat the current best (starting from `base`) beyond the noise."""
     best = base
     for cand in candidates:
         if is_better(cand, best, min_net):
@@ -236,17 +222,17 @@ def choose(candidates: list, base: dict, min_net: int) -> dict:
 
 
 # ---------------------------------------------------------------------------
-# Combinazione (F)
+# Combination (F)
 # ---------------------------------------------------------------------------
 
 
 def components(winners: dict) -> dict:
-    """Componenti vincenti: nome → sostituzioni di config (e `min_observers` in ``"_mo"``). Solo quelle diverse dalla base."""
+    """Winning components: name → config overrides (and `min_observers` in ``"_mo"``). Only those different from the base."""
     return {k: v for k, v in winners.items() if v is not None}
 
 
 def combination_variant(name: str, parts: dict, config: dict, scopes, corr=False) -> dict:
-    """Variante che unisce i componenti `parts` (A, B, C, D). La robustezza D usa le sostituzioni del suo ambito (assoluto/relativo)."""
+    """Variant that merges the components `parts` (A, B, C, D). Robustness D uses the overrides of its scope (absolute/relative)."""
     overrides = {"kalman.sigma_a": config["refinement"]["base"]["sigma_a"]}
     mo = 1
     relative = "B" in parts
@@ -262,25 +248,24 @@ def combination_variant(name: str, parts: dict, config: dict, scopes, corr=False
 
 
 # ---------------------------------------------------------------------------
-# Diagnostica della linea di base (corse none)
+# Baseline diagnostics (none runs)
 # ---------------------------------------------------------------------------
+
+EDGE_TOLERANCE = 1e-9
 
 
 def _max_run(flag: np.ndarray, dt: float) -> float:
-    """Durata massima (s) di una sequenza consecutiva di True."""
-    best = cur = 0
-    for x in flag:
-        cur = cur + 1 if x else 0
-        best = max(best, cur)
-    return best * dt
+    """Maximum duration (s) of a consecutive sequence of True."""
+    starts, stops = run_bounds(flag)
+    return int((stops - starts).max(initial=0)) * dt
 
 
 def baseline_diagnostics(args: tuple) -> dict:
-    """Diagnostica del livello relativo su una corsa ``none`` a una soglia: istogramma del calo fuso, congelamenti.
+    """Relative-level diagnostics on a ``none`` run at one threshold: fused-drop histogram, freezes.
 
-    `args` = (corsa, config, cartella di cache, variante, soglia, ``R``, ambito). Per ogni coppia (osservatore, bersaglio) dopo il warmup:
-    ``hist`` (calo fuso), ``frozen_time``/``time`` (istanti con almeno una base congelata / totali), ``max_freeze`` (s, il congelamento
-    più lungo di un singolo link), ``state_time`` (istanti in pre-allarme).
+    `args` = (run, config, cache directory, variant, threshold, ``R``, scope). For each (observer, target) pair after the warmup:
+    ``hist`` (fused drop), ``frozen_time``/``time`` (instants with at least one frozen base / total), ``max_freeze`` (s, the longest
+    freeze of a single link), ``state_time`` (instants in pre-alarm).
     """
     run_info, config, cache_dir, variant, threshold, R, scope = args
     run = load_or_simulate(run_info["config"], cache_dir)
@@ -301,7 +286,7 @@ def baseline_diagnostics(args: tuple) -> dict:
             tr = relative_trace(inputs, vcfg, scope, threshold, m, i)
             drop = tr["drop"][first:]
             finite = drop[np.isfinite(drop)]
-            hist += np.histogram(np.clip(finite, edges[0], edges[-1] - 1e-9), bins=edges)[0]
+            hist += np.histogram(np.clip(finite, edges[0], edges[-1] - EDGE_TOLERANCE), bins=edges)[0]
             out["over_hi"] += int((finite >= edges[-1]).sum())
             frozen = tr["frozen"][first:]
             any_frozen = frozen.any(axis=1)
@@ -315,7 +300,7 @@ def baseline_diagnostics(args: tuple) -> dict:
 
 
 # ---------------------------------------------------------------------------
-# Salvataggio
+# Saving
 # ---------------------------------------------------------------------------
 
 
@@ -323,7 +308,7 @@ def best_threshold_index(summary: dict) -> int | None:
     if summary["wp"] is None:
         return None
     grid = sorted({r["threshold"] for r in summary["rows"]})
-    return int(np.argmin(np.abs(np.asarray(grid) - summary["wp"]["threshold"])))
+    return nearest_index(grid, summary["wp"]["threshold"])
 
 
 def threshold_axis(config: dict, mode: str) -> np.ndarray:

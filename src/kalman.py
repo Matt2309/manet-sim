@@ -1,25 +1,25 @@
-"""Blocco 4 — Kalman per link.
+"""Block 4 — Per-link Kalman.
 
-Il nodo `j` tiene un filtro per ogni vicino `i`, sul link `i → j`, aggiornato solo
-quando riceve un beacon di `i`. Indici ``[i, ..., j]`` = trasmette `i`, riceve `j`.
+Node `j` keeps one filter for each neighbour `i`, on the link `i → j`, updated only
+when it receives a beacon from `i`. Indices ``[i, ..., j]`` = `i` transmits, `j` receives.
 
-- stato ``x = [r, s]``: RSSI (dBm) e pendenza (dB/s); misura ``z`` = RSSI del beacon, ``H = [1, 0]``;
-- ``F = [[1, Δt], [0, 1]]`` con `Δt` EFFETTIVO dall'ultimo aggiornamento (irregolare per jitter e beacon persi);
-- accelerazione casuale continua (pendenza = moto browniano di intensità ``σ_a²``)::
+- state ``x = [r, s]``: RSSI (dBm) and slope (dB/s); measurement ``z`` = beacon RSSI, ``H = [1, 0]``;
+- ``F = [[1, Δt], [0, 1]]`` with `Δt` ACTUAL since the last update (irregular due to jitter and lost beacons);
+- continuous random acceleration (slope = Brownian motion of intensity ``σ_a²``)::
 
       Q = σ_a² · [[Δt³/3, Δt²/2],
                   [Δt²/2, Δt   ]]
 
-  scelta perché ADDITIVA nel tempo (la covarianza predetta non dipende da come
-  si spezza l'intervallo), utile con i buchi irregolari dei beacon persi;
-- rumore di misura `R`: solo fading del Blocco 2 più quantizzazione; torso,
-  altri corridori e shadowing sono lenti e li assorbe `Q`.
+  chosen because it is ADDITIVE in time (the predicted covariance does not depend on how
+  the interval is split), useful with the irregular gaps of lost beacons;
+- measurement noise `R`: only Block 2 fading plus quantization; torso,
+  other runners and shadowing are slow and are absorbed by `Q`.
 
-Robustezza ai salti da corpo (Blocco 5, ``kalman.robust``): ``none`` (base), ``inflate`` (R
-moltiplicato per ``r_inflation``) e ``nis_gate`` (se la NIS supera ``nis_gate`` l'aggiornamento
-usa ``R·NIS/nis_gate``: l'innovazione pesa meno ma non è scartata).
+Robustness to body jumps (Block 5, ``kalman.robust``): ``none`` (base), ``inflate`` (R
+multiplied by ``r_inflation``) and ``nis_gate`` (if the NIS exceeds ``nis_gate`` the update
+uses ``R·NIS/nis_gate``: the innovation weighs less but is not discarded).
 
-Parametri: sezione ``kalman`` della config.
+Parameters: ``kalman`` section of the config.
 """
 
 from __future__ import annotations
@@ -29,36 +29,38 @@ from dataclasses import dataclass
 
 import numpy as np
 
-ROBUST_OPTIONS = ("none", "inflate", "nis_gate")
+from src.common.enums import RobustMode
+
+ROBUST_OPTIONS = tuple(m.value for m in RobustMode)
 
 
 # ---------------------------------------------------------------------------
-# Strutture dati
+# Data structures
 # ---------------------------------------------------------------------------
 
 
 @dataclass
 class KalmanResult:
-    """Stime a posteriori allineate ai beacon: ``[i, k, j]`` = link `i → j` dopo l'aggiornamento dal beacon `k` di `i`; NaN se `j` non l'ha ricevuto."""
+    """Posterior estimates aligned to the beacons: ``[i, k, j]`` = link `i → j` after the update from beacon `k` of `i`; NaN if `j` did not receive it."""
 
-    times: np.ndarray  # (N, K) istanti dei beacon (NaN oltre la fine)
+    times: np.ndarray  # (N, K) beacon times (NaN past the end)
     received: np.ndarray  # (N, K, N) bool
     r: np.ndarray  # (N, K, N) dBm
     s: np.ndarray  # (N, K, N) dB/s
-    P: np.ndarray  # (N, K, N, 2, 2) covarianza a posteriori
-    nis: np.ndarray  # (N, K, N) innovazione normalizzata (NaN all'inizializzazione)
-    reinit: np.ndarray  # (N, K, N) bool: il filtro è (ri)partito da questo beacon
+    P: np.ndarray  # (N, K, N, 2, 2) posterior covariance
+    nis: np.ndarray  # (N, K, N) normalized innovation (NaN at initialization)
+    reinit: np.ndarray  # (N, K, N) bool: the filter (re)started from this beacon
     sigma_a: float
     measurement_noise: float
 
 
 # ---------------------------------------------------------------------------
-# Modello
+# Model
 # ---------------------------------------------------------------------------
 
 
 def transition(dt: np.ndarray) -> np.ndarray:
-    """``F = [[1, Δt], [0, 1]]`` con `dt` in s (scalare o array): forma ``dt.shape + (2, 2)``."""
+    """``F = [[1, Δt], [0, 1]]`` with `dt` in s (scalar or array): shape ``dt.shape + (2, 2)``."""
     dt = np.asarray(dt, dtype=float)
     f = np.zeros(dt.shape + (2, 2))
     f[..., 0, 0] = 1.0
@@ -68,7 +70,7 @@ def transition(dt: np.ndarray) -> np.ndarray:
 
 
 def process_noise(dt: np.ndarray, sigma_a: float) -> np.ndarray:
-    """``Q = σ_a² [[Δt³/3, Δt²/2], [Δt²/2, Δt]]`` (`sigma_a` in dB/s²), forma ``dt.shape + (2, 2)``. Additiva: ``Φ(b)Q(a)Φ(b)^T + Q(b) = Q(a+b)``."""
+    """``Q = σ_a² [[Δt³/3, Δt²/2], [Δt²/2, Δt]]`` (`sigma_a` in dB/s²), shape ``dt.shape + (2, 2)``. Additive: ``Φ(b)Q(a)Φ(b)^T + Q(b) = Q(a+b)``."""
     dt = np.asarray(dt, dtype=float)
     q = np.zeros(dt.shape + (2, 2))
     q[..., 0, 0] = dt**3 / 3.0
@@ -79,7 +81,7 @@ def process_noise(dt: np.ndarray, sigma_a: float) -> np.ndarray:
 
 
 def predict(x: np.ndarray, P: np.ndarray, dt: np.ndarray, sigma_a: float) -> tuple:
-    """``x⁻ = F x``, ``P⁻ = F P Fᵀ + Q`` su `dt` s; forme 2×2 esplicite, vettorizzate, stesse forme degli ingressi."""
+    """``x⁻ = F x``, ``P⁻ = F P Fᵀ + Q`` over `dt` s; explicit 2×2 forms, vectorized, same shapes as the inputs."""
     x = np.asarray(x, dtype=float)
     P = np.asarray(P, dtype=float)
     dt = np.asarray(dt, dtype=float)
@@ -94,18 +96,18 @@ def predict(x: np.ndarray, P: np.ndarray, dt: np.ndarray, sigma_a: float) -> tup
 
 
 def measurement_noise(config: dict, fading_variance: float) -> float:
-    """Rumore di misura `R` in dB²: con ``auto``, ``var(fading) + quantization_step²/12`` (`fading_variance` del Blocco 2 nel gruppo senza separazione); altrimenti il valore in config."""
+    """Measurement noise `R` in dB²: with ``auto``, ``var(fading) + quantization_step²/12`` (`fading_variance` from Block 2 in the no-separation group); otherwise the config value."""
     value = config["kalman"]["measurement_noise"]
     if isinstance(value, str):
         if value != "auto":
-            raise ValueError(f"kalman.measurement_noise deve essere 'auto' o un numero, non {value!r}")
+            raise ValueError(f"kalman.measurement_noise must be 'auto' or a number, not {value!r}")
         step = config["channel"]["measurement"]["quantization_step"]
         return float(fading_variance + step**2 / 12.0)
     return float(value)
 
 
 # ---------------------------------------------------------------------------
-# Filtro di un link
+# Single-link filter
 # ---------------------------------------------------------------------------
 
 
@@ -118,10 +120,10 @@ def filter_link(
     reinit_gap: float,
     nis_gate: float = math.inf,
 ) -> tuple:
-    """Kalman di un link su `times` (n,) crescenti e RSSI `z` (n,) dei beacon ricevuti. Al primo beacon o dopo `reinit_gap` s riparte
-    (``r = z``, ``s = 0``, ``P = diag(R, initial_slope_std²)``, senza innovazione); altrimenti predice con `Δt` effettivo e aggiorna (P in forma di Joseph).
-    NIS = ``(z - r⁻)² / S`` con ``S = P⁻₀₀ + R``. Con `nis_gate` finito, se la NIS lo supera l'aggiornamento (guadagno e Joseph) usa ``R·NIS/nis_gate``
-    al posto di `R`; la NIS riportata resta quella con `R`. Ritorna (r, s, P (n, 2, 2), nis, reinit); i beacon persi non producono nulla (vedi `predict_links`).
+    """Kalman filter of one link on increasing `times` (n,) and received-beacon RSSI `z` (n,). At the first beacon or after `reinit_gap` s it restarts
+    (``r = z``, ``s = 0``, ``P = diag(R, initial_slope_std²)``, no innovation); otherwise it predicts with the actual `Δt` and updates (P in Joseph form).
+    NIS = ``(z - r⁻)² / S`` with ``S = P⁻₀₀ + R``. With a finite `nis_gate`, if the NIS exceeds it the update (gain and Joseph) uses ``R·NIS/nis_gate``
+    in place of `R`; the reported NIS remains the one computed with `R`. Returns (r, s, P (n, 2, 2), nis, reinit); lost beacons produce nothing (see `predict_links`).
     """
     n = len(times)
     r_out = np.empty(n)
@@ -183,16 +185,16 @@ def filter_all(
     sigma_a: float,
     kalman_cfg: dict,
 ) -> KalmanResult:
-    """Applica `filter_link` a ogni coppia `(i, j)` sui beacon di `i` ricevuti da `j`; `times` (N, K), `received` e `rssi` (N, K, N) come in `PacketResult`.
+    """Applies `filter_link` to every pair `(i, j)` on the beacons of `i` received by `j`; `times` (N, K), `received` and `rssi` (N, K, N) as in `PacketResult`.
 
-    `kalman_cfg["robust"]`: ``none`` (base), ``inflate`` (il filtro usa ``R·r_inflation``, anche all'avvio) o ``nis_gate`` (vedi `filter_link`).
-    Il risultato conserva `R` nominale; la NIS è quella del filtro (con ``R·r_inflation`` in ``inflate``).
+    `kalman_cfg["robust"]`: ``none`` (base), ``inflate`` (the filter uses ``R·r_inflation``, also at startup) or ``nis_gate`` (see `filter_link`).
+    The result keeps the nominal `R`; the NIS is the filter's (with ``R·r_inflation`` in ``inflate``).
     """
     robust = kalman_cfg["robust"]
     if robust not in ROBUST_OPTIONS:
-        raise ValueError(f"kalman.robust deve essere uno fra {ROBUST_OPTIONS}, non {robust!r}")
-    R_filter = R * kalman_cfg["r_inflation"] if robust == "inflate" else R
-    gate = float(kalman_cfg["nis_gate"]) if robust == "nis_gate" else math.inf
+        raise ValueError(f"kalman.robust must be one of {ROBUST_OPTIONS}, not {robust!r}")
+    R_filter = R * kalman_cfg["r_inflation"] if robust == RobustMode.INFLATE else R
+    gate = float(kalman_cfg["nis_gate"]) if robust == RobustMode.NIS_GATE else math.inf
     n_nodes, n_beacons = times.shape
     r = np.full((n_nodes, n_beacons, n_nodes), np.nan)
     s = np.full_like(r, np.nan)
@@ -220,13 +222,13 @@ def filter_all(
 
 
 # ---------------------------------------------------------------------------
-# Stima sulla griglia
+# Estimate on the grid
 # ---------------------------------------------------------------------------
 
 
 def predict_links(kres: KalmanResult, t: np.ndarray) -> dict:
-    """Stima di ogni link predetta a ogni istante `t` (T,): ultimo aggiornamento ``<= t`` più `predict` per la sua età.
-    Dizionario ``r, s, p00, p01, p11, age``, ognuno (T, N, N) ``[t, i, j]``; NaN prima del primo aggiornamento e in diagonale.
+    """Estimate of each link predicted at every time `t` (T,): last update ``<= t`` plus `predict` over its age.
+    Dictionary ``r, s, p00, p01, p11, age``, each (T, N, N) ``[t, i, j]``; NaN before the first update and on the diagonal.
     """
     n_nodes = kres.times.shape[0]
     shape = (len(t), n_nodes, n_nodes)
@@ -254,7 +256,7 @@ def predict_links(kres: KalmanResult, t: np.ndarray) -> dict:
 
 
 def mean_nis(kres: KalmanResult, mask: np.ndarray | None = None) -> float:
-    """NIS media dei valori finiti (1 se il filtro è consistente), con maschera (N, K, N) opzionale."""
+    """Mean NIS of the finite values (1 if the filter is consistent), with optional (N, K, N) mask."""
     values = kres.nis if mask is None else np.where(mask, kres.nis, np.nan)
     return float(np.nanmean(values))
 

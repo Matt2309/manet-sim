@@ -1,29 +1,31 @@
-"""Blocco 5 (A) — Regole di fusione delle voci di un bersaglio.
+"""Block 5 (A) — Fusion rules for the entries of a target.
 
-Le voci sono i link ``i → k`` (indice `k` sull'ultimo asse) che l'osservatore `m` conosce del
-bersaglio `i`. Ogni voce ha un INDICE DI SEGNALE (più alto = più vicino) e una pendenza. Con il
-livello assoluto l'indice è `L` (dBm); con il livello relativo è ``−calo``. Così ogni regola ha lo
-stesso significato nei due casi.
+The entries are the links ``i → k`` (index `k` on the last axis) that observer `m` knows about
+target `i`. Each entry has a SIGNAL INDEX (higher = closer) and a slope. With the
+absolute level the index is `L` (dBm); with the relative level it is ``−drop``. This way every rule has the
+same meaning in both cases.
 
-Regole (``fusion.rule``):
+Rules (``fusion.rule``):
 
-- ``weighted_mean``: media pesata con pesi ``1/varianza`` (il Blocco 4);
-- ``median``: mediana delle voci valide; con un numero pari di voci (4) è la media delle due centrali;
-- ``max``: miglior osservatore, cioè la voce con il segnale più forte ("se almeno uno lo sente bene,
-  è con il gruppo"). Il collegamento più forte è di solito quello col compagno più vicino: quindi
-  ``max`` approssima la DISTANZA DAL COMPAGNO PIÙ VICINO, che è proprio la grandezza del criterio
-  dei 30 m. Il massimo di valori rumorosi è distorto verso l'alto (più voci, più distorsione), ma
-  lo sweep della soglia lo compensa.
+- ``weighted_mean``: weighted mean with ``1/variance`` weights (Block 4);
+- ``median``: median of the valid entries; with an even number of entries (4) it is the mean of the two middle ones;
+- ``max``: best observer, i.e. the entry with the strongest signal ("if at least one hears it well,
+  it is with the group"). The strongest link is usually the one with the closest companion: so
+  ``max`` approximates the DISTANCE FROM THE CLOSEST COMPANION, which is exactly the quantity of the
+  30 m criterion. The maximum of noisy values is biased upwards (more entries, more bias), but
+  the threshold sweep compensates for it.
 
-Per ``median`` e ``max`` la pendenza e la varianza sono quelle della voce scelta (``median``: media
-delle due centrali, o la voce centrale se dispari).
+For ``median`` and ``max`` the slope and variance are those of the chosen entry (``median``: mean
+of the two middle ones, or the middle entry if odd).
 """
 
 from __future__ import annotations
 
 import numpy as np
 
-RULES = ("weighted_mean", "median", "max")
+from src.common.enums import FusionRule
+
+RULES = tuple(r.value for r in FusionRule)
 
 
 def combine(
@@ -34,24 +36,24 @@ def combine(
     rule: str = "weighted_mean",
     min_variance: float = 0.0,
 ) -> tuple:
-    """Fonde le voci valide sull'ULTIMO asse con la regola `rule`.
+    """Fuses the valid entries on the LAST axis with rule `rule`.
 
-    Input: `index`, `slope`, `variance` (stessa forma, voci sull'ultimo asse; i valori delle voci
-    non valide sono ignorati), `valid` (bool, stessa forma), `min_variance` (dB², solo per i pesi
-    di ``weighted_mean``).
+    Input: `index`, `slope`, `variance` (same shape, entries on the last axis; the values of the
+    invalid entries are ignored), `valid` (bool, same shape), `min_variance` (dB², only for the
+    ``weighted_mean`` weights).
 
-    Procedimento: ``weighted_mean``: ``w = 1/max(var, min_variance)``, ``L = Σ w r / Σ w``,
-    ``S = Σ w s / Σ w``, varianza ``1/Σ w``. ``median`` e ``max``: vedi la docstring del modulo.
+    Procedure: ``weighted_mean``: ``w = 1/max(var, min_variance)``, ``L = Σ w r / Σ w``,
+    ``S = Σ w s / Σ w``, variance ``1/Σ w``. ``median`` and ``max``: see the module docstring.
 
-    Output: (indice fuso, pendenza fusa, varianza, numero di voci valide) con l'ultimo asse
-    eliminato; NaN (e 0 voci) dove nessuna voce è valida.
+    Output: (fused index, fused slope, variance, number of valid entries) with the last axis
+    removed; NaN (and 0 entries) where no entry is valid.
     """
     index = np.asarray(index, dtype=float)
     slope = np.asarray(slope, dtype=float)
     variance = np.asarray(variance, dtype=float)
     valid = np.asarray(valid, dtype=bool)
     count = valid.sum(axis=-1)
-    if rule == "weighted_mean":
+    if rule == FusionRule.WEIGHTED_MEAN:
         floor = max(min_variance, np.finfo(float).tiny)
         weight = np.where(valid, 1.0 / np.maximum(np.where(valid, variance, 1.0), floor), 0.0)
         total = weight.sum(axis=-1)
@@ -62,11 +64,11 @@ def combine(
         fused_var = np.where(has, 1.0 / safe, np.nan)
         return level, fused_slope, fused_var, count
     has = count > 0
-    if rule == "max":
+    if rule == FusionRule.MAX:
         pos = np.argmax(np.where(valid, index, -np.inf), axis=-1)[..., None]
         pick = lambda a: np.take_along_axis(a, pos, axis=-1)[..., 0]
         out = (pick(index), pick(slope), pick(variance))
-    elif rule == "median":
+    elif rule == FusionRule.MEDIAN:
         order = np.argsort(np.where(valid, index, np.inf), axis=-1, kind="stable")
         lo = np.maximum((count - 1) // 2, 0)[..., None]
         hi = (count // 2)[..., None]
@@ -76,5 +78,5 @@ def combine(
         pick = lambda a: 0.5 * (np.take_along_axis(a, pos_lo, axis=-1)[..., 0] + np.take_along_axis(a, pos_hi, axis=-1)[..., 0])
         out = (pick(index), pick(slope), pick(variance))
     else:
-        raise ValueError(f"fusion.rule deve essere uno fra {RULES}, non {rule!r}")
+        raise ValueError(f"fusion.rule must be one of {RULES}, not {rule!r}")
     return tuple(np.where(has, o, np.nan) for o in out) + (count,)

@@ -6,7 +6,7 @@ import yaml
 
 
 def load_config(config: Union[str, Path, dict]) -> dict:
-    """Carica la config da YAML o dizionario (copia profonda); `track.gpx_file` è risolto rispetto alla cartella del YAML."""
+    """Load the config from YAML or a dict (deep copy); `track.gpx_file` is resolved relative to the YAML folder."""
     if isinstance(config, (str, Path)):
         config_path = Path(config).resolve()
         with open(config_path, "r") as f:
@@ -19,8 +19,14 @@ def load_config(config: Union[str, Path, dict]) -> dict:
     return copy.deepcopy(config)
 
 
+def separation_variants(config: dict) -> tuple:
+    cfg_nosep = apply_overrides(config, {"separation.enabled": False})
+    cfg_sep = apply_overrides(config, {"separation.enabled": True})
+    return cfg_nosep, cfg_sep
+
+
 def apply_overrides(config: dict, overrides: dict) -> dict:
-    """Copia della config con le sostituzioni ``{"sezione.chiave": valore}`` (chiavi puntate)."""
+    """Copy of the config with the ``{"section.key": value}`` replacements (dotted keys)."""
     cfg = copy.deepcopy(config)
     for dotted, value in overrides.items():
         node = cfg
@@ -28,6 +34,6 @@ def apply_overrides(config: dict, overrides: dict) -> dict:
         for key in path:
             node = node[key]
         if last not in node:
-            raise KeyError(f"chiave di config sconosciuta: {dotted}")
+            raise KeyError(f"unknown config key: {dotted}")
         node[last] = value
     return cfg

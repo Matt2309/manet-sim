@@ -1,22 +1,22 @@
-"""Blocco 3 — Pacchetti e beacon.
+"""Block 3 — Packets and beacons.
 
-Trasforma l'RSSI "perfetto" del Blocco 2 nel registro reale di ogni scheda: solo i
-beacon ricevuti, con il loro RSSI. Indici ``[i, ..., j]`` = trasmette ``i``, riceve ``j``.
+Turns the "perfect" RSSI of Block 2 into the real log of each board: only the
+received beacons, with their RSSI. Indices ``[i, ..., j]`` = ``i`` transmits, ``j`` receives.
 
-1. Beacon broadcast ESP-NOW (1 Mbit/s, senza conferma) ogni ``beacon_period`` s,
-   fase iniziale uniforme e jitter uniforme su ogni intervallo.
-2. Collisioni NON modellate: CSMA/CA, beacon da ~1 ms, occupazione del canale
-   ``n_nodi * 1 ms / beacon_period`` (~1 % con 5 nodi, periodo 0,5 s), trascurabile
-   rispetto alla perdita di fondo.
-3. Arriva se superano due prove indipendenti: segnale (logistica in dB sull'RSSI
-   vero, vedi `logistic_parameters`) e perdita di fondo (Wi-Fi circostante).
-4. Se arriva la scheda legge `rssi_measured` del Blocco 2, altrimenti NaN.
-5. Ogni beacon porta la tabella dei vicini del trasmettitore (ultimo RSSI e età). Un solo salto.
-6. Conoscenza di ogni osservatore `m` sulla griglia del simulatore.
+1. ESP-NOW broadcast beacons (1 Mbit/s, no acknowledgment) every ``beacon_period`` s,
+   uniform initial phase and uniform jitter on each interval.
+2. Collisions NOT modeled: CSMA/CA, ~1 ms beacons, channel occupancy
+   ``n_nodes * 1 ms / beacon_period`` (~1 % with 5 nodes, period 0.5 s), negligible
+   compared to the background loss.
+3. A beacon arrives if it passes two independent trials: signal (logistic in dB on the true
+   RSSI, see `logistic_parameters`) and background loss (surrounding Wi-Fi).
+4. If it arrives the board reads `rssi_measured` of Block 2, otherwise NaN.
+5. Each beacon carries the transmitter's neighbour table (last RSSI and age). One hop only.
+6. Knowledge of each observer `m` on the simulator grid.
 
-Parametri: sezione ``packets`` della config.
+Parameters: ``packets`` section of the config.
 
-Blocco 6: perdite di fondo a raffiche (modello di Gilbert-Elliott per ricevitore o per link), opzione ``background_model``.
+Block 6: bursty background losses (Gilbert-Elliott model per receiver or per link), option ``background_model``.
 """
 
 from __future__ import annotations
@@ -30,6 +30,8 @@ from typing import Union
 import numpy as np
 from scipy.special import expit
 
+from src.common.arrays import run_bounds
+from src.common.enums import BackgroundModel, BurstScope, ReceptionModel
 from src.common.rng import spawn_rng
 from src.channel import ChannelResult
 from src.mobility import MobilityResult, load_config
@@ -40,37 +42,37 @@ SEED_KEY_BURST = 10
 
 
 # ---------------------------------------------------------------------------
-# Strutture dati
+# Data structures
 # ---------------------------------------------------------------------------
 
 
 @dataclass
 class PacketResult:
-    """Output del Blocco 3. ``(N, K, N)`` indicizzato ``[i, k, j]`` = beacon `k` di `i` visto da `j`;
-    ``(T, M, N, N)`` indicizzato ``[t, m, i, j]`` = cosa sa l'osservatore `m` del link `i → j`.
+    """Output of Block 3. ``(N, K, N)`` indexed ``[i, k, j]`` = beacon `k` of `i` seen by `j`;
+    ``(T, M, N, N)`` indexed ``[t, m, i, j]`` = what observer `m` knows about link `i → j`.
     """
 
-    beacon_times: np.ndarray  # (N, K) s; NaN dove un nodo ha meno beacon
-    beacon_steps: np.ndarray  # (N, K) int, indice sulla griglia; -1 come riempimento
-    p_success: np.ndarray  # (N, K, N) probabilità di ricezione (curva × fondo)
-    passed_signal: np.ndarray  # (N, K, N) bool, prova del segnale superata
-    passed_background: np.ndarray  # (N, K, N) bool, prova di fondo superata
-    background_state: np.ndarray | None  # Blocco 6: (T, N) o (T, N, N) bool, stato disturbato (None con ``independent``)
+    beacon_times: np.ndarray  # (N, K) s; NaN where a node has fewer beacons
+    beacon_steps: np.ndarray  # (N, K) int, grid index; -1 as padding
+    p_success: np.ndarray  # (N, K, N) reception probability (curve × background)
+    passed_signal: np.ndarray  # (N, K, N) bool, signal trial passed
+    passed_background: np.ndarray  # (N, K, N) bool, background trial passed
+    background_state: np.ndarray | None  # Block 6: (T, N) or (T, N, N) bool, disturbed state (None with ``independent``)
     received: np.ndarray  # (N, K, N) bool, diagonale False
-    rssi: np.ndarray  # (N, K, N) dBm misurato, NaN se perso
-    knowledge_rssi: np.ndarray  # (T, M, N, N) float32, cosa sa m del link i→j
-    knowledge_age: np.ndarray  # (T, M, N, N) float32 s, età di quell'informazione
+    rssi: np.ndarray  # (N, K, N) measured dBm, NaN if lost
+    knowledge_rssi: np.ndarray  # (T, M, N, N) float32, what m knows about link i→j
+    knowledge_age: np.ndarray  # (T, M, N, N) float32 s, age of that information
     metadata: dict = field(default_factory=dict)
 
 
 # ---------------------------------------------------------------------------
-# Curva di ricezione
+# Reception curve
 # ---------------------------------------------------------------------------
 
 
 def logistic_parameters(sensitivity: float, success: float, width: float) -> tuple:
-    """Centro `c` e pendenza `s` (dB) della logistica ``p(x) = 1 / (1 + exp(-(x - c) / s))``: `width` dB fra 10% e 90% (``s = width / (2 ln 9)``)
-    e ``p(S) = success`` alla sensibilità `S` (``c = S - s ln(success / (1 - success))``). Il centro (50%) sta sotto `S`: la sensibilità di datasheet è al livello con l'8% di perdita.
+    """Center `c` and slope `s` (dB) of the logistic ``p(x) = 1 / (1 + exp(-(x - c) / s))``: `width` dB between 10% and 90% (``s = width / (2 ln 9)``)
+    and ``p(S) = success`` at sensitivity `S` (``c = S - s ln(success / (1 - success))``). The center (50%) lies below `S`: the datasheet sensitivity is at the level with 8% loss.
     """
     scale = width / (2.0 * math.log(9.0))
     center = sensitivity - scale * math.log(success / (1.0 - success))
@@ -78,39 +80,39 @@ def logistic_parameters(sensitivity: float, success: float, width: float) -> tup
 
 
 def reception_probability(rssi: np.ndarray, reception_cfg: dict) -> np.ndarray:
-    """Probabilità di superare la prova del segnale dall'RSSI vero: logistica (``model: curve``) o soglia netta alla sensibilità (``threshold``)."""
+    """Probability of passing the signal trial from the true RSSI: logistic (``model: curve``) or hard threshold at the sensitivity (``threshold``)."""
     model = reception_cfg["model"]
     x = np.asarray(rssi, dtype=float)
-    if model == "curve":
+    if model == ReceptionModel.CURVE:
         center, scale = logistic_parameters(
             reception_cfg["sensitivity_dbm"],
             reception_cfg["sensitivity_success"],
             reception_cfg["transition_width"],
         )
         return expit((x - center) / scale)
-    if model == "threshold":
+    if model == ReceptionModel.THRESHOLD:
         return (x >= reception_cfg["sensitivity_dbm"]).astype(float)
-    raise ValueError(f"packets.reception.model deve essere 'curve' o 'threshold', non {model!r}")
+    raise ValueError(f"packets.reception.model must be 'curve' or 'threshold', not {model!r}")
 
 
 # ---------------------------------------------------------------------------
-# Perdite a raffiche (Blocco 6)
+# Bursty losses (Block 6)
 # ---------------------------------------------------------------------------
 
 
 def gilbert_elliott_states(n_steps: int, shape: tuple, dt: float, bursty_cfg: dict, rng: np.random.Generator) -> np.ndarray:
-    """Catene di Gilbert-Elliott a due stati (buono / disturbato) sulla griglia `dt`.
+    """Two-state (good / disturbed) Gilbert-Elliott chains on the `dt` grid.
 
-    Input: `n_steps` passi, `shape` = forma delle catene indipendenti (``(N,)`` per ricevitore, ``(N, N)`` per link), `bursty_cfg`
-    (``mean_loss`` L, ``mean_burst`` T_b), generatore `rng`.
-    Procedimento: durata media del periodo buono ``T_g = T_b (1 - L) / L``; per passo buono → disturbato con probabilità
-    ``1 - exp(-dt / T_g)``, disturbato → buono ``1 - exp(-dt / T_b)``. Stato iniziale dalla distribuzione stazionaria (disturbato con
-    probabilità L). Si estraggono sempre ``n_steps + 1`` uniformi per catena (la prima per lo stato iniziale).
-    Output: bool ``(n_steps, *shape)``, True = disturbato.
+    Input: `n_steps` steps, `shape` = shape of the independent chains (``(N,)`` per receiver, ``(N, N)`` per link), `bursty_cfg`
+    (``mean_loss`` L, ``mean_burst`` T_b), generator `rng`.
+    Procedure: mean duration of the good period ``T_g = T_b (1 - L) / L``; per step good → disturbed with probability
+    ``1 - exp(-dt / T_g)``, disturbed → good ``1 - exp(-dt / T_b)``. Initial state from the stationary distribution (disturbed with
+    probability L). Always ``n_steps + 1`` uniforms are drawn per chain (the first for the initial state).
+    Output: bool ``(n_steps, *shape)``, True = disturbed.
     """
     loss, burst = bursty_cfg["mean_loss"], bursty_cfg["mean_burst"]
     if not 0.0 < loss < 1.0 or burst <= 0.0:
-        raise ValueError("packets.reception.bursty: mean_loss in (0, 1) e mean_burst > 0")
+        raise ValueError("packets.reception.bursty: mean_loss in (0, 1) and mean_burst > 0")
     good = burst * (1.0 - loss) / loss
     p_go_bad = -math.expm1(-dt / good)
     p_go_good = -math.expm1(-dt / burst)
@@ -124,13 +126,11 @@ def gilbert_elliott_states(n_steps: int, shape: tuple, dt: float, bursty_cfg: di
 
 
 def burst_lengths(state: np.ndarray, dt: float) -> np.ndarray:
-    """Durate (s) delle raffiche complete di `state` (tempo sul primo asse): sequenze consecutive di True comprese fra due False."""
+    """Durations (s) of the complete bursts of `state` (time on the first axis): consecutive runs of True between two False."""
     flat = state.reshape(state.shape[0], -1)
     out = []
     for column in flat.T:
-        padded = np.concatenate([[False], column, [False]]).astype(np.int8)
-        edges = np.flatnonzero(np.diff(padded))
-        starts, stops = edges[0::2], edges[1::2]
+        starts, stops = run_bounds(column)
         for a, b in zip(starts, stops):
             if a > 0 and b < len(column):
                 out.append((b - a) * dt)
@@ -138,20 +138,20 @@ def burst_lengths(state: np.ndarray, dt: float) -> np.ndarray:
 
 
 # ---------------------------------------------------------------------------
-# Istanti dei beacon
+# Beacon instants
 # ---------------------------------------------------------------------------
 
 
 def beacon_schedule(
     n_nodes: int, t_end: float, dt: float, packets_cfg: dict, rng: np.random.Generator
 ) -> tuple:
-    """Istanti dei beacon: (times (N, K) in s, steps (N, K) int). Fase iniziale uniforme in ``[0, period)``, intervalli ``period + U[-jitter, +jitter]``;
-    oltre `t_end` NaN. `steps` = ``rint(t / dt)``, -1 dove NaN.
+    """Beacon instants: (times (N, K) in s, steps (N, K) int). Uniform initial phase in ``[0, period)``, intervals ``period + U[-jitter, +jitter]``;
+    beyond `t_end` NaN. `steps` = ``rint(t / dt)``, -1 where NaN.
     """
     period = packets_cfg["beacon_period"]
     jitter = packets_cfg["jitter"]
     if not 0.0 <= jitter < period:
-        raise ValueError("packets.jitter deve essere in [0, beacon_period)")
+        raise ValueError("packets.jitter must be in [0, beacon_period)")
     n_beacons = int(math.ceil(t_end / (period - jitter))) + 1
     phase = rng.uniform(0.0, period, size=n_nodes)
     intervals = period + rng.uniform(-jitter, jitter, size=(n_nodes, n_beacons - 1))
@@ -163,14 +163,14 @@ def beacon_schedule(
 
 
 # ---------------------------------------------------------------------------
-# Conoscenza dei nodi
+# Node knowledge
 # ---------------------------------------------------------------------------
 
 
-def _neighbour_tables(times: np.ndarray, received: np.ndarray, payload: dict) -> tuple:
-    """Tabella dei vicini portata da ogni beacon. ``payload[nome][i, k, j]`` = valore che il beacon `k` di `i` porta a `j`.
-    Per il beacon `k` di `j`, per ogni `i`: l'ultimo beacon di `i` ricevuto da `j` prima di ``times[j, k]``. Ritorna (tabelle, table_origin) indicizzati ``[j, k, i]``;
-    `table_origin` = istante d'origine (l'età si ricava per sottrazione: nessun orologio comune). NaN se `j` non ha ancora ricevuto nulla da `i`.
+def neighbour_tables(times: np.ndarray, received: np.ndarray, payload: dict) -> tuple:
+    """Neighbour table carried by each beacon. ``payload[name][i, k, j]`` = value that beacon `k` of `i` carries to `j`.
+    For beacon `k` of `j`, for each `i`: the last beacon of `i` received by `j` before ``times[j, k]``. Returns (tables, table_origin) indexed ``[j, k, i]``;
+    `table_origin` = origin instant (age is obtained by subtraction: no common clock). NaN if `j` has not yet received anything from `i`.
     """
     n_nodes, n_beacons = times.shape
     tables = {name: np.full((n_nodes, n_beacons, n_nodes), np.nan) for name in payload}
@@ -195,13 +195,13 @@ def _neighbour_tables(times: np.ndarray, received: np.ndarray, payload: dict) ->
 def forward_link_payload(
     t: np.ndarray, times: np.ndarray, received: np.ndarray, payload: dict
 ) -> tuple:
-    """Cosa sa ogni osservatore `m` del link `i → j`, per un carico qualsiasi (``payload[nome][i, k, j]``, valore portato dal beacon `k` di `i`).
-    Un beacon di istante `t_b` è noto a `t` se ``t_b <= t``. Per ``j == m``: ultimo beacon di `i` ricevuto da `m`; per ``j != m``: riga `i` della tabella dei vicini dell'ultimo beacon di `j` (un solo salto).
-    Ritorna (campi, age, relay_time): `campi` e `age` (s) sono (T, M, N, N) float32 ``[t, m, i, j]``; `relay_time` (float64) = istante del beacon di `j` che ha inoltrato (NaN se diretto o assente). NaN anche per ``i == j``.
+    """What each observer `m` knows about link `i → j`, for any payload (``payload[name][i, k, j]``, value carried by beacon `k` of `i`).
+    A beacon at instant `t_b` is known at `t` if ``t_b <= t``. For ``j == m``: last beacon of `i` received by `m`; for ``j != m``: row `i` of the neighbour table of the last beacon of `j` (one hop only).
+    Returns (fields, age, relay_time): `fields` and `age` (s) are (T, M, N, N) float32 ``[t, m, i, j]``; `relay_time` (float64) = instant of the beacon of `j` that relayed (NaN if direct or absent). NaN also for ``i == j``.
     """
     n_steps = len(t)
     n_nodes = times.shape[0]
-    tables, table_origin = _neighbour_tables(times, received, payload)
+    tables, table_origin = neighbour_tables(times, received, payload)
     out = {name: np.full((n_steps, n_nodes, n_nodes, n_nodes), np.nan, dtype=np.float32) for name in payload}
     k_age = np.full((n_steps, n_nodes, n_nodes, n_nodes), np.nan, dtype=np.float32)
     relay = np.full((n_steps, n_nodes, n_nodes, n_nodes), np.nan)
@@ -215,7 +215,7 @@ def forward_link_payload(
                 continue
             pos = np.searchsorted(times[j, got], t, side="right") - 1
             ok = pos >= 0
-            k = got[pos[ok]]  # beacon di j più recente noto a m, per ogni istante valido
+            k = got[pos[ok]]  # most recent beacon of j known to m, for each valid instant
             origin = table_origin[j, k, :]  # (n_ok, i)
             for name in payload:
                 out[name][ok, m, :, j] = tables[name][j, k, :]
@@ -241,25 +241,66 @@ def forward_link_payload(
 
 
 def _knowledge(t: np.ndarray, times: np.ndarray, received: np.ndarray, rssi: np.ndarray) -> tuple:
-    """Caso particolare di `forward_link_payload` con carico = RSSI riportato: ritorna (rssi, età), (T, M, N, N) float32 ``[t, m, i, j]``."""
+    """Special case of `forward_link_payload` with payload = reported RSSI: returns (rssi, age), (T, M, N, N) float32 ``[t, m, i, j]``."""
     fields, age, _ = forward_link_payload(t, times, received, {"rssi": rssi})
     return fields["rssi"], age
 
 
 # ---------------------------------------------------------------------------
-# Simulazione dei pacchetti
+# Packet simulation
 # ---------------------------------------------------------------------------
+
+
+def _burst_state_shape(bcfg: dict, n_nodes: int) -> tuple:
+    scope = bcfg["burst_scope"]
+    if scope == BurstScope.RECEIVER:
+        return (n_nodes,)
+    if scope == BurstScope.LINK:
+        return (n_nodes, n_nodes)
+    raise ValueError("packets.reception.bursty.burst_scope must be 'receiver' or 'link'")
+
+
+def _background_trial(
+    rc: dict,
+    seed: int,
+    dt: float,
+    n_steps: int,
+    steps: np.ndarray,
+    valid: np.ndarray,
+    off_diag: np.ndarray,
+    u_background: np.ndarray,
+    tx: np.ndarray,
+    rx: np.ndarray,
+) -> tuple:
+    background_model = rc["background_model"]
+    if background_model == BackgroundModel.INDEPENDENT:
+        passed_background = off_diag & (u_background >= rc["background_loss"])
+        return passed_background, None, rc["background_loss"]
+    if background_model == BackgroundModel.BURSTY:
+        bcfg = rc["bursty"]
+        n_nodes = rx.shape[2]
+        rng_burst = spawn_rng(seed, SEED_KEY_BURST)
+        shape = _burst_state_shape(bcfg, n_nodes)
+        background_state = gilbert_elliott_states(n_steps, shape, dt, bcfg, rng_burst)
+        steps_safe = np.where(valid, steps, 0)[:, :, None]
+        if bcfg["burst_scope"] == BurstScope.RECEIVER:
+            bad = background_state[steps_safe, rx]
+        else:
+            bad = background_state[steps_safe, tx, rx]
+        passed_background = off_diag & ~(bad & (u_background < bcfg["loss_bad"]))
+        return passed_background, background_state, bcfg["mean_loss"] * bcfg["loss_bad"]
+    raise ValueError(f"packets.reception.background_model must be 'independent' or 'bursty', not {background_model!r}")
 
 
 def simulate_packets(
     mobility: MobilityResult, channel: ChannelResult, config: Union[str, Path, dict]
 ) -> PacketResult:
-    """Simulazione dei pacchetti del Blocco 3 (config: percorso YAML o dict con ``simulation`` e ``packets``).
-    Generatori indipendenti dal Blocco 2: ``SeedSequence(seed, spawn_key=(4,))`` per gli istanti, ``(5,)`` per la ricezione, da cui si estraggono sempre due array uniformi (N, K, N):
-    segnale (``u < p_curve(rssi_true)``, RSSI vero non arrotondato) e fondo (``u >= background_loss``), così variare uno non cambia l'altro. Il beacon arriva se superano entrambe.
-    Blocco 6: con ``background_model: bursty`` la prova di fondo è sostituita da catene di Gilbert-Elliott (`gilbert_elliott_states`, generatore dedicato
-    ``spawn_key=(10,)``, uno per ricevitore o per link secondo ``burst_scope``): nello stato disturbato il beacon è perso con probabilità ``loss_bad`` (usando
-    l'uniforme di fondo già estratta). Con ``independent`` il comportamento è identico a prima, bit per bit.
+    """Block 3 packet simulation (config: YAML path or dict with ``simulation`` and ``packets``).
+    Generators independent of Block 2: ``SeedSequence(seed, spawn_key=(4,))`` for the instants, ``(5,)`` for reception, from which two uniform arrays (N, K, N) are always drawn:
+    signal (``u < p_curve(rssi_true)``, true unrounded RSSI) and background (``u >= background_loss``), so varying one does not change the other. The beacon arrives if it passes both.
+    Block 6: with ``background_model: bursty`` the background trial is replaced by Gilbert-Elliott chains (`gilbert_elliott_states`, dedicated generator
+    ``spawn_key=(10,)``, one per receiver or per link according to ``burst_scope``): in the disturbed state the beacon is lost with probability ``loss_bad`` (using
+    the background uniform already drawn). With ``independent`` the behaviour is identical to before, bit for bit.
     """
     cfg = load_config(config)
     pk = cfg["packets"]
@@ -289,26 +330,9 @@ def simulate_packets(
     u_background = rng_rx.random((n_nodes, n_beacons, n_nodes))
     passed_signal = off_diag & (u_signal < p_curve)
     background_model = rc["background_model"]
-    background_state = None
-    if background_model == "independent":
-        passed_background = off_diag & (u_background >= rc["background_loss"])
-        background_loss = rc["background_loss"]
-    elif background_model == "bursty":
-        bcfg = rc["bursty"]
-        rng_burst = spawn_rng(seed, SEED_KEY_BURST)
-        shape = (n_nodes,) if bcfg["burst_scope"] == "receiver" else (n_nodes, n_nodes)
-        if bcfg["burst_scope"] not in ("receiver", "link"):
-            raise ValueError("packets.reception.bursty.burst_scope deve essere 'receiver' o 'link'")
-        background_state = gilbert_elliott_states(len(t), shape, dt, bcfg, rng_burst)
-        steps_safe = np.where(valid, steps, 0)[:, :, None]
-        if bcfg["burst_scope"] == "receiver":
-            bad = background_state[steps_safe, rx]
-        else:
-            bad = background_state[steps_safe, tx, rx]
-        passed_background = off_diag & ~(bad & (u_background < bcfg["loss_bad"]))
-        background_loss = bcfg["mean_loss"] * bcfg["loss_bad"]
-    else:
-        raise ValueError(f"packets.reception.background_model deve essere 'independent' o 'bursty', non {background_model!r}")
+    passed_background, background_state, background_loss = _background_trial(
+        rc, seed, dt, len(t), steps, valid, off_diag, u_background, tx, rx
+    )
     received = passed_signal & passed_background
 
     rssi = np.where(received, rssi_meas, np.nan)

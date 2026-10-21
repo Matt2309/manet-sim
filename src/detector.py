@@ -1,26 +1,26 @@
-"""Blocco 4 — Tabella dei vicini, fusione e rilevatore.
+"""Block 4 — Neighbour table, fusion and detector.
 
-Catena su ogni nodo: beacon ricevuto → Kalman del link (`src/kalman.py`) →
-tabella dei vicini → fusione per bersaglio → rilevatore → allarme.
-Convenzione degli indici: ``[i, ..., j]`` = trasmette `i`, riceve `j`.
+Chain on each node: received beacon → link Kalman (`src/kalman.py`) →
+neighbour table → per-target fusion → detector → alarm.
+Index convention: ``[i, ..., j]`` = `i` transmits, `j` receives.
 
-Tabella dei vicini (5 byte per vicino): id, RSSI stimato (int8, 1 dB),
-pendenza (int8, 0,1 dB/s, ±12,7), deviazione standard (uint8, 0,1 dB), età
-(uint8, 0,1 s, satura a 25,5 s). Il beacon di `j` porta, per ogni vicino `i`,
-la stima a posteriori del Kalman del link `i → j`; chi riceve aggiunge il
-tempo trascorso dalla ricezione (esatto).
+Neighbour table (5 bytes per neighbour): id, estimated RSSI (int8, 1 dB),
+slope (int8, 0.1 dB/s, ±12.7), standard deviation (uint8, 0.1 dB), age
+(uint8, 0.1 s, saturates at 25.5 s). The beacon of `j` carries, for each neighbour `i`,
+the Kalman posterior estimate of the link `i → j`; the receiver adds the
+time elapsed since reception (exact).
 
-Fusione per bersaglio `i` (osservatore `m`): solo i link in cui trasmette `i`.
-Semplificazioni, da raffinare:
+Fusion per target `i` (observer `m`): only the links on which `i` transmits.
+Simplifications, to be refined:
 
-- la tabella non porta la covarianza completa: la voce ``i → k`` avanza con
-  ``r + s·età`` e varianza ``std² + σ_a²·età³/3`` (ignora la correlazione
-  livello-pendenza);
-- per la pendenza si usano gli stessi pesi ``1/varianza`` dell'RSSI;
-- lo shadowing è condiviso fra i link (correlazione ~0,9): la media pesata
-  SOTTOSTIMA la varianza vera, quindi le soglie si tarano sui dati (sweep).
+- the table does not carry the full covariance: the entry ``i → k`` advances with
+  ``r + s·age`` and variance ``std² + σ_a²·age³/3`` (ignores the level-slope
+  correlation);
+- for the slope the same ``1/variance`` weights as for the RSSI are used;
+- shadowing is shared among the links (correlation ~0.9): the weighted mean
+  UNDERESTIMATES the true variance, so the thresholds are tuned on the data (sweep).
 
-Parametri: sezioni ``neighbour_table``, ``fusion``, ``detector`` della config.
+Parameters: ``neighbour_table``, ``fusion``, ``detector`` sections of the config.
 """
 
 from __future__ import annotations
@@ -29,18 +29,20 @@ from dataclasses import dataclass
 
 import numpy as np
 
+from src.common.arrays import rising_edges, warmup_start
+from src.common.enums import DetectorMode, LostRule, Reference
 from src.fusion import combine
 from src.kalman import KalmanResult, filter_all, predict_links
 from src.packets import forward_link_payload
 
 
 # ---------------------------------------------------------------------------
-# Tabella dei vicini a 5 byte
+# 5-byte neighbour table
 # ---------------------------------------------------------------------------
 
-# Limiti dei tipi interi; la pendenza è simmetrica (±127 passi).
-_INT8 = (-128, 127)
-_SLOPE = (-127, 127)
+# Integer type limits; the slope is symmetric (±127 steps).
+INT8_RANGE = (-128, 127)
+SLOPE_CODE_RANGE = (-127, 127)
 _UINT8 = (0, 255)
 
 
@@ -49,20 +51,20 @@ def _to_code(values: np.ndarray, step: float, limits: tuple, dtype) -> np.ndarra
 
 
 def encode_table(r, s, std, age, table_cfg: dict) -> dict:
-    """Codifica una voce (4 byte, id escluso): arrotonda a passo e satura ai limiti del tipo.
+    """Encodes an entry (4 bytes, id excluded): rounds to step and saturates at the type limits.
 
-    Campi in unità fisiche (dBm, dB/s, dB, s); restituisce ``r``, ``s`` (int8), ``std``, ``age`` (uint8).
+    Fields in physical units (dBm, dB/s, dB, s); returns ``r``, ``s`` (int8), ``std``, ``age`` (uint8).
     """
     return {
-        "r": _to_code(r, table_cfg["rssi_step"], _INT8, np.int8),
-        "s": _to_code(s, table_cfg["slope_step"], _SLOPE, np.int8),
+        "r": _to_code(r, table_cfg["rssi_step"], INT8_RANGE, np.int8),
+        "s": _to_code(s, table_cfg["slope_step"], SLOPE_CODE_RANGE, np.int8),
         "std": _to_code(std, table_cfg["std_step"], _UINT8, np.uint8),
         "age": _to_code(age, table_cfg["age_step"], _UINT8, np.uint8),
     }
 
 
 def decode_table(codes: dict, table_cfg: dict) -> dict:
-    """Inverso di `encode_table`: codici → unità fisiche (errore ≤ mezzo passo, salvo saturazione)."""
+    """Inverse of `encode_table`: codes → physical units (error ≤ half a step, except for saturation)."""
     return {
         "r": codes["r"].astype(float) * table_cfg["rssi_step"],
         "s": codes["s"].astype(float) * table_cfg["slope_step"],
@@ -71,40 +73,40 @@ def decode_table(codes: dict, table_cfg: dict) -> dict:
     }
 
 
-def _quantize(values: np.ndarray, step: float, limits: tuple) -> np.ndarray:
-    """Arrotonda e satura come la scheda; i NaN restano NaN."""
+def quantize(values: np.ndarray, step: float, limits: tuple) -> np.ndarray:
+    """Rounds and saturates like the board; NaNs stay NaN."""
     out = np.clip(np.rint(values / step), limits[0], limits[1]) * step
     return np.where(np.isnan(values), np.nan, out)
 
 
 def neighbour_knowledge(t: np.ndarray, kres: KalmanResult, table_cfg: dict) -> dict:
-    """Cosa sa l'osservatore `m` del link `i → j` dalle tabelle dei vicini.
+    """What observer `m` knows about the link `i → j` from the neighbour tables.
 
-    Carico dei beacon = stima a posteriori quantizzata come sulla scheda; età = età alla trasmissione
-    (quantizzata) + tempo dalla ricezione (esatto). Restituisce ``r``, ``s``, ``std``, ``age``
-    (T, M, N, N) indicizzati ``[t, m, i, j]``; per ``j == m`` l'età è esatta (stima propria).
+    Beacon payload = posterior estimate quantized as on the board; age = age at transmission
+    (quantized) + time since reception (exact). Returns ``r``, ``s``, ``std``, ``age``
+    (T, M, N, N) indexed ``[t, m, i, j]``; for ``j == m`` the age is exact (own estimate).
     """
     return neighbour_knowledge_relay(t, kres, table_cfg)[0]
 
 
 def neighbour_knowledge_relay(t: np.ndarray, kres: KalmanResult, table_cfg: dict) -> tuple:
-    """Come `neighbour_knowledge`, ma restituisce anche ``relay`` (T, M, N, N) float64: istante del beacon di `j` che ha inoltrato
-    la tabella (NaN per ``j == m``, cioè la stima propria). Serve a riconoscere un valore NUOVO del link (Blocco 5, livello relativo)."""
+    """Like `neighbour_knowledge`, but also returns ``relay`` (T, M, N, N) float64: time of the beacon of `j` that forwarded
+    the table (NaN for ``j == m``, i.e. the own estimate). Used to recognize a NEW value of the link (Block 5, relative level)."""
     payload = {
-        "r": _quantize(kres.r, table_cfg["rssi_step"], _INT8),
-        "s": _quantize(kres.s, table_cfg["slope_step"], _SLOPE),
-        "std": _quantize(np.sqrt(kres.P[..., 0, 0]), table_cfg["std_step"], _UINT8),
+        "r": quantize(kres.r, table_cfg["rssi_step"], INT8_RANGE),
+        "s": quantize(kres.s, table_cfg["slope_step"], SLOPE_CODE_RANGE),
+        "std": quantize(np.sqrt(kres.P[..., 0, 0]), table_cfg["std_step"], _UINT8),
     }
     fields, age, relay = forward_link_payload(t, kres.times, kres.received, payload)
-    since_rx = t[:, None, None, None] - relay  # NaN sul link diretto
+    since_rx = t[:, None, None, None] - relay  # NaN on the direct link
     age_tx = np.maximum(age.astype(float) - since_rx, 0.0)
-    age_q = _quantize(age_tx, table_cfg["age_step"], _UINT8) + since_rx
+    age_q = quantize(age_tx, table_cfg["age_step"], _UINT8) + since_rx
     fields["age"] = np.where(np.isnan(relay), age.astype(float), age_q)
     return fields, relay
 
 
 # ---------------------------------------------------------------------------
-# Fusione
+# Fusion
 # ---------------------------------------------------------------------------
 
 
@@ -117,11 +119,11 @@ def fuse(
     min_variance: float = 0.0,
     rule: str = "weighted_mean",
 ) -> tuple:
-    """Fonde le voci di un bersaglio (voci sull'ULTIMO asse, `max_age` in s) con la regola `rule` (`src/fusion.py`).
+    """Fuses the entries of a target (entries on the LAST axis, `max_age` in s) with rule `rule` (`src/fusion.py`).
 
-    Voce valida: campi finiti ed ``età <= max_age``. Con ``weighted_mean`` (base): peso ``w = 1/max(var, min_variance)``,
-    ``L = Σ w r / Σ w``, ``S = Σ w s / Σ w``, varianza ``1/Σ w``. Restituisce (L, S, varianza, n voci valide);
-    NaN dove nessuna voce è valida.
+    Valid entry: finite fields and ``age <= max_age``. With ``weighted_mean`` (base): weight ``w = 1/max(var, min_variance)``,
+    ``L = Σ w r / Σ w``, ``S = Σ w s / Σ w``, variance ``1/Σ w``. Returns (L, S, variance, n valid entries);
+    NaN where no entry is valid.
     """
     values = np.asarray(values, dtype=float)
     slopes = np.asarray(slopes, dtype=float)
@@ -132,15 +134,15 @@ def fuse(
 
 
 def _valid_entries(values, slopes, variances, ages, max_age: float) -> np.ndarray:
-    """Voci valide: campi finiti ed ``età <= max_age``."""
+    """Valid entries: finite fields and ``age <= max_age``."""
     return np.isfinite(values) & np.isfinite(slopes) & np.isfinite(variances) & np.isfinite(ages) & (ages <= max_age)
 
 
 def _entry_arrays(t: np.ndarray, kres: KalmanResult, config: dict, sigma_a: float) -> tuple:
-    """Voci ``(T, M, I, K)`` ``[t, m, i, k]`` del link ``i → k`` come le conosce `m`: (valore, pendenza, varianza, età per la validità, relay, età propria).
+    """Entries ``(T, M, I, K)`` ``[t, m, i, k]`` of the link ``i → k`` as known by `m`: (value, slope, variance, age for validity, relay, own age).
 
-    Valore ``r + s·età``, varianza ``std² + σ_a²·età³/3``; per ``k == m`` la stima propria predetta (`predict_links`).
-    ``relay`` è l'istante del beacon di `k` che ha inoltrato la voce (NaN per la propria); ``età propria`` ``[t, i, m]`` è l'età della stima propria.
+    Value ``r + s·age``, variance ``std² + σ_a²·age³/3``; for ``k == m`` the predicted own estimate (`predict_links`).
+    ``relay`` is the time of the beacon of `k` that forwarded the entry (NaN for the own one); ``own age`` ``[t, i, m]`` is the age of the own estimate.
     """
     fcfg = config["fusion"]
     tcfg = config["neighbour_table"]
@@ -155,7 +157,7 @@ def _entry_arrays(t: np.ndarray, kres: KalmanResult, config: dict, sigma_a: floa
     mask_age = age.copy()
 
     own_age = own["age"] if fcfg["max_age_own"] else np.where(np.isnan(own["age"]), np.nan, 0.0)
-    for m in range(n_nodes):  # voce propria: indice k = m
+    for m in range(n_nodes):  # own entry: index k = m
         value[:, m, :, m] = own["r"][:, :, m]
         slope[:, m, :, m] = own["s"][:, :, m]
         var[:, m, :, m] = own["p00"][:, :, m]
@@ -166,14 +168,14 @@ def _entry_arrays(t: np.ndarray, kres: KalmanResult, config: dict, sigma_a: floa
 def fusion_indices(
     t: np.ndarray, kres: KalmanResult, config: dict, sigma_a: float | None = None
 ) -> dict:
-    """Livello e pendenza di ogni bersaglio per ogni osservatore, fusi e non (`sigma_a` default del filtro).
+    """Level and slope of every target for every observer, fused and unfused (`sigma_a` defaults to the filter's).
 
-    Voci per ``(m, i)``: stima propria ``i → m`` predetta all'istante corrente (`predict_links`) e,
-    per ogni compagno `k`, la voce ``i → k`` dall'ultima tabella di `k` ricevuta da `m`. Escluse
-    quelle con età > ``fusion.max_age`` (la propria solo se ``fusion.max_age_own``). Varianza minima
-    in tabella ``std_step²/12``. Regola di fusione: ``fusion.rule`` (`src/fusion.py`). Restituisce ``fused``
-    (tutte le voci) e ``pairwise`` (solo la propria), ciascuno ``(L, S, var, n)`` con array (T, M, I)
-    ``[t, m, i]``; diagonale ``m == i`` NaN.
+    Entries for ``(m, i)``: own estimate ``i → m`` predicted at the current time (`predict_links`) and,
+    for each companion `k`, the entry ``i → k`` from the last table of `k` received by `m`. Excluded
+    are those with age > ``fusion.max_age`` (the own one only if ``fusion.max_age_own``). Minimum variance
+    in the table ``std_step²/12``. Fusion rule: ``fusion.rule`` (`src/fusion.py`). Returns ``fused``
+    (all entries) and ``pairwise`` (own only), each ``(L, S, var, n)`` with (T, M, I) arrays
+    ``[t, m, i]``; diagonal ``m == i`` NaN.
     """
     fcfg = config["fusion"]
     tcfg = config["neighbour_table"]
@@ -198,11 +200,11 @@ def fusion_indices(
 
 
 def fusion_entries(t: np.ndarray, kres: KalmanResult, config: dict, sigma_a: float | None = None) -> dict:
-    """Voci non fuse per il livello relativo (Blocco 5): ``value``, ``var``, ``valid``, ``new``, tutte ``(T, M, I, K)`` ``[t, m, i, k]``.
+    """Unfused entries for the relative level (Block 5): ``value``, ``var``, ``valid``, ``new``, all ``(T, M, I, K)`` ``[t, m, i, k]``.
 
-    Come in `fusion_indices` (stesse voci, stessa validità per età). ``new`` è vero all'istante della griglia in cui `m` ha un valore
-    NUOVO del link ``i → k``: per ``k == m`` un nuovo beacon di `i` ricevuto da `m`; per ``k != m`` un nuovo beacon di `k` (con la sua
-    tabella). Il formato dei beacon non cambia: `m` ricava tutto da sé.
+    As in `fusion_indices` (same entries, same validity by age). ``new`` is true at the grid instant when `m` has a NEW
+    value of the link ``i → k``: for ``k == m`` a new beacon of `i` received by `m`; for ``k != m`` a new beacon of `k` (with its
+    table). The beacon format does not change: `m` derives everything by itself.
     """
     fcfg = config["fusion"]
     sigma_a = kres.sigma_a if sigma_a is None else sigma_a
@@ -217,23 +219,23 @@ def fusion_entries(t: np.ndarray, kres: KalmanResult, config: dict, sigma_a: flo
         for m in range(n_nodes):
             age = own_age[:, :, m]  # (T, I)
             fresh = np.zeros(age.shape, dtype=bool)
-            fresh[1:] = np.isfinite(age[1:]) & (np.isnan(age[:-1]) | (age[1:] < age[:-1] + dt - _TIME_TOLERANCE))
+            fresh[1:] = np.isfinite(age[1:]) & (np.isnan(age[:-1]) | (age[1:] < age[:-1] + dt - TIME_TOLERANCE))
             fresh[0] = np.isfinite(age[0])
             new[:, m, :, m] = fresh
     return {"value": value, "var": var, "valid": valid, "new": new & valid}
 
 
 # ---------------------------------------------------------------------------
-# Ricezione diretta
+# Direct reception
 # ---------------------------------------------------------------------------
 
 
 def reception_features(t: np.ndarray, times: np.ndarray, received: np.ndarray, config: dict) -> tuple:
-    """Silenzio e ricezione recente di ogni link diretto ``i → m`` (`times` (N, K), `received` (N, K, N)).
+    """Silence and recent reception of every direct link ``i → m`` (`times` (N, K), `received` (N, K, N)).
 
-    silence = tempo dall'ultima ricezione (da 0 se nessuna); ``rx_ok`` = beacon ricevuti in
-    ``(t − release_time, t]`` ≥ ``release_reception · release_time / beacon_period`` (periodo nominale).
-    Restituisce (silence (s), rx_ok) (T, M, I) ``[t, m, i]``; diagonale 0 e False.
+    silence = time since the last reception (from 0 if none); ``rx_ok`` = beacons received in
+    ``(t − release_time, t]`` ≥ ``release_reception · release_time / beacon_period`` (nominal period).
+    Returns (silence (s), rx_ok) (T, M, I) ``[t, m, i]``; diagonal 0 and False.
     """
     dcfg = config["detector"]
     window = dcfg["release_time"]
@@ -250,22 +252,22 @@ def reception_features(t: np.ndarray, times: np.ndarray, received: np.ndarray, c
             count_before = np.searchsorted(rx_times, t - window, side="right")
             last = np.where(count_now > 0, rx_times[np.maximum(count_now - 1, 0)] if len(rx_times) else 0.0, 0.0)
             silence[:, m, i] = t - last
-            rx_ok[:, m, i] = (count_now - count_before) >= needed - 1e-9
+            rx_ok[:, m, i] = (count_now - count_before) >= needed - TIME_TOLERANCE
     return silence, rx_ok
 
 
 def deafness(t: np.ndarray, times: np.ndarray, received: np.ndarray, silence: np.ndarray, config: dict) -> tuple:
-    """Sordità degli osservatori (Blocco 6, D4): ricevitore `m` che non sente nessuno, non un nodo `i` davvero perso.
+    """Deafness of the observers (Block 6, D4): receiver `m` that hears nobody, not a node `i` that is truly lost.
 
-    Input: `t`, `times` (N, K), `received` (N, K, N), `silence` (T, M, I) da `reception_features`, `config`.
-    Procedimento:
+    Input: `t`, `times` (N, K), `received` (N, K, N), `silence` (T, M, I) from `reception_features`, `config`.
+    Procedure:
 
-    - ``deaf_window`` (T, M): `m` non ha ricevuto beacon da NESSUN vicino negli ultimi ``lost_silence`` s (definizione letterale di ``not_deaf``);
-    - ``deaf_episode`` (T, M, I): per l'episodio di silenzio di `i` iniziato all'ultimo beacon `last` di `i`, `m` non ha ricevuto beacon da nessun altro
-      vicino in ``(last + beacon_period, last + lost_silence]``. La decisione è quindi una proprietà dell'episodio (costante finché `i` tace) e non
-      dipende dall'istante: evita che il "perso" scatti per il vicino con l'ultimo beacon più vecchio (il silenzio di `m` è ancora nascosto dal beacon
-      di un altro vicino arrivato meno di un periodo dopo) o al rientro di `m` (sente un vicino prima di `i`). Si usa solo con ``not_deaf_episode``.
-    Output: (deaf_window, deaf_episode); diagonale False.
+    - ``deaf_window`` (T, M): `m` has received beacons from NO neighbour in the last ``lost_silence`` s (literal definition of ``not_deaf``);
+    - ``deaf_episode`` (T, M, I): for the silence episode of `i` that started at the last beacon `last` of `i`, `m` has received no beacon from any other
+      neighbour in ``(last + beacon_period, last + lost_silence]``. The decision is therefore a property of the episode (constant while `i` is silent) and does not
+      depend on the instant: it avoids the "lost" firing for the neighbour with the oldest last beacon (the silence of `m` is still hidden by the beacon
+      of another neighbour that arrived less than one period later) or when `m` comes back (it hears a neighbour before `i`). Used only with ``not_deaf_episode``.
+    Output: (deaf_window, deaf_episode); diagonal False.
     """
     dcfg = config["detector"]
     silence_limit = dcfg["lost_silence"]
@@ -287,14 +289,14 @@ def deafness(t: np.ndarray, times: np.ndarray, received: np.ndarray, silence: np
 
 
 # ---------------------------------------------------------------------------
-# Allarmi
+# Alarms
 # ---------------------------------------------------------------------------
 
-_TIME_TOLERANCE = 1e-9  # s; errore di arrotondamento sui confronti fra durate
+TIME_TOLERANCE = 1e-9  # s; rounding error on duration comparisons
 
 
 def run_duration(cond: np.ndarray, t: np.ndarray) -> np.ndarray:
-    """Durata in s da cui `cond` (tempo sul primo asse) è vera senza interruzioni; 0 se falsa o al primo campione vero."""
+    """Duration in s for which `cond` (time on the first axis) has been true without interruption; 0 if false or at the first true sample."""
     shape = (-1,) + (1,) * (cond.ndim - 1)
     idx = np.arange(len(t)).reshape(shape)
     last_false = np.maximum.accumulate(np.where(cond, -1, idx), axis=0)
@@ -303,9 +305,9 @@ def run_duration(cond: np.ndarray, t: np.ndarray) -> np.ndarray:
 
 
 def latched_alarm(on: np.ndarray, off: np.ndarray) -> np.ndarray:
-    """Stato con isteresi (tempo sul primo asse): acceso se l'ultimo `on` è più recente dell'ultimo `off`.
+    """Hysteresis state (time on the first axis): on if the last `on` is more recent than the last `off`.
 
-    A pari indice vince lo spegnimento; parte spento.
+    At the same index turning off wins; starts off.
     """
     idx = np.arange(on.shape[0]).reshape((-1,) + (1,) * (on.ndim - 1))
     last_on = np.maximum.accumulate(np.where(on, idx, -1), axis=0)
@@ -324,12 +326,12 @@ def pre_alarm(
     slope_threshold: float | None = None,
     valid: np.ndarray | None = None,
 ) -> np.ndarray:
-    """Pre-allarme di ogni coppia (osservatore, bersaglio); `mode` e soglie sostituibili per gli sweep.
+    """Pre-alarm of every (observer, target) pair; `mode` and thresholds can be overridden for the sweeps.
 
-    Condizione: ``level`` ``L < soglia``, ``slope`` ``S < soglia``, ``both`` entrambe (NaN = falso).
-    Si accende dopo ``min_duration``; si spegne dopo ``release_time`` di rientro con margine
-    (``release_*_margin``; in ``both`` solo sul livello) e con `rx_ok`. Soglie più larghe ⇒ allarmi
-    in numero monotono crescente (vedi `src/metrics.py`). `valid` esclude ``m == i``.
+    Condition: ``level`` ``L < threshold``, ``slope`` ``S < threshold``, ``both`` both (NaN = false).
+    It turns on after ``min_duration``; it turns off after ``release_time`` of return with margin
+    (``release_*_margin``; in ``both`` only on the level) and with `rx_ok`. Wider thresholds ⇒ alarms
+    in monotonically increasing number (see `src/metrics.py`). `valid` excludes ``m == i``.
     """
     mode = detector_cfg["mode"] if mode is None else mode
     thr_l = detector_cfg["level_threshold"] if level_threshold is None else level_threshold
@@ -339,16 +341,16 @@ def pre_alarm(
         low_s = slope < thr_s
         back_l = level > thr_l + detector_cfg["release_level_margin"]
         back_s = slope > thr_s + detector_cfg["release_slope_margin"]
-    if mode == "level":
+    if mode == DetectorMode.LEVEL:
         cond, back = low_l, back_l
-    elif mode == "slope":
+    elif mode == DetectorMode.SLOPE:
         cond, back = low_s, back_s
-    elif mode == "both":
+    elif mode == DetectorMode.BOTH:
         cond, back = low_l & low_s, back_l
     else:
-        raise ValueError(f"detector.mode deve essere 'level', 'slope' o 'both', non {mode!r}")
-    on = run_duration(cond, t) >= detector_cfg["min_duration"] - _TIME_TOLERANCE
-    off = (run_duration(back, t) >= detector_cfg["release_time"] - _TIME_TOLERANCE) & rx_ok
+        raise ValueError(f"detector.mode must be 'level', 'slope' or 'both', not {mode!r}")
+    on = run_duration(cond, t) >= detector_cfg["min_duration"] - TIME_TOLERANCE
+    off = (run_duration(back, t) >= detector_cfg["release_time"] - TIME_TOLERANCE) & rx_ok
     state = latched_alarm(on, off)
     return state if valid is None else state & valid
 
@@ -362,53 +364,51 @@ def lost_alarm(
     deaf_window: np.ndarray | None = None,
     deaf_episode: np.ndarray | None = None,
 ) -> np.ndarray:
-    """Allarme "nodo perso" di ogni coppia: acceso con silenzio > ``lost_silence`` s, spento da `rx_ok`.
+    """"Lost node" alarm of every pair: on with silence > ``lost_silence`` s, off by `rx_ok`.
 
-    Un beacon isolato non lo spegne. `valid` esclude ``m == i``. ``detector.lost_rule`` (Blocco 6): ``any`` = base; ``not_deaf`` non accende
-    il "perso" se `m` non sente nessun vicino (`deaf_window` (T, M), vedi `deafness`); ``not_deaf_episode`` usa `deaf_episode` (T, M, I o T, M).
-    Lo spegnimento non cambia.
+    An isolated beacon does not turn it off. `valid` excludes ``m == i``. ``detector.lost_rule`` (Block 6): ``any`` = base; ``not_deaf`` does not turn on
+    the "lost" if `m` hears no neighbour (`deaf_window` (T, M), see `deafness`); ``not_deaf_episode`` uses `deaf_episode` (T, M, I or T, M).
+    Turning off does not change.
     """
     on = silence > detector_cfg["lost_silence"]
     rule = detector_cfg.get("lost_rule", "any")
-    if rule == "not_deaf":
+    if rule == LostRule.NOT_DEAF:
         on = on & ~(deaf_window if silence.ndim == 2 else deaf_window[:, :, None])
-    elif rule == "not_deaf_episode":
+    elif rule == LostRule.NOT_DEAF_EPISODE:
         on = on & ~deaf_episode
-    elif rule != "any":
-        raise ValueError(f"detector.lost_rule deve essere 'any', 'not_deaf' o 'not_deaf_episode', non {rule!r}")
+    elif rule != LostRule.ANY:
+        raise ValueError(f"detector.lost_rule must be 'any', 'not_deaf' or 'not_deaf_episode', not {rule!r}")
     state = latched_alarm(on, rx_ok)
     return state if valid is None else state & valid
 
 
 def system_alarm(observer_alarm: np.ndarray, min_observers: int) -> np.ndarray:
-    """Allarme di sistema (ciò che arriva al capogruppo): osservatori in allarme ≥ `min_observers`.
+    """System alarm (what reaches the group leader): observers in alarm ≥ `min_observers`.
 
-    Ingresso (tempo, osservatore, ...); uscita (tempo, ...).
+    Input (time, observer, ...); output (time, ...).
     """
     return observer_alarm.sum(axis=1) >= min_observers
 
 
 def count_episodes(system: np.ndarray, t: np.ndarray, warmup: float) -> np.ndarray:
-    """Numero di fronti di salita dell'allarme di sistema con ``t[k] >= warmup`` (s), per asse non temporale.
+    """Number of rising edges of the system alarm with ``t[k] >= warmup`` (s), per non-time axis.
 
-    Un allarme già acceso al termine del `warmup` non è un episodio.
+    An alarm already on at the end of `warmup` is not an episode.
     """
-    edges = system[1:] & ~system[:-1]
-    first = int(np.searchsorted(t, warmup))
-    return edges[max(first - 1, 0) :].sum(axis=0)
+    return rising_edges(system)[warmup_start(t, warmup) :].sum(axis=0)
 
 
 # ---------------------------------------------------------------------------
-# Ingressi del rilevatore per una corsa
+# Detector inputs for a run
 # ---------------------------------------------------------------------------
 
 
 @dataclass
 class DetectionInputs:
-    """Tutto ciò che il rilevatore usa di una corsa, indipendente dalle soglie.
+    """Everything the detector uses from a run, independent of the thresholds.
 
-    Gli array hanno il tempo sul primo asse e, per l'intera corsa,
-    ``[t, m, i]`` (osservatore, bersaglio); `target_slice` ne ritaglia uno solo.
+    The arrays have time on the first axis and, for the whole run,
+    ``[t, m, i]`` (observer, target); `target_slice` slices out a single one.
     """
 
     t: np.ndarray
@@ -417,13 +417,13 @@ class DetectionInputs:
     n_entries: dict
     silence: np.ndarray
     rx_ok: np.ndarray
-    valid: np.ndarray  # (M, I) False sulla diagonale
-    entries: dict | None = None  # Blocco 5: voci non fuse (T, M, I, K) per il livello relativo (`fusion_entries`)
-    deaf_window: np.ndarray | None = None  # Blocco 6: (T, M), `deafness`
-    deaf_episode: np.ndarray | None = None  # Blocco 6: (T, M, I) interi, (T, M) dopo `target_slice`
+    valid: np.ndarray  # (M, I) False on the diagonal
+    entries: dict | None = None  # Block 5: unfused entries (T, M, I, K) for the relative level (`fusion_entries`)
+    deaf_window: np.ndarray | None = None  # Block 6: (T, M), `deafness`
+    deaf_episode: np.ndarray | None = None  # Block 6: (T, M, I) whole, (T, M) after `target_slice`
 
     def lost_kwargs(self) -> dict:
-        """Argomenti di `lost_alarm` che dipendono dalla sordità."""
+        """Arguments of `lost_alarm` that depend on deafness."""
         return {"deaf_window": self.deaf_window, "deaf_episode": self.deaf_episode}
 
     def target_slice(self, target: int) -> "DetectionInputs":
@@ -443,10 +443,10 @@ class DetectionInputs:
 
 
 def build_inputs(run: dict, config: dict, sigma_a: float, R: float, kres: KalmanResult | None = None) -> tuple:
-    """`filter_all` → `fusion_indices` → `reception_features` su una corsa (chiavi come `PacketResult`).
+    """`filter_all` → `fusion_indices` → `reception_features` on a run (keys as in `PacketResult`).
 
-    `kres` (già calcolato con gli stessi parametri del Kalman) evita di rifare il filtro. Con ``detector.reference == "relative"``
-    aggiunge anche le voci non fuse (`fusion_entries`). Restituisce (`DetectionInputs`, `KalmanResult`).
+    `kres` (already computed with the same Kalman parameters) avoids redoing the filter. With ``detector.reference == "relative"``
+    it also adds the unfused entries (`fusion_entries`). Returns (`DetectionInputs`, `KalmanResult`).
     """
     if kres is None:
         kres = filter_all(run["beacon_times"], run["received"], run["rssi"], R, sigma_a, config["kalman"])
@@ -463,7 +463,7 @@ def build_inputs(run: dict, config: dict, sigma_a: float, R: float, kres: Kalman
         silence=silence,
         rx_ok=rx_ok,
         valid=~np.eye(n_nodes, dtype=bool),
-        entries=fusion_entries(t, kres, config, sigma_a) if config["detector"]["reference"] == "relative" else None,
+        entries=fusion_entries(t, kres, config, sigma_a) if config["detector"]["reference"] == Reference.RELATIVE else None,
         deaf_window=deaf_window,
         deaf_episode=deaf_episode,
     )

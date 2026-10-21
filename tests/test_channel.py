@@ -1,11 +1,10 @@
-"""Test del Blocco 2 (canale).
+"""Block 2 tests (channel).
 
-Ogni test verifica un fatto noto (teoria o formula chiusa), con input costruiti a mano o ridotti.
+Each test checks a known fact (theory or closed formula), with hand-built or reduced inputs.
 """
 
 import copy
 import math
-from pathlib import Path
 
 import numpy as np
 import pytest
@@ -23,30 +22,19 @@ from src.channel import (
     shadow_field_sigma_p,
     simulate_channel,
 )
-from src.mobility import MobilityResult, load_config, simulate_mobility
+from src.mobility import MobilityResult, simulate_mobility
 
-CONFIG_PATH = Path(__file__).resolve().parent.parent / "config" / "default.yaml"
 C_LIGHT = 299792458.0
 
 
 # ---------------------------------------------------------------------------
-# Fixture e utilità
+# Fixtures and utilities
 # ---------------------------------------------------------------------------
 
 
 @pytest.fixture(scope="session")
-def base_config():
-    return load_config(CONFIG_PATH)
-
-
-@pytest.fixture
-def cfg(base_config):
-    return copy.deepcopy(base_config)
-
-
-@pytest.fixture(scope="session")
 def short_mobility(base_config):
-    """Simulazione di mobilità breve (60 s), senza separazione."""
+    """Short mobility simulation (60 s), without separation."""
     c = copy.deepcopy(base_config)
     c["simulation"]["duration"] = 60.0
     c["separation"]["enabled"] = False
@@ -54,7 +42,7 @@ def short_mobility(base_config):
 
 
 def _quiet(cfg: dict) -> dict:
-    """Disattiva tutte le componenti casuali: resta la sola attenuazione."""
+    """Disables all random components: only the attenuation remains."""
     ch = cfg["channel"]
     ch["shadowing"]["enabled"] = False
     ch["body"]["own"]["enabled"] = False
@@ -65,7 +53,7 @@ def _quiet(cfg: dict) -> dict:
 
 
 def _mobility(positions: np.ndarray, headings=None, dt: float = 0.1) -> MobilityResult:
-    """`MobilityResult` costruito a mano da posizioni (T, N, 2)."""
+    """`MobilityResult` built by hand from positions (T, N, 2)."""
     positions = np.asarray(positions, dtype=float)
     n_steps, n_nodes, _ = positions.shape
     if headings is None:
@@ -89,7 +77,7 @@ def _offdiag(arr: np.ndarray) -> np.ndarray:
 
 
 def _exp_cov_link_matrix(a1, b1, a2, b2, delta: float, n: int = 500) -> float:
-    """Integrale doppio numerico di exp(-r/delta) fra due segmenti, normalizzato come lo shadowing."""
+    """Numerical double integral of exp(-r/delta) between two segments, normalized like the shadowing."""
     d1 = np.linalg.norm(b1 - a1)
     d2 = np.linalg.norm(b2 - a2)
     u = (np.arange(n) + 0.5) / n
@@ -100,7 +88,7 @@ def _exp_cov_link_matrix(a1, b1, a2, b2, delta: float, n: int = 500) -> float:
 
 
 # ---------------------------------------------------------------------------
-# 1. Attenuazione con la distanza
+# 1. Attenuation with distance
 # ---------------------------------------------------------------------------
 
 
@@ -116,7 +104,7 @@ def test_path_loss_matches_formula(cfg):
     positions[:, 1, 0] = distances
     result = simulate_channel(_mobility(positions), _quiet(cfg))
 
-    # formula scritta indipendentemente (c fisica, nessun valore del codice)
+    # formula written independently (physical c, no value from the code)
     pl0_ref = 20.0 * np.log10(4.0 * np.pi * d0 * 2.437e9 / C_LIGHT)
     expected = 10.0 - (pl0_ref + 10.0 * n * np.log10(np.maximum(distances, d0) / d0))
     assert np.allclose(result.rssi_true[:, 0, 1], expected, atol=1e-9)
@@ -131,13 +119,13 @@ def test_path_loss_matches_formula(cfg):
 
 
 # ---------------------------------------------------------------------------
-# 2. Mappa: varianza e correlazione
+# 2. Map: variance and correlation
 # ---------------------------------------------------------------------------
 
 
 @pytest.fixture(scope="module")
 def big_fields():
-    """Tre realizzazioni di una mappa 600x600 m a passo 0,5 m."""
+    """Three realizations of a 600x600 m map at 0.5 m step."""
     sigma, delta = 4.0, 7.0
     sigma_p = shadow_field_sigma_p(sigma, delta)
     rng = np.random.default_rng(2024)
@@ -177,7 +165,7 @@ def test_field_autocorrelation_is_exponential(big_fields, axis, lag_in_deltas):
 
 
 # ---------------------------------------------------------------------------
-# 3. Varianza del link in funzione della lunghezza
+# 3. Link variance as a function of length
 # ---------------------------------------------------------------------------
 
 
@@ -199,16 +187,16 @@ def test_link_std_vs_length(cfg):
             samples.append(link_shadowing(sf, a, b, sh))
         std = np.std(np.concatenate(samples))
         theory = math.sqrt(link_variance_theory(length, sigma, delta))
-        assert std == pytest.approx(theory, rel=0.12), f"lunghezza {length} m"
+        assert std == pytest.approx(theory, rel=0.12), f"length {length} m"
 
 
 # ---------------------------------------------------------------------------
-# 4. Correlazione fra link vicini (il test che motiva il modello)
+# 4. Correlation between neighbouring links (the test that motivates the model)
 # ---------------------------------------------------------------------------
 
 _A = np.array([100.0, 150.0])
 _B1 = np.array([180.0, 150.0])
-_B2 = np.array([180.0, 153.0])  # a 3 m da B1
+_B2 = np.array([180.0, 153.0])  # 3 m from B1
 
 
 def test_neighbouring_links_correlation_field(cfg):
@@ -233,13 +221,13 @@ def test_neighbouring_links_correlation_field(cfg):
     var2 = _exp_cov_link_matrix(_A, _B2, _A, _B2, delta)
     theory = cov12 / math.sqrt(var1 * var2)
 
-    assert theory > 0.5  # i link condividono quasi tutto il percorso
+    assert theory > 0.5  # the links share almost the whole path
     assert empirical == pytest.approx(theory, abs=0.1)
 
 
 def test_neighbouring_links_correlation_independent(cfg):
     sh = cfg["channel"]["shadowing"]
-    positions = np.array([[_A, _B1, _B2]])  # (1, 3, 2): link 0-1 e 0-2 condividono il nodo 0
+    positions = np.array([[_A, _B1, _B2]])  # (1, 3, 2): links 0-1 and 0-2 share node 0
     rng = np.random.default_rng(12)
     s = np.array(
         [independent_shadowing(positions, sh["sigma"], sh["correlation_distance"], rng)[0, 0, 1:] for _ in range(2000)]
@@ -248,7 +236,7 @@ def test_neighbouring_links_correlation_independent(cfg):
 
 
 # ---------------------------------------------------------------------------
-# 5. Ritorno nello stesso punto
+# 5. Return to the same point
 # ---------------------------------------------------------------------------
 
 
@@ -265,13 +253,13 @@ def test_field_same_positions_same_shadowing(cfg):
 
 
 # ---------------------------------------------------------------------------
-# 6. Modalità indipendente
+# 6. Independent mode
 # ---------------------------------------------------------------------------
 
 
 @pytest.fixture(scope="module")
 def parallel_run(base_config):
-    """5 nodi in parallelo a 0,05 m per passo: ogni coppia percorre 0,1 m per passo."""
+    """5 nodes in parallel at 0.05 m per step: each pair travels 0.1 m per step."""
     sh = base_config["channel"]["shadowing"]
     n_steps, n_nodes, step = 100_000, 5, 0.05
     k = np.arange(n_steps)
@@ -306,11 +294,11 @@ def test_independent_static_nodes_constant_shadowing(cfg):
     sh = cfg["channel"]["shadowing"]
     s = independent_shadowing(positions, sh["sigma"], sh["correlation_distance"], np.random.default_rng(3))
     assert np.ptp(s, axis=0).max() == 0.0
-    assert np.std(s[0, [0, 0, 1], [1, 2, 2]]) > 0.0  # coppie diverse, valori diversi
+    assert np.std(s[0, [0, 0, 1], [1, 2, 2]]) > 0.0  # different pairs, different values
 
 
 # ---------------------------------------------------------------------------
-# 7. Reciprocità
+# 7. Reciprocity
 # ---------------------------------------------------------------------------
 
 
@@ -332,12 +320,12 @@ def test_reciprocity(cfg, short_mobility, mode):
 
 
 # ---------------------------------------------------------------------------
-# 8. Torso proprio
+# 8. Own torso
 # ---------------------------------------------------------------------------
 
 
 def _torso_case(cfg, other_pos, other_heading):
-    """Nodo 0 in (0,0) verso est, altro nodo con perdita nulla: il totale è la perdita dell'estremo 0."""
+    """Node 0 at (0,0) heading east, other node with zero loss: the total is the loss of endpoint 0."""
     positions = np.array([[[0.0, 0.0], other_pos]])
     headings = np.array([[[1.0, 0.0], other_heading]])
     return own_body_loss(positions, headings, cfg["channel"]["body"]["own"])[0, 0, 1]
@@ -348,24 +336,24 @@ def test_own_body_lobe(cfg):
     max_loss, n = own["max_loss"], own["lobe_exponent"]
     assert own["mount_side"] == "right"
 
-    # altro a nord (a sinistra di chi corre verso est): torso massimo
+    # other to the north (to the left of the runner heading east): maximum torso
     assert _torso_case(cfg, [0.0, 10.0], [1.0, 0.0]) == pytest.approx(max_loss, abs=1e-9)
-    # altro a sud (a destra): nessuna perdita
+    # other to the south (to the right): no loss
     assert _torso_case(cfg, [0.0, -10.0], [-1.0, 0.0]) == pytest.approx(0.0, abs=1e-9)
-    # altro davanti: metà lobo
+    # other ahead: half lobe
     assert _torso_case(cfg, [10.0, 0.0], [0.0, -1.0]) == pytest.approx(max_loss * 0.5**n, abs=1e-9)
 
 
 def test_own_body_mount_side_left_mirrors(cfg):
     cfg["channel"]["body"]["own"]["mount_side"] = "left"
     max_loss = cfg["channel"]["body"]["own"]["max_loss"]
-    # scheda a sinistra: il torso blocca verso sud
+    # board on the left: the torso blocks toward the south
     assert _torso_case(cfg, [0.0, -10.0], [1.0, 0.0]) == pytest.approx(max_loss, abs=1e-9)
     assert _torso_case(cfg, [0.0, 10.0], [-1.0, 0.0]) == pytest.approx(0.0, abs=1e-9)
 
 
 # ---------------------------------------------------------------------------
-# 9. Altri corridori
+# 9. Other runners
 # ---------------------------------------------------------------------------
 
 
@@ -393,7 +381,7 @@ def test_other_runner_beyond_endpoint(cfg):
 
 
 def test_runners_in_line_hit_the_cap(cfg):
-    """Il tetto sulla perdita totale vale per più corridori in fila, non per uno solo."""
+    """The cap on the total loss applies to several runners in a row, not to a single one."""
     o = cfg["channel"]["body"]["others"]
     assert 2 * o["loss"] > o["max_total_loss"]
     three = _others(cfg, [[0, 0], [10, 0], [3, 0], [5, 0], [7, 0]])[0, 1]
@@ -406,7 +394,7 @@ def test_runners_in_line_hit_the_cap(cfg):
 
 
 # ---------------------------------------------------------------------------
-# 10. Variazioni rapide
+# 10. Fast variations
 # ---------------------------------------------------------------------------
 
 
@@ -426,7 +414,7 @@ def test_rician_fading_matches_scipy():
 
 
 # ---------------------------------------------------------------------------
-# 11. Scarti delle schede
+# 11. Board offsets
 # ---------------------------------------------------------------------------
 
 
@@ -445,7 +433,7 @@ def test_device_offsets_break_reciprocity(cfg, short_mobility):
 
 
 # ---------------------------------------------------------------------------
-# 12. Lettura
+# 12. Reading
 # ---------------------------------------------------------------------------
 
 
@@ -460,14 +448,14 @@ def test_measurement_saturation_and_quantization(cfg, short_mobility):
     assert np.allclose(ratio, np.round(ratio), atol=1e-9)
     assert result.metadata["saturated_fraction"] > 0.0
 
-    # quantizzazione più grossolana: multipli di 3 dB
+    # coarser quantization: multiples of 3 dB
     cfg["channel"]["measurement"]["quantization_step"] = 3.0
     coarse = _offdiag(simulate_channel(short_mobility, cfg).rssi_measured) / 3.0
     assert np.allclose(coarse, np.round(coarse), atol=1e-9)
 
 
 # ---------------------------------------------------------------------------
-# 13. Riproducibilità e indipendenza dei generatori
+# 13. Reproducibility and independence of the generators
 # ---------------------------------------------------------------------------
 
 
@@ -507,7 +495,7 @@ def test_generators_are_independent(cfg, short_mobility):
 
 
 # ---------------------------------------------------------------------------
-# 14. Forme e componenti disattivate
+# 14. Shapes and disabled components
 # ---------------------------------------------------------------------------
 
 

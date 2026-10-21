@@ -1,3 +1,3 @@
-# File vuoto: la sua sola presenza nella root del repository fa sì che pytest
-# aggiunga questa directory a sys.path, rendendo importabile il pacchetto `src`
-# dai test in tests/test_mobility.py (import src.mobility).
+# Empty file: its mere presence in the repository root makes pytest
+# add this directory to sys.path, making the `src` package importable
+# from the tests in tests/test_mobility.py (import src.mobility).

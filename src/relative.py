@@ -1,40 +1,40 @@
-"""Blocco 5 (B) — Livello relativo: quanto è calato il segnale rispetto al gruppo.
+"""Block 5 (B) — Relative level: how much the signal has dropped relative to the group.
 
-Con ``detector.reference = relative`` non si guarda il valore in dBm ma il CALO rispetto a una
-LINEA DI BASE. Per ogni osservatore `m`, bersaglio `i` e link usato nella fusione (il proprio
-``i → m`` e i link ``i → k`` inoltrati dai compagni) `m` calcola da sé la base: il formato del
-beacon non cambia.
+With ``detector.reference = relative`` the value in dBm is not used, but the DROP relative to a
+BASELINE. For each observer `m`, target `i` and link used in the fusion (its own
+``i → m`` and the links ``i → k`` forwarded by the companions) `m` computes the baseline by itself: the
+beacon format does not change.
 
-- **Linea di base**: mediana delle stime del link negli ultimi ``baseline_window`` s. Contano solo
-  i campioni ACCETTATI, presi agli istanti in cui `m` ha un valore nuovo del link (un
-  aggiornamento proprio, oppure una tabella ricevuta da `k`: `fusion_entries`).
-- **Congelamento**: un campione è accettato solo se non è sceso più di ``freeze_drop`` dB sotto la
-  base corrente e solo se `m` non ha un allarme attivo (pre-allarme o "perso") sul bersaglio. Se
-  non è accettato la base resta ferma; riprende da sola quando il segnale torna entro
-  ``freeze_drop`` dB. Con meno di ``baseline_min_samples`` campioni accettati in finestra la base
-  precedente resta ferma.
-- **Avvio**: finché un link non ha una base è escluso dalla fusione; se non resta nessuna voce,
-  non c'è allarme.
-- **Calo** del link = base − stima attuale (positivo = segnale più debole). I cali dei link si
-  fondono con la regola di `src/fusion.py` applicata all'indice ``−calo`` (``max`` = il calo più
-  piccolo = il miglior osservatore).
-- **Pre-allarme**: calo fuso > ``drop_threshold`` per almeno ``min_duration``; si spegne dopo
-  ``release_time`` con calo fuso < ``drop_threshold − release_level_margin`` e buona ricezione
-  (stessa logica di `src/detector.py::pre_alarm`, a pari istante vince lo spegnimento).
+- **Baseline**: median of the link estimates over the last ``baseline_window`` s. Only
+  ACCEPTED samples count, taken at the instants when `m` has a new value of the link (an
+  own update, or a table received from `k`: `fusion_entries`).
+- **Freezing**: a sample is accepted only if it has not fallen more than ``freeze_drop`` dB below the
+  current baseline and only if `m` has no active alarm (pre-alarm or "lost") on the target. If it
+  is not accepted the baseline stays put; it resumes on its own when the signal returns within
+  ``freeze_drop`` dB. With fewer than ``baseline_min_samples`` accepted samples in the window the
+  previous baseline stays put.
+- **Startup**: until a link has a baseline it is excluded from the fusion; if no entry remains,
+  there is no alarm.
+- **Drop** of the link = baseline − current estimate (positive = weaker signal). The link drops are
+  fused with the rule of `src/fusion.py` applied to the index ``−drop`` (``max`` = the smallest
+  drop = the best observer).
+- **Pre-alarm**: fused drop > ``drop_threshold`` for at least ``min_duration``; it turns off after
+  ``release_time`` with fused drop < ``drop_threshold − release_level_margin`` and good reception
+  (same logic as `src/detector.py::pre_alarm`, at the same instant turning off wins).
 
-Perché aiuta: il calo relativo annulla gli scarti fissi delle schede (il link ha sempre la stessa
-coppia tx/rx) e la parte di shadowing che cambia poco fra il punto in cui il corridore stava nel
-gruppo e quello in cui si stacca. Lo shadowing che cambia lungo il percorso non lo annulla.
+Why it helps: the relative drop cancels the fixed offsets of the boards (the link always has the same
+tx/rx pair) and the part of shadowing that changes little between the point where the runner was in the
+group and the one where he breaks away. It does not cancel shadowing that changes along the path.
 
-La base dipende dagli allarmi (il congelamento), quindi lo stato è sequenziale: il ciclo è in
-numba (`@njit`; senza numba gira, molto più lento, in Python puro).
+The baseline depends on the alarms (the freezing), so the state is sequential: the loop is in
+numba (`@njit`; without numba it runs, much slower, in pure Python).
 """
 
 from __future__ import annotations
 
 import numpy as np
 
-try:  # numba è opzionale: senza, lo stesso codice gira in Python puro
+try:  # numba is optional: without it, the same code runs in pure Python
     from numba import njit
 except ImportError:  # pragma: no cover
 
@@ -44,7 +44,7 @@ except ImportError:  # pragma: no cover
         return lambda f: f
 
 
-from src.detector import _TIME_TOLERANCE, lost_alarm
+from src.detector import TIME_TOLERANCE, lost_alarm
 from src.fusion import RULES
 
 _RULE_CODE = {name: code for code, name in enumerate(RULES)}
@@ -56,10 +56,10 @@ def _run_pairs(
     window, min_samples, freeze_drop, margin, min_duration, release_time, tol, cap, trace,
     out_state, out_drop, out_frozen, out_base,
 ):  # fmt: skip
-    """Livello relativo su ogni coppia (osservatore, bersaglio) di `obs`/`tgt` e ogni soglia (vedi la docstring del modulo).
+    """Relative level on every (observer, target) pair of `obs`/`tgt` and every threshold (see the module docstring).
 
-    `value`, `var`, `valid`, `new`: (T, M, I, K); `lost`, `rx_ok`: (T, M, I); `out_state`: (coppie, soglie, T) bool.
-    Con `trace` scrive anche `out_drop` (T,), `out_frozen` (T, K) e `out_base` (T, K) (solo per la prima coppia e la prima soglia).
+    `value`, `var`, `valid`, `new`: (T, M, I, K); `lost`, `rx_ok`: (T, M, I); `out_state`: (pairs, thresholds, T) bool.
+    With `trace` it also writes `out_drop` (T,), `out_frozen` (T, K) and `out_base` (T, K) (only for the first pair and the first threshold).
     """
     n_steps = len(t)
     n_links = value.shape[3]
@@ -83,7 +83,7 @@ def _run_pairs(
             back_on = False
             back_t0 = 0.0
             for s in range(n_steps):
-                # 1. calo fuso
+                # 1. fused drop
                 n_used = 0
                 for k in range(n_links):
                     if only_own and k != m:
@@ -109,7 +109,7 @@ def _run_pairs(
                         for u in range(1, n_used):
                             if drops[u] < fused:
                                 fused = drops[u]
-                # 2. pre-allarme (stessa logica di `pre_alarm`)
+                # 2. pre-alarm (same logic as `pre_alarm`)
                 cond = fused > thr  # NaN -> False
                 back = fused < thr - margin
                 if cond:
@@ -131,7 +131,7 @@ def _run_pairs(
                 elif on:
                     state = True
                 out_state[p, n, s] = state
-                # 3. linea di base
+                # 3. baseline
                 active = state or lost[s, m, i]
                 for k in range(n_links):
                     if only_own and k != m:
@@ -166,11 +166,11 @@ def _run_pairs(
 
 
 def _arrays(inputs, config: dict, scope: str, targets: list | None):
-    """Prepara gli ingressi del kernel: voci 4D ``(T, M, I, K)``, allarme "perso" e ricezione 3D, coppie (osservatore, bersaglio)."""
+    """Prepares the kernel inputs: 4D entries ``(T, M, I, K)``, "lost" alarm and 3D reception, (observer, target) pairs."""
     dcfg = config["detector"]
     entries = inputs.entries
     if entries is None:
-        raise ValueError("servono le voci non fuse: costruire gli ingressi con detector.reference = 'relative'")
+        raise ValueError("unfused entries are required: build the inputs with detector.reference = 'relative'")
     sliced = entries["value"].ndim == 3  # `target_slice`: (T, M, K)
     expand = (lambda a: a[:, :, None, ...]) if sliced else (lambda a: a)
     lost = lost_alarm(inputs.silence, inputs.rx_ok, inputs.t, dcfg, inputs.valid, **inputs.lost_kwargs())
@@ -189,7 +189,7 @@ def _call(inputs, config, scope, thresholds, trace_pair=None):
     dcfg = config["detector"]
     rule = config["fusion"]["rule"]
     if rule not in _RULE_CODE:
-        raise ValueError(f"fusion.rule deve essere uno fra {RULES}, non {rule!r}")
+        raise ValueError(f"fusion.rule must be one of {RULES}, not {rule!r}")
     value, var, valid, new, lost, rx_ok, pairs, sliced = _arrays(inputs, config, scope, None)
     if trace_pair is not None:
         pairs = [trace_pair]
@@ -210,19 +210,19 @@ def _call(inputs, config, scope, thresholds, trace_pair=None):
         t, np.ascontiguousarray(value), np.ascontiguousarray(var), np.ascontiguousarray(valid), np.ascontiguousarray(new),
         lost, rx_ok, obs, tgt, thresholds, scope == "pairwise", _RULE_CODE[rule], max(min_var, np.finfo(float).tiny),
         float(dcfg["baseline_window"]), int(dcfg["baseline_min_samples"]), float(dcfg["freeze_drop"]),
-        float(dcfg["release_level_margin"]), float(dcfg["min_duration"]), float(dcfg["release_time"]), _TIME_TOLERANCE, cap,
+        float(dcfg["release_level_margin"]), float(dcfg["min_duration"]), float(dcfg["release_time"]), TIME_TOLERANCE, cap,
         trace, out_state, out_drop, out_frozen, out_base,
     )  # fmt: skip
     return out_state, pairs, sliced, (out_drop, out_frozen, out_base)
 
 
 def relative_alarms(inputs, config: dict, scope: str, thresholds: np.ndarray) -> np.ndarray:
-    """Pre-allarme relativo di ogni coppia (osservatore, bersaglio) per ogni soglia del calo.
+    """Relative pre-alarm of every (observer, target) pair for every drop threshold.
 
-    Input: `inputs` (`DetectionInputs` con ``entries``, intero o ritagliato su un bersaglio), `scope` (``fused`` o ``pairwise``:
-    solo il link proprio), `thresholds` (dB).
-    Procedimento: kernel sequenziale (docstring del modulo) con la regola ``fusion.rule`` e i parametri ``detector``.
-    Output: bool ``(soglie, T, M, I)``, oppure ``(soglie, T, M)`` se ritagliato; False sulla diagonale.
+    Input: `inputs` (`DetectionInputs` with ``entries``, whole or sliced to one target), `scope` (``fused`` or ``pairwise``:
+    own link only), `thresholds` (dB).
+    Procedure: sequential kernel (module docstring) with the ``fusion.rule`` rule and the ``detector`` parameters.
+    Output: bool ``(thresholds, T, M, I)``, or ``(thresholds, T, M)`` if sliced; False on the diagonal.
     """
     out_state, pairs, sliced, _ = _call(inputs, config, scope, thresholds)
     n_thr, n_steps = out_state.shape[1], out_state.shape[2]
@@ -240,9 +240,9 @@ def relative_alarms(inputs, config: dict, scope: str, thresholds: np.ndarray) ->
 
 
 def relative_trace(inputs, config: dict, scope: str, threshold: float, observer: int, target: int = 0) -> dict:
-    """Traccia di una coppia (osservatore, bersaglio) a una soglia: ``state`` (T,), ``drop`` (T,) calo fuso, ``frozen`` (T, K) e ``base`` (T, K) per link.
+    """Trace of an (observer, target) pair at one threshold: ``state`` (T,), ``drop`` (T,) fused drop, ``frozen`` (T, K) and ``base`` (T, K) per link.
 
-    `target` è l'indice nell'array (0 se `inputs` è ritagliato su un bersaglio). Serve alla diagnostica e ai grafici.
+    `target` is the index in the array (0 if `inputs` is sliced to one target). Used for diagnostics and plots.
     """
     out_state, _, _, (drop, frozen, base) = _call(inputs, config, scope, np.array([threshold]), (observer, target))
     return {"state": out_state[0, 0], "drop": drop, "frozen": frozen, "base": base}
