@@ -1,48 +1,24 @@
-"""Test del Blocco 4: Kalman per link e tabella dei vicini.
+"""Block 4 tests: per-link Kalman and neighbour table.
 
-Ogni test verifica un fatto noto (teoria o formula chiusa); tolleranze statistiche a 4 sigma.
+Each test checks a known fact (theory or closed formula); statistical tolerances at 4 sigma.
 """
 
-import copy
 import math
-from pathlib import Path
 
 import numpy as np
 import pytest
 from scipy.linalg import solve_discrete_are
 
-from src.kalman import (
-    KalmanResult,
-    filter_all,
-    filter_link,
-    measurement_noise,
-    predict,
-    predict_links,
-    process_noise,
-    transition,
-)
-from src.mobility import load_config
-
-CONFIG_PATH = Path(__file__).resolve().parent.parent / "config" / "default.yaml"
-
-
-@pytest.fixture(scope="session")
-def base_config():
-    return load_config(CONFIG_PATH)
-
-
-@pytest.fixture
-def cfg(base_config):
-    return copy.deepcopy(base_config)
+from src.kalman import filter_all, filter_link, measurement_noise, predict, predict_links, process_noise, transition
 
 
 # ---------------------------------------------------------------------------
-# 1. Retta senza rumore
+# 1. Noiseless line
 # ---------------------------------------------------------------------------
 
 
 def test_noiseless_line_slope_converges(cfg):
-    """Con ``z = a + b t`` e `Δt` regolare la pendenza stimata converge a `b`."""
+    """With ``z = a + b t`` and regular `Δt` the estimated slope converges to `b`."""
     kc = cfg["kalman"]
     a, b, dt = -70.0, -0.8, 0.5
     times = np.arange(200) * dt
@@ -52,7 +28,7 @@ def test_noiseless_line_slope_converges(cfg):
     assert r[-1] == pytest.approx(a + b * times[-1], abs=1e-3)
     assert reinit[0] and not reinit[1:].any()
     assert np.isnan(nis[0])
-    # Δt irregolari
+    # irregular Δt
     rng = np.random.default_rng(0)
     times = np.cumsum(rng.uniform(0.3, 0.7, 300))
     r, s, *_ = filter_link(times, a + b * times, 1.0, kc["sigma_a"], kc["initial_slope_std"], kc["reinit_gap"])
@@ -60,13 +36,13 @@ def test_noiseless_line_slope_converges(cfg):
 
 
 # ---------------------------------------------------------------------------
-# 2. Guadagno stazionario
+# 2. Steady-state gain
 # ---------------------------------------------------------------------------
 
 
 @pytest.mark.parametrize("sigma_a", [0.25, 1.0])
 def test_steady_state_covariance_matches_dare(sigma_a):
-    """Con `Δt` costante la covarianza a priori a regime risolve la Riccati discreta."""
+    """With constant `Δt` the steady-state prior covariance solves the discrete Riccati equation."""
     dt, R = 0.5, 11.0
     rng = np.random.default_rng(1)
     times = np.arange(400) * dt
@@ -78,19 +54,19 @@ def test_steady_state_covariance_matches_dare(sigma_a):
     expected = solve_discrete_are(F.T, H.T, Q, np.array([[R]]))
     prior = F @ P[-1] @ F.T + Q
     np.testing.assert_allclose(prior, expected, rtol=1e-7)
-    # guadagno di regime
+    # steady-state gain
     gain = expected[:, 0] / (expected[0, 0] + R)
     p_post = (np.eye(2) - np.outer(gain, [1.0, 0.0])) @ expected
     np.testing.assert_allclose(P[-1], p_post, rtol=1e-7)
 
 
 # ---------------------------------------------------------------------------
-# 3. Additività di Q e crescita durante i buchi
+# 3. Additivity of Q and growth during gaps
 # ---------------------------------------------------------------------------
 
 
 def test_process_noise_additive():
-    """Due predizioni da Δt/2 equivalgono a una da Δt (stessa P, stesso x)."""
+    """Two predictions of Δt/2 are equivalent to one of Δt (same P, same x)."""
     rng = np.random.default_rng(2)
     a = rng.normal(size=(2, 2))
     P = a @ a.T + np.eye(2)
@@ -101,7 +77,7 @@ def test_process_noise_additive():
         x2, P2 = predict(xh, Ph, dt / 2.0, 0.8)
         np.testing.assert_allclose(P2, P1, rtol=1e-12)
         np.testing.assert_allclose(x2, x1, rtol=1e-12)
-    # Q(dt) = ∫ Φ(u) G Gᵀ Φ(u)ᵀ σ² du per quadratura
+    # Q(dt) = ∫ Φ(u) G Gᵀ Φ(u)ᵀ σ² du by quadrature
     dt, sigma_a = 1.3, 0.8
     u = np.linspace(0.0, dt, 200001)
     g = np.stack([dt - u, np.ones_like(u)], axis=-1)
@@ -117,7 +93,7 @@ def test_variance_grows_strictly_during_gaps(cfg):
     times[0] = np.arange(n_beacons) * 0.5
     received = np.zeros((n_nodes, n_beacons, n_nodes), dtype=bool)
     received[0, :, 1] = True
-    received[0, 20:40, 1] = False  # buco di 10 s
+    received[0, 20:40, 1] = False  # 10 s gap
     rssi = np.full((n_nodes, n_beacons, n_nodes), np.nan)
     rssi[0, :, 1] = -70.0 + np.random.default_rng(3).normal(0.0, 3.0, n_beacons)
     kres = filter_all(times, received, rssi, 10.0, kc["sigma_a"], kc)
@@ -126,7 +102,7 @@ def test_variance_grows_strictly_during_gaps(cfg):
     p00 = est["p00"][:, 0, 1]
     in_gap = (t > 9.5) & (t < 20.0)
     assert np.all(np.diff(p00[in_gap]) > 0.0)
-    # predizione sulla griglia = predizione esplicita dall'ultimo aggiornamento
+    # prediction on the grid = explicit prediction from the last update
     k = 19
     k_idx = int(np.searchsorted(t, 12.0))
     _, p_exp = predict(
@@ -149,12 +125,12 @@ def test_reinit_after_long_silence(cfg):
 
 
 # ---------------------------------------------------------------------------
-# 4. Consistenza
+# 4. Consistency
 # ---------------------------------------------------------------------------
 
 
 def test_consistency_constant_level_white_noise():
-    """Livello costante e rumore bianco (σ_a = 0): NIS media 1 e varianza dell'errore pari a P."""
+    """Constant level and white noise (σ_a = 0): mean NIS 1 and error variance equal to P."""
     R, level, n_real, n_steps = 9.0, -72.0, 1500, 60
     rng = np.random.default_rng(4)
     times = np.arange(n_steps) * 0.5
@@ -174,12 +150,12 @@ def test_consistency_constant_level_white_noise():
 
 
 def test_consistency_random_acceleration_irregular_dt():
-    """Con verità dal modello stesso (σ_a > 0, Δt irregolari) NIS media 1 e covarianza dell'errore come P."""
+    """With truth drawn from the model itself (σ_a > 0, irregular Δt) mean NIS 1 and error covariance equal to P."""
     R, sigma_a, slope_std = 6.0, 0.7, 3.0
     n_real, n_steps = 1500, 50
     rng = np.random.default_rng(5)
     dts = rng.uniform(0.3, 0.7, n_steps - 1)
-    dts[rng.random(n_steps - 1) < 0.2] += rng.uniform(1.0, 3.0)  # buchi (< reinit_gap)
+    dts[rng.random(n_steps - 1) < 0.2] += rng.uniform(1.0, 3.0)  # gaps (< reinit_gap)
     times = np.concatenate([[0.0], np.cumsum(dts)])
     chol = [np.linalg.cholesky(process_noise(d, sigma_a)) for d in dts]
     nis_all, err = [], []
@@ -209,13 +185,13 @@ def test_measurement_noise_auto_and_explicit(cfg):
     assert measurement_noise(cfg, 10.0) == pytest.approx(10.0 + q**2 / 12.0)
     cfg["kalman"]["measurement_noise"] = 7.5
     assert measurement_noise(cfg, 10.0) == 7.5
-    cfg["kalman"]["measurement_noise"] = "altro"
+    cfg["kalman"]["measurement_noise"] = "other"
     with pytest.raises(ValueError):
         measurement_noise(cfg, 10.0)
 
 
 # ---------------------------------------------------------------------------
-# 5. Tabella a 5 byte
+# 5. 5-byte table
 # ---------------------------------------------------------------------------
 
 
@@ -235,11 +211,11 @@ def test_table_roundtrip_half_step_and_saturation(cfg):
     assert np.all(np.abs(back["s"] - s) <= tc["slope_step"] / 2 + 1e-9)
     assert np.all(np.abs(back["std"] - std) <= tc["std_step"] / 2 + 1e-9)
     assert np.all(np.abs(back["age"] - age) <= tc["age_step"] / 2 + 1e-9)
-    # 4 byte di dati + 1 di id
+    # 4 data bytes + 1 id byte
     assert [codes[k].dtype for k in ("r", "s", "std", "age")] == [np.int8, np.int8, np.uint8, np.uint8]
     assert sum(codes[k].dtype.itemsize for k in codes) + 1 == 5
 
-    # saturazione fuori intervallo
+    # saturation outside the range
     sat = decode_table(encode_table(np.array([-300.0, 300.0]), np.array([-50.0, 50.0]),
                                     np.array([-1.0, 99.0]), np.array([-3.0, 99.0]), tc), tc)
     assert sat["r"].tolist() == [-128.0 * tc["rssi_step"], 127.0 * tc["rssi_step"]]

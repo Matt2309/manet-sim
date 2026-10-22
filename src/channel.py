@@ -1,26 +1,26 @@
-"""Blocco 2 — Modello di canale.
+"""Block 2 — Channel model.
 
-RSSI in dBm per ogni istante e coppia ordinata di nodi: ``rssi[t, i, j]`` =
-potenza ricevuta da ``j`` quando trasmette ``i``, diagonale NaN. Sensibilità,
-perdite e istanti dei beacon sono del Blocco 3: l'RSSI c'è anche sotto soglia.
+RSSI in dBm for every instant and ordered pair of nodes: ``rssi[t, i, j]`` =
+power received by ``j`` when ``i`` transmits, NaN diagonal. Sensitivity,
+losses and beacon instants belong to Block 3: the RSSI exists even below threshold.
 
-Formula (perdite positive, termini casuali additivi)::
+Formula (positive losses, additive random terms)::
 
-    rssi_true = P_tx + G_tx + G_rx - PL(d)      # attenuazione con la distanza
-              + S_ij(t)                         # shadowing (simmetrico)
-              - B_own_ij(t)                     # torso di chi trasmette e riceve (simmetrico)
-              - B_others_ij(t)                  # altri corridori in mezzo (simmetrico)
-              + F_ij(t)                         # variazioni rapide (NON simmetrico)
-              + tx_offset[i] + rx_offset[j]     # scarto fisso di ogni scheda
-              - obstacles_ij(t)                 # edifici (Blocco 2b)
+    rssi_true = P_tx + G_tx + G_rx - PL(d)      # attenuation with distance
+              + S_ij(t)                         # shadowing (symmetric)
+              - B_own_ij(t)                     # torso of transmitter and receiver (symmetric)
+              - B_others_ij(t)                  # other runners in between (symmetric)
+              + F_ij(t)                         # fast variations (NOT symmetric)
+              + tx_offset[i] + rx_offset[j]     # fixed offset of each board
+              - obstacles_ij(t)                 # buildings (Block 2b)
 
-    rssi_measured = quantizza(min(rssi_true, saturazione))
+    rssi_measured = quantize(min(rssi_true, saturation))
 
-Parametri: sezione ``channel`` della config.
+Parameters: ``channel`` section of the config.
 
-Riferimenti: Agrawal e Patwari, IEEE Trans. Wireless Commun., 2009 (network
-shadowing); Wang, Tameh e Nix, IEEE Trans. Veh. Technol., 2008 (shadowing per
-link fra terminali mobili).
+References: Agrawal and Patwari, IEEE Trans. Wireless Commun., 2009 (network
+shadowing); Wang, Tameh and Nix, IEEE Trans. Veh. Technol., 2008 (per-link
+shadowing between mobile terminals).
 """
 
 from __future__ import annotations
@@ -36,38 +36,41 @@ from scipy.fft import irfft2, next_fast_len, rfft2
 from scipy.ndimage import map_coordinates
 from scipy.special import expit
 
+from src.common.arrays import off_diagonal
+from src.common.enums import ShadowingMode
 from src.mobility import MobilityResult, load_config
 
 _SPEED_OF_LIGHT = 299792458.0  # m/s
+_N_RNG_STREAMS = 4  # map, independent shadowing, offsets, fading
 
 
 # ---------------------------------------------------------------------------
-# Strutture dati
+# Data structures
 # ---------------------------------------------------------------------------
 
 
 @dataclass
 class ShadowField:
-    """Mappa 2D di shadowing (modalità ``field``)."""
+    """2D shadowing map (``field`` mode)."""
 
-    values: np.ndarray  # (nx, ny) float32, indice [ix, iy]
-    origin: tuple  # (x0, y0) in metri: posizione della cella [0, 0]
-    resolution: float  # m; passo della griglia
+    values: np.ndarray  # (nx, ny) float32, index [ix, iy]
+    origin: tuple  # (x0, y0) in meters: position of cell [0, 0]
+    resolution: float  # m; grid step
 
 
 @dataclass
 class ChannelResult:
-    """Output del Blocco 2. Matrici (T, N, N) indicizzate ``[t, i, j]`` (trasmette ``i``, riceve ``j``), diagonale NaN."""
+    """Output of Block 2. Matrices (T, N, N) indexed ``[t, i, j]`` (``i`` transmits, ``j`` receives), NaN diagonal."""
 
     t: np.ndarray  # (T,)
-    rssi_true: np.ndarray  # (T, N, N) dBm, prima di saturazione e quantizzazione
-    rssi_measured: np.ndarray  # (T, N, N) dBm, dopo saturazione e quantizzazione
+    rssi_true: np.ndarray  # (T, N, N) dBm, before saturation and quantization
+    rssi_measured: np.ndarray  # (T, N, N) dBm, after saturation and quantization
     rssi_path_loss: np.ndarray  # (T, N, N) P_tx + G_tx + G_rx - PL(d)
-    shadowing: np.ndarray  # (T, N, N) dB, contributo additivo
-    body_own: np.ndarray  # (T, N, N) dB, perdita positiva
-    body_others: np.ndarray  # (T, N, N) dB, perdita positiva
-    fading: np.ndarray  # (T, N, N) dB, contributo additivo
-    obstacles: np.ndarray  # (T, N, N) dB, perdita positiva (Blocco 2b)
+    shadowing: np.ndarray  # (T, N, N) dB, additive contribution
+    body_own: np.ndarray  # (T, N, N) dB, positive loss
+    body_others: np.ndarray  # (T, N, N) dB, positive loss
+    fading: np.ndarray  # (T, N, N) dB, additive contribution
+    obstacles: np.ndarray  # (T, N, N) dB, positive loss (Block 2b)
     tx_offset: np.ndarray  # (N,) dB
     rx_offset: np.ndarray  # (N,) dB
     shadow_field: Optional[ShadowField]
@@ -75,17 +78,17 @@ class ChannelResult:
 
 
 # ---------------------------------------------------------------------------
-# Attenuazione con la distanza e lettura
+# Attenuation with distance and reading
 # ---------------------------------------------------------------------------
 
 
 def reference_path_loss(frequency: float, reference_distance: float) -> float:
-    """Attenuazione di spazio libero a `d0`: ``20 log10(4 pi d0 f / c)`` in dB (circa 40,2 dB a 2,437 GHz con d0 = 1 m)."""
+    """Free-space attenuation at `d0`: ``20 log10(4 pi d0 f / c)`` in dB (about 40.2 dB at 2.437 GHz with d0 = 1 m)."""
     return 20.0 * math.log10(4.0 * math.pi * reference_distance * frequency / _SPEED_OF_LIGHT)
 
 
 def path_loss_db(distance: np.ndarray, channel_cfg: dict) -> np.ndarray:
-    """Modello log-distanza ``PL0 + 10 n log10(max(d, d0) / d0)``: perdita positiva in dB, forma di `distance`; sotto `d0` vale PL(d0)."""
+    """Log-distance model ``PL0 + 10 n log10(max(d, d0) / d0)``: positive loss in dB, shape of `distance`; below `d0` it equals PL(d0)."""
     pl_cfg = channel_cfg["path_loss"]
     d0 = pl_cfg["reference_distance"]
     pl0 = reference_path_loss(channel_cfg["frequency"], d0)
@@ -93,25 +96,37 @@ def path_loss_db(distance: np.ndarray, channel_cfg: dict) -> np.ndarray:
     return pl0 + 10.0 * pl_cfg["exponent"] * np.log10(d / d0)
 
 
+def _link_budget_db(channel_cfg: dict) -> float:
+    return channel_cfg["tx_power"] + channel_cfg["antenna_gain_tx"] + channel_cfg["antenna_gain_rx"]
+
+
+def distance_from_path_loss(level_dbm: float, channel_cfg: dict) -> float:
+    """Distance (m) at which path loss alone gives `level_dbm`; analytic inversion of `path_loss_db`."""
+    pl_cfg = channel_cfg["path_loss"]
+    pl = _link_budget_db(channel_cfg) - level_dbm
+    pl0 = reference_path_loss(channel_cfg["frequency"], pl_cfg["reference_distance"])
+    return float(pl_cfg["reference_distance"] * 10.0 ** ((pl - pl0) / (10.0 * pl_cfg["exponent"])))
+
+
 def measure_rssi(rssi_true: np.ndarray, measurement_cfg: dict) -> np.ndarray:
-    """Saturazione e poi quantizzazione ``round(x / step) * step``; i NaN restano NaN."""
+    """Saturation and then quantization ``round(x / step) * step``; NaNs stay NaN."""
     step = measurement_cfg["quantization_step"]
     saturated = np.minimum(rssi_true, measurement_cfg["saturation_dbm"])
     return np.round(saturated / step) * step
 
 
 # ---------------------------------------------------------------------------
-# Shadowing: modalità "field" (network shadowing)
+# Shadowing: "field" mode (network shadowing)
 # ---------------------------------------------------------------------------
 
 
 def shadow_field_sigma_p(sigma: float, delta: float) -> float:
-    """``sigma_p = sigma / sqrt(2 delta)`` in dB/sqrt(m): la varianza del link tende a `sigma^2` per ``d >> delta``."""
+    """``sigma_p = sigma / sqrt(2 delta)`` in dB/sqrt(m): the link variance tends to `sigma^2` for ``d >> delta``."""
     return sigma / math.sqrt(2.0 * delta)
 
 
 def link_variance_theory(distance: np.ndarray, sigma: float, delta: float) -> np.ndarray:
-    """Varianza teorica (dB^2) dello shadowing di un link di lunghezza `d`: ``sigma^2 [1 - (delta/d)(1 - exp(-d/delta))]``."""
+    """Theoretical variance (dB^2) of the shadowing of a link of length `d`: ``sigma^2 [1 - (delta/d)(1 - exp(-d/delta))]``."""
     d = np.asarray(distance, dtype=float)
     return sigma**2 * (1.0 - (delta / d) * (1.0 - np.exp(-d / delta)))
 
@@ -125,8 +140,8 @@ def generate_shadow_field(
     padding: float,
     rng: np.random.Generator,
 ) -> ShadowField:
-    """Mappa gaussiana 2D di shadowing, a media nulla, isotropa, autocorrelazione ``exp(-r/delta)``, varianza ``sigma_p^2``.
-    Generata per via spettrale (spettro ``(1 + (2 pi k delta)^2)^(-3/2)``) su griglia FFT allargata di `padding` m per lato, poi ritagliata. float32.
+    """2D Gaussian shadowing map, zero mean, isotropic, autocorrelation ``exp(-r/delta)``, variance ``sigma_p^2``.
+    Generated spectrally (spectrum ``(1 + (2 pi k delta)^2)^(-3/2)``) on an FFT grid enlarged by `padding` m per side, then cropped. float32.
     """
     nx = int(math.ceil((x_range[1] - x_range[0]) / resolution)) + 1
     ny = int(math.ceil((y_range[1] - y_range[0]) / resolution)) + 1
@@ -157,8 +172,8 @@ def generate_shadow_field(
 def link_shadowing(
     shadow_field: ShadowField, pos_a: np.ndarray, pos_b: np.ndarray, shadow_cfg: dict
 ) -> np.ndarray:
-    """Shadowing di L link come integrale della mappa: ``S = (1/sqrt(d)) * integrale_0^d p(x(u)) du`` (trapezi, interpolazione bilineare).
-    `pos_a`, `pos_b` (L, 2); ritorna (L,) in dB, simmetrico. Passo più largo sui link lunghi; elaborazione a blocchi di link interi.
+    """Shadowing of L links as an integral of the map: ``S = (1/sqrt(d)) * integral_0^d p(x(u)) du`` (trapezoids, bilinear interpolation).
+    `pos_a`, `pos_b` (L, 2); returns (L,) in dB, symmetric. Wider step on long links; processed in blocks of whole links.
     """
     delta = shadow_cfg["correlation_distance"]
     step_short = shadow_cfg["integration_step"]
@@ -196,7 +211,7 @@ def link_shadowing(
         coords = np.stack([(px - ox) / res, (py - oy) / res])
         vals = map_coordinates(shadow_field.values, coords, order=1, mode="nearest", output=np.float64)
 
-        # pesi trapezoidali: passo effettivo d/(n-1), metà peso agli estremi
+        # trapezoidal weights: effective step d/(n-1), half weight at the ends
         spacing = d[start:end] / (n_c - 1)
         weights = spacing[rep]
         weights = np.where((k == 0) | (k == n_c[rep] - 1), 0.5 * weights, weights)
@@ -211,7 +226,7 @@ def link_shadowing(
 def field_shadowing(
     positions: np.ndarray, shadow_field: ShadowField, shadow_cfg: dict
 ) -> np.ndarray:
-    """Shadowing (T, N, N) in dB, modalità field, da `positions` (T, N, 2): calcolato per ``i < j`` e specchiato, diagonale nulla."""
+    """Shadowing (T, N, N) in dB, field mode, from `positions` (T, N, 2): computed for ``i < j`` and mirrored, zero diagonal."""
     n_steps, n_nodes, _ = positions.shape
     iu, ju = np.triu_indices(n_nodes, k=1)
     a = positions[:, iu, :].reshape(-1, 2)
@@ -224,15 +239,15 @@ def field_shadowing(
 
 
 # ---------------------------------------------------------------------------
-# Shadowing: modalità "independent"
+# Shadowing: "independent" mode
 # ---------------------------------------------------------------------------
 
 
 def independent_shadowing(
     positions: np.ndarray, sigma: float, delta: float, rng: np.random.Generator
 ) -> np.ndarray:
-    """Shadowing (T, N, N) in dB, modalità independent: per coppia, Gauss-Markov che avanza con la distanza percorsa dai due estremi
-    (``Delta_k = |dp_i| + |dp_j|``, ``a_k = exp(-Delta_k / delta)``; Wang, Tameh e Nix). Stato iniziale stazionario, nodi fermi = costante. Simmetrico, diagonale nulla.
+    """Shadowing (T, N, N) in dB, independent mode: per pair, Gauss-Markov advancing with the distance travelled by the two endpoints
+    (``Delta_k = |dp_i| + |dp_j|``, ``a_k = exp(-Delta_k / delta)``; Wang, Tameh and Nix). Stationary initial state, still nodes = constant. Symmetric, zero diagonal.
     """
     n_steps, n_nodes, _ = positions.shape
     iu, ju = np.triu_indices(n_nodes, k=1)
@@ -257,18 +272,18 @@ def independent_shadowing(
 
 
 # ---------------------------------------------------------------------------
-# Corpi
+# Bodies
 # ---------------------------------------------------------------------------
 
 
 def own_body_loss(positions: np.ndarray, headings: np.ndarray, own_cfg: dict) -> np.ndarray:
-    """Perdita (T, N, N) in dB del torso di chi trasmette e di chi riceve: ``B_ij = L_i(phi_ij) + L_j(phi_ji)``.
-    `phi` = angolo di ``p_j - p_i`` rispetto a ``headings[i]`` (antiorario); torso a ``phi_b = +90°`` con ``mount_side: right``, ``-90°`` con ``left``.
+    """Loss (T, N, N) in dB of the torso of the transmitter and of the receiver: ``B_ij = L_i(phi_ij) + L_j(phi_ji)``.
+    `phi` = angle of ``p_j - p_i`` relative to ``headings[i]`` (counterclockwise); torso at ``phi_b = +90°`` with ``mount_side: right``, ``-90°`` with ``left``.
     ``L(phi) = max_loss * ((1 + cos(phi - phi_b)) / 2) ** lobe_exponent``.
     """
     side = own_cfg["mount_side"]
     if side not in ("right", "left"):
-        raise ValueError(f"channel.body.own.mount_side deve essere 'right' o 'left', non {side!r}")
+        raise ValueError(f"channel.body.own.mount_side must be 'right' or 'left', not {side!r}")
     phi_b = math.pi / 2.0 if side == "right" else -math.pi / 2.0
 
     v = positions[:, None, :, :] - positions[:, :, None, :]  # (T, i, j, 2): p_j - p_i
@@ -282,15 +297,15 @@ def own_body_loss(positions: np.ndarray, headings: np.ndarray, own_cfg: dict) ->
 
 
 def other_bodies_loss(positions: np.ndarray, others_cfg: dict, chunk_steps: int = 2000) -> np.ndarray:
-    """Perdita (T, N, N) in dB degli altri corridori (separato compreso) sul link `i–j`: per ogni `k` con proiezione ``0 < u < 1`` sul segmento
-    e distanza `c`, ``loss / (1 + exp((c - radius) / transition_width))``; somma su `k` con tetto `max_total_loss`. Calcolata per ``i < j`` e specchiata.
+    """Loss (T, N, N) in dB of the other runners (detached one included) on link `i–j`: for each `k` with projection ``0 < u < 1`` onto the segment
+    and distance `c`, ``loss / (1 + exp((c - radius) / transition_width))``; sum over `k` capped at `max_total_loss`. Computed for ``i < j`` and mirrored.
     """
     n_steps, n_nodes, _ = positions.shape
     out = np.zeros((n_steps, n_nodes, n_nodes))
     idx = np.arange(n_nodes)
     not_endpoint = (
         (idx[None, None, :] != idx[:, None, None]) & (idx[None, None, :] != idx[None, :, None])
-    )  # (i, j, k): k diverso da i e da j
+    )  # (i, j, k): k different from i and j
 
     for lo in range(0, n_steps, chunk_steps):
         p = positions[lo : lo + chunk_steps]
@@ -313,13 +328,13 @@ def other_bodies_loss(positions: np.ndarray, others_cfg: dict, chunk_steps: int 
 
 
 # ---------------------------------------------------------------------------
-# Variazioni rapide e scarti delle schede
+# Fast variations and board offsets
 # ---------------------------------------------------------------------------
 
 
 def rician_fading_db(shape: tuple, k_db: float, rng: np.random.Generator) -> np.ndarray:
-    """Fading di Rice a potenza media unitaria: ``F = 20 log10 |h|``, ``h = sqrt(K/(K+1)) + sqrt(1/(K+1)) z``, `z` gaussiana complessa unitaria.
-    Estrazioni indipendenti per elemento: fra due passi (0,1 s) il nodo si sposta ~0,28 m >> lambda/2 (~6 cm), e le due direzioni sono misurate in istanti diversi.
+    """Rician fading with unit mean power: ``F = 20 log10 |h|``, ``h = sqrt(K/(K+1)) + sqrt(1/(K+1)) z``, `z` unit complex Gaussian.
+    Independent draws per element: between two steps (0.1 s) the node moves ~0.28 m >> lambda/2 (~6 cm), and the two directions are measured at different instants.
     """
     k = 10.0 ** (k_db / 10.0)
     los = math.sqrt(k / (k + 1.0))
@@ -331,19 +346,19 @@ def rician_fading_db(shape: tuple, k_db: float, rng: np.random.Generator) -> np.
 
 
 def device_offsets(n_nodes: int, sigma: float, rng: np.random.Generator) -> tuple:
-    """Scarti fissi di ogni scheda, ``N(0, sigma)`` in dB, estratti una volta: (tx_offset, rx_offset), ciascuno (N,)."""
+    """Fixed offsets of each board, ``N(0, sigma)`` in dB, drawn once: (tx_offset, rx_offset), each (N,)."""
     tx = rng.normal(0.0, sigma, size=n_nodes)
     rx = rng.normal(0.0, sigma, size=n_nodes)
     return tx, rx
 
 
 def _obstacle_loss(mobility: MobilityResult, obstacles_cfg: dict) -> np.ndarray:
-    """Aggancio per il Blocco 2b (edifici OSM): non ancora implementato."""
-    raise NotImplementedError("channel.obstacles.enabled: true richiede il Blocco 2b (non ancora implementato).")
+    """Hook for Block 2b (OSM buildings): not yet implemented."""
+    raise NotImplementedError("channel.obstacles.enabled: true requires Block 2b (not yet implemented).")
 
 
 # ---------------------------------------------------------------------------
-# Simulazione del canale
+# Channel simulation
 # ---------------------------------------------------------------------------
 
 
@@ -354,35 +369,29 @@ def _set_diagonal_nan(*arrays: np.ndarray) -> None:
         arr[:, idx, idx] = np.nan
 
 
-def simulate_channel(mobility: MobilityResult, config: Union[str, Path, dict]) -> ChannelResult:
-    """Simulazione di canale del Blocco 2 (config: percorso YAML o dict con ``simulation`` e ``channel``).
-    Quattro generatori indipendenti da ``SeedSequence(simulation.seed)`` in ordine fisso (mappa, shadowing indipendente, scarti, fading): attivare una componente non cambia le altre. Componenti disattivate = 0.
-    """
-    cfg = load_config(config)
-    ch = cfg["channel"]
-    seed = cfg["simulation"]["seed"]
-    positions = mobility.positions
+def _shadowing_mode(value: str) -> ShadowingMode:
+    try:
+        return ShadowingMode(value)
+    except ValueError:
+        raise ValueError(f"channel.shadowing.mode must be 'field' or 'independent', not {value!r}") from None
+
+
+def _simulate_shadowing(
+    positions: np.ndarray,
+    sh: dict,
+    rng_field: np.random.Generator,
+    rng_indep: np.random.Generator,
+    timings: dict,
+) -> tuple[np.ndarray, Optional[ShadowField], Optional[float]]:
+    t0 = time.perf_counter()
     n_steps, n_nodes, _ = positions.shape
-    timings: dict = {}
-
-    ss = np.random.SeedSequence(seed)
-    rng_field, rng_indep, rng_device, rng_fading = (np.random.default_rng(c) for c in ss.spawn(4))
-
-    # attenuazione con la distanza
-    t0 = time.perf_counter()
-    pl0 = reference_path_loss(ch["frequency"], ch["path_loss"]["reference_distance"])
-    rssi_path_loss = ch["tx_power"] + ch["antenna_gain_tx"] + ch["antenna_gain_rx"] - path_loss_db(mobility.distances, ch)
-    timings["path_loss"] = time.perf_counter() - t0
-
-    # shadowing
-    t0 = time.perf_counter()
-    sh = ch["shadowing"]
     shadow_field: Optional[ShadowField] = None
     sigma_p = None
     shadowing = np.zeros((n_steps, n_nodes, n_nodes))
     if sh["enabled"]:
         delta = sh["correlation_distance"]
-        if sh["mode"] == "field":
+        mode = _shadowing_mode(sh["mode"])
+        if mode == ShadowingMode.FIELD:
             margin = sh["field_margin"]
             x_range = (positions[..., 0].min() - margin, positions[..., 0].max() + margin)
             y_range = (positions[..., 1].min() - margin, positions[..., 1].max() + margin)
@@ -393,13 +402,79 @@ def simulate_channel(mobility: MobilityResult, config: Union[str, Path, dict]) -
             timings["shadow_field"] = time.perf_counter() - t0
             t0 = time.perf_counter()
             shadowing = field_shadowing(positions, shadow_field, sh)
-        elif sh["mode"] == "independent":
-            shadowing = independent_shadowing(positions, sh["sigma"], delta, rng_indep)
         else:
-            raise ValueError(f"channel.shadowing.mode deve essere 'field' o 'independent', non {sh['mode']!r}")
+            shadowing = independent_shadowing(positions, sh["sigma"], delta, rng_indep)
     timings["shadowing"] = time.perf_counter() - t0
+    return shadowing, shadow_field, sigma_p
 
-    # corpi
+
+def _channel_metadata(
+    cfg: dict,
+    arrays: dict,
+    rssi_true: np.ndarray,
+    rssi_measured: np.ndarray,
+    pl0: float,
+    sigma_p: Optional[float],
+    timings: dict,
+) -> dict:
+    ch = cfg["channel"]
+    sh = ch["shadowing"]
+    n_nodes = rssi_true.shape[1]
+    off_diag = off_diagonal(n_nodes)
+    true_od = rssi_true[:, off_diag]
+    meas_od = rssi_measured[:, off_diag]
+    saturation = ch["measurement"]["saturation_dbm"]
+
+    def _std(arr: np.ndarray) -> float:
+        return float(np.std(arr[:, off_diag]))
+
+    return {
+        "seed": cfg["simulation"]["seed"],
+        "config": cfg,
+        "pl0": pl0,
+        "sigma_p": sigma_p,
+        "shadowing_mode": sh["mode"] if sh["enabled"] else None,
+        "saturated_fraction": float(np.mean(true_od > saturation)),
+        "rssi_measured_median": float(np.median(meas_od)),
+        "rssi_measured_p5": float(np.percentile(meas_od, 5)),
+        "rssi_measured_p95": float(np.percentile(meas_od, 95)),
+        "component_std": {
+            "path_loss": _std(arrays["path_loss"]),
+            "shadowing": _std(arrays["shadowing"]),
+            "body_own": _std(arrays["body_own"]),
+            "body_others": _std(arrays["body_others"]),
+            "fading": _std(arrays["fading"]),
+        },
+        "timings": timings,
+    }
+
+
+def simulate_channel(mobility: MobilityResult, config: Union[str, Path, dict]) -> ChannelResult:
+    """Block 2 channel simulation (config: YAML path or dict with ``simulation`` and ``channel``).
+    Four independent generators from ``SeedSequence(simulation.seed)`` in fixed order (map, independent shadowing, offsets, fading): enabling a component does not change the others. Disabled components = 0.
+    """
+    cfg = load_config(config)
+    ch = cfg["channel"]
+    seed = cfg["simulation"]["seed"]
+    positions = mobility.positions
+    n_steps, n_nodes, _ = positions.shape
+    timings: dict = {}
+
+    ss = np.random.SeedSequence(seed)
+    rng_field, rng_indep, rng_device, rng_fading = (np.random.default_rng(c) for c in ss.spawn(_N_RNG_STREAMS))
+
+    # attenuation with distance
+    t0 = time.perf_counter()
+    pl0 = reference_path_loss(ch["frequency"], ch["path_loss"]["reference_distance"])
+    rssi_path_loss = _link_budget_db(ch) - path_loss_db(mobility.distances, ch)
+    timings["path_loss"] = time.perf_counter() - t0
+
+    # shadowing
+    shadowing, shadow_field, sigma_p = _simulate_shadowing(
+        positions, ch["shadowing"], rng_field, rng_indep, timings
+    )
+
+    # bodies
     t0 = time.perf_counter()
     body_own = np.zeros((n_steps, n_nodes, n_nodes))
     if ch["body"]["own"]["enabled"]:
@@ -412,20 +487,20 @@ def simulate_channel(mobility: MobilityResult, config: Union[str, Path, dict]) -
         body_others = other_bodies_loss(positions, ch["body"]["others"])
     timings["body_others"] = time.perf_counter() - t0
 
-    # variazioni rapide
+    # fast variations
     t0 = time.perf_counter()
     fading = np.zeros((n_steps, n_nodes, n_nodes))
     if ch["fading"]["enabled"]:
         fading = rician_fading_db((n_steps, n_nodes, n_nodes), ch["fading"]["rician_k_db"], rng_fading)
     timings["fading"] = time.perf_counter() - t0
 
-    # scarti delle schede
+    # board offsets
     tx_offset = np.zeros(n_nodes)
     rx_offset = np.zeros(n_nodes)
     if ch["device_offset"]["enabled"]:
         tx_offset, rx_offset = device_offsets(n_nodes, ch["device_offset"]["sigma"], rng_device)
 
-    # ostacoli (Blocco 2b)
+    # obstacles (Block 2b)
     if ch["obstacles"]["enabled"]:
         obstacles = _obstacle_loss(mobility, ch["obstacles"])
     else:
@@ -446,33 +521,21 @@ def simulate_channel(mobility: MobilityResult, config: Union[str, Path, dict]) -
     arrays = [rssi_true, rssi_measured, rssi_path_loss, shadowing, body_own, body_others, fading, obstacles]
     _set_diagonal_nan(*arrays)
 
-    off_diag = ~np.eye(n_nodes, dtype=bool)
-    true_od = rssi_true[:, off_diag]
-    meas_od = rssi_measured[:, off_diag]
-    saturation = ch["measurement"]["saturation_dbm"]
-
-    def _std(arr: np.ndarray) -> float:
-        return float(np.std(arr[:, off_diag]))
-
-    metadata = {
-        "seed": seed,
-        "config": cfg,
-        "pl0": pl0,
-        "sigma_p": sigma_p,
-        "shadowing_mode": sh["mode"] if sh["enabled"] else None,
-        "saturated_fraction": float(np.mean(true_od > saturation)),
-        "rssi_measured_median": float(np.median(meas_od)),
-        "rssi_measured_p5": float(np.percentile(meas_od, 5)),
-        "rssi_measured_p95": float(np.percentile(meas_od, 95)),
-        "component_std": {
-            "path_loss": _std(rssi_path_loss),
-            "shadowing": _std(shadowing),
-            "body_own": _std(body_own),
-            "body_others": _std(body_others),
-            "fading": _std(fading),
+    metadata = _channel_metadata(
+        cfg,
+        {
+            "path_loss": rssi_path_loss,
+            "shadowing": shadowing,
+            "body_own": body_own,
+            "body_others": body_others,
+            "fading": fading,
         },
-        "timings": timings,
-    }
+        rssi_true,
+        rssi_measured,
+        pl0,
+        sigma_p,
+        timings,
+    )
 
     return ChannelResult(
         t=mobility.t,

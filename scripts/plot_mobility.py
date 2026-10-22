@@ -1,37 +1,28 @@
 #!/usr/bin/env python3
-"""Script di ispezione visiva del Blocco 1 (mobilità).
+"""Visual inspection script for Block 1 (mobility).
 
-Genera le figure diagnostiche in results/ a partire da un file di
-configurazione YAML (config/default.yaml se non specificato altrimenti).
+Generates the diagnostic figures in results/ from a YAML configuration
+file (config/default.yaml if not specified otherwise).
 """
 
-import argparse
 import itertools
 import subprocess
 import sys
 import types
 from pathlib import Path
 
-_REPO_ROOT = Path(__file__).resolve().parent.parent
-sys.path.insert(0, str(_REPO_ROOT))
-
-import matplotlib
-
-matplotlib.use("Agg")
-import matplotlib.pyplot as plt
 import numpy as np
 
-from src.mobility import (
-    Track,
-    lateral_offset_speed,
-    load_config,
-    load_track,
-    relative_speed,
-    simulate_mobility,
-)
+from _cli import make_parser  # noqa: E402
+from src.common.git import git_output
+from src.common.paths import block_dir
+from src.common.plotting import plt, save_figure
+from src.mobility import lateral_offset_speed, load_config, load_track, relative_speed, simulate_mobility, Track
 
-# Commit con il modulo di mobilità originale (OU del primo ordine e vincolo
-# di distanza minima a proiezione): serve solo al confronto prima/dopo.
+# Commit with the original mobility module (first-order OU and minimum-distance
+# projection constraint): only used for the before/after comparison.
+
+
 LEGACY_MOBILITY_COMMIT = "921bfb8"
 
 
@@ -40,7 +31,7 @@ def _suffix(cfg: dict) -> str:
 
 
 def _analysis_window(result, cfg: dict) -> tuple[int, int]:
-    """Intervallo di indici su cui calcolare le statistiche: prima della separazione se attiva (il nodo separato falserebbe la formazione), altrimenti tutta la simulazione."""
+    """Index interval on which to compute the statistics: before the separation if active (the separated node would skew the formation), otherwise the whole simulation."""
     if cfg["separation"]["enabled"]:
         idx_end = int(np.searchsorted(result.t, cfg["separation"]["start_time"]))
         return 0, max(idx_end, 1)
@@ -48,7 +39,7 @@ def _analysis_window(result, cfg: dict) -> tuple[int, int]:
 
 
 def plot_path_overview(track: Track, result, out_dir: Path, suffix: str) -> None:
-    """Percorso completo in coordinate locali, con il baricentro del gruppo in alcuni istanti."""
+    """Full route in local coordinates, with the group centroid at a few instants."""
     fig, ax = plt.subplots(figsize=(8, 8))
     ax.plot(track.x, track.y, "-", color="0.7", linewidth=1, label="percorso GPX")
 
@@ -69,15 +60,13 @@ def plot_path_overview(track: Track, result, out_dir: Path, suffix: str) -> None
     ax.set_title("Percorso completo e posizione del gruppo")
     ax.legend()
     ax.set_aspect("equal")
-    fig.tight_layout()
-    fig.savefig(out_dir / f"path_overview{suffix}.png", dpi=150)
-    plt.close(fig)
+    save_figure(fig, out_dir / f"path_overview{suffix}.png", 150)
 
 
 def plot_curve_zoom(track: Track, result, out_dir: Path, suffix: str, half_window_m: float = 8.0) -> None:
-    """Zoom sull'istante di massimo rapporto fra estensione in ascissa curvilinea e in linea d'aria (gruppo "a cavallo" di un tornante).
+    """Zoom on the instant of maximum ratio between the extent in curvilinear abscissa and in straight line (group "straddling" a hairpin).
 
-    I nodi sono uniti in ordine di ascissa curvilinea. Solo senza separazione attiva.
+    The nodes are joined in curvilinear-abscissa order. Only without active separation.
     """
     n_nodes = result.positions.shape[1]
     s_nodes = result.s_nodes  # (T, N)
@@ -115,13 +104,11 @@ def plot_curve_zoom(track: Track, result, out_dir: Path, suffix: str, half_windo
         f"estensione in linea d'aria: {extent_air[t_idx]:.2f} m"
     )
     ax.legend(fontsize=8)
-    fig.tight_layout()
-    fig.savefig(out_dir / f"curve_zoom{suffix}.png", dpi=150)
-    plt.close(fig)
+    save_figure(fig, out_dir / f"curve_zoom{suffix}.png", 150)
 
 
 def plot_pair_distances_window(result, out_dir: Path, suffix: str, cfg: dict, window_s: float = 120.0) -> None:
-    """Distanze fra tutte le coppie su `window_s` s a metà della finestra di analisi: le curve devono essere lisce (un ciclo OU = 80 campioni a correlation_time = 8 s)."""
+    """Distances between all pairs over `window_s` s in the middle of the analysis window: the curves must be smooth (one OU cycle = 80 samples at correlation_time = 8 s)."""
     n_nodes = cfg["group"]["n_nodes"]
     dt = cfg["simulation"]["dt"]
     idx_a, idx_b = _analysis_window(result, cfg)
@@ -140,13 +127,11 @@ def plot_pair_distances_window(result, out_dir: Path, suffix: str, cfg: dict, wi
     ax.set_ylabel("distanza [m]")
     ax.set_title(f"Distanze fra tutte le coppie — finestra di {window_s:.0f} s ({hi - lo} campioni)")
     ax.legend(fontsize=7, ncol=3)
-    fig.tight_layout()
-    fig.savefig(out_dir / f"pair_distances_window{suffix}.png", dpi=150)
-    plt.close(fig)
+    save_figure(fig, out_dir / f"pair_distances_window{suffix}.png", 150)
 
 
 def plot_group_extent(result, out_dir: Path, suffix: str, cfg: dict) -> None:
-    """Estensione testa-coda in ascissa curvilinea nel tempo, con longitudinal_spread e mediana osservata; solo finestra di analisi."""
+    """Head-to-tail extent in curvilinear abscissa over time, with longitudinal_spread and observed median; analysis window only."""
     idx_a, idx_b = _analysis_window(result, cfg)
     extent = np.max(result.s_nodes[idx_a:idx_b], axis=1) - np.min(result.s_nodes[idx_a:idx_b], axis=1)
     median_extent = float(np.median(extent))
@@ -163,13 +148,11 @@ def plot_group_extent(result, out_dir: Path, suffix: str, cfg: dict) -> None:
         f"finestra [{result.t[idx_a]:.0f}, {result.t[idx_b - 1]:.0f}] s ({idx_b - idx_a} campioni)"
     )
     ax.legend()
-    fig.tight_layout()
-    fig.savefig(out_dir / f"group_extent{suffix}.png", dpi=150)
-    plt.close(fig)
+    save_figure(fig, out_dir / f"group_extent{suffix}.png", 150)
 
 
 def plot_distance_histogram(result, out_dir: Path, suffix: str, cfg: dict) -> None:
-    """Istogramma delle distanze euclidee fra tutte le coppie sulla finestra di analisi, con mediana, 95° percentile e min_node_gap."""
+    """Histogram of the Euclidean distances between all pairs over the analysis window, with median, 95th percentile and min_node_gap."""
     idx_a, idx_b = _analysis_window(result, cfg)
     n_nodes = cfg["group"]["n_nodes"]
     iu, ju = np.triu_indices(n_nodes, k=1)
@@ -188,13 +171,11 @@ def plot_distance_histogram(result, out_dir: Path, suffix: str, cfg: dict) -> No
     ax.set_ylabel("conteggio")
     ax.set_title(f"Distribuzione delle distanze fra coppie ({len(pair_dist)} campioni)")
     ax.legend()
-    fig.tight_layout()
-    fig.savefig(out_dir / f"distance_histogram{suffix}.png", dpi=150)
-    plt.close(fig)
+    save_figure(fig, out_dir / f"distance_histogram{suffix}.png", 150)
 
 
 def plot_separation_detail(result, out_dir: Path, suffix: str, cfg: dict, window_s: float = 300.0) -> None:
-    """Distanza fra il nodo separato e gli altri quattro nei primi `window_s` s dopo la separazione (finestra in cui il rilevamento è in gioco), asse y logaritmico."""
+    """Distance between the separated node and the other four in the first `window_s` s after the separation (window in which detection is at stake), logarithmic y axis."""
     sep_cfg = cfg["separation"]
     node_id = sep_cfg["node_id"]
     start_time = sep_cfg["start_time"]
@@ -218,13 +199,11 @@ def plot_separation_detail(result, out_dir: Path, suffix: str, cfg: dict, window
     ax.set_ylabel("distanza [m] (scala log)")
     ax.set_title(f"Dettaglio della separazione — primi {window_s:.0f} s")
     ax.legend()
-    fig.tight_layout()
-    fig.savefig(out_dir / f"separation_detail{suffix}.png", dpi=150)
-    plt.close(fig)
+    save_figure(fig, out_dir / f"separation_detail{suffix}.png", 150)
 
 
 def print_group_stats(track: Track, result, cfg: dict) -> None:
-    """Stampa le statistiche del gruppo nella finestra di analisi: estensione longitudinale e laterale, distanze fra coppie, velocità 2D (rispetto al baricentro e laterale)."""
+    """Print the group statistics in the analysis window: longitudinal and lateral extent, pairwise distances, 2D speeds (relative to the centroid and lateral)."""
     idx_a, idx_b = _analysis_window(result, cfg)
     n_nodes = cfg["group"]["n_nodes"]
     sl = slice(idx_a, idx_b)
@@ -240,34 +219,29 @@ def print_group_stats(track: Track, result, cfg: dict) -> None:
     v_lat = lateral_offset_speed(result, track)[idx_a : max(idx_b - 1, idx_a + 1)]
     v_road = relative_speed(result)[idx_a : max(idx_b - 1, idx_a + 1)]
 
-    print(f"Statistiche del gruppo, finestra [{result.t[idx_a]:.0f}, {result.t[idx_b - 1]:.0f}] s ({idx_b - idx_a} campioni):")
+    print(f"Group statistics, window [{result.t[idx_a]:.0f}, {result.t[idx_b - 1]:.0f}] s ({idx_b - idx_a} samples):")
     print(f"  sigma_long = {result.metadata['sigma_long']:.4f} m, sigma_lat = {result.metadata['sigma_lat']:.4f} m")
-    print(f"  estensione longitudinale: mediana {np.median(ext_long):.2f} m, p95 {np.percentile(ext_long, 95):.2f} m")
-    print(f"  estensione laterale:      mediana {np.median(ext_lat):.2f} m, p95 {np.percentile(ext_lat, 95):.2f} m")
+    print(f"  longitudinal extent: median {np.median(ext_long):.2f} m, p95 {np.percentile(ext_long, 95):.2f} m")
+    print(f"  lateral extent:      median {np.median(ext_lat):.2f} m, p95 {np.percentile(ext_lat, 95):.2f} m")
     print(
-        f"  distanza fra coppie: mediana {np.median(pair):.2f} m, p95 {np.percentile(pair, 95):.2f} m, "
-        f"p1 {np.percentile(pair, 1):.2f} m; campioni sotto 1 m: {int(np.sum(pair < 1.0))} su {len(pair)} "
+        f"  pairwise distance: median {np.median(pair):.2f} m, p95 {np.percentile(pair, 95):.2f} m, "
+        f"p1 {np.percentile(pair, 1):.2f} m; samples below 1 m: {int(np.sum(pair < 1.0))} out of {len(pair)} "
         f"({100 * np.mean(pair < 1.0):.4f} %)"
     )
     for label, v in (
-        ("2D rispetto al baricentro", v_full),
-        ("2D dello scostamento laterale", v_lat),
-        ("stradale (s, l)", v_road),
+        ("2D relative to the centroid", v_full),
+        ("2D of the lateral offset", v_lat),
+        ("road (s, l)", v_road),
     ):
-        print(f"  velocità {label}: p99 {np.percentile(v, 99):.2f} m/s, max {v.max():.2f} m/s")
+        print(f"  speed {label}: p99 {np.percentile(v, 99):.2f} m/s, max {v.max():.2f} m/s")
 
 
 def _git_show(path: str) -> str:
-    return subprocess.run(
-        ["git", "-C", str(_REPO_ROOT), "show", f"{LEGACY_MOBILITY_COMMIT}:{path}"],
-        check=True,
-        capture_output=True,
-        text=True,
-    ).stdout
+    return git_output("show", f"{LEGACY_MOBILITY_COMMIT}:{path}")
 
 
 def legacy_relative_speed(cfg: dict) -> np.ndarray:
-    """Velocità relativa al baricentro col modulo originale (letto dal commit `LEGACY_MOBILITY_COMMIT`), stessa definizione di `relative_speed`. Solleva se git non è disponibile."""
+    """Speed relative to the centroid with the original module (read from commit `LEGACY_MOBILITY_COMMIT`), same definition as `relative_speed`. Raises if git is not available."""
     import yaml
 
     module = types.ModuleType("mobility_legacy")
@@ -290,20 +264,20 @@ def legacy_relative_speed(cfg: dict) -> np.ndarray:
 
 
 def plot_relative_speed(result, out_dir: Path, suffix: str, cfg: dict) -> dict:
-    """Distribuzione della velocità relativa al baricentro (passo dt, finestra di analisi) con `max_relative_speed_p99`; sovrappone il modulo originale se leggibile da git. Restituisce i 99° percentili."""
+    """Distribution of the speed relative to the centroid (dt step, analysis window) with `max_relative_speed_p99`; overlays the original module if readable from git. Returns the 99th percentiles."""
     idx_a, idx_b = _analysis_window(result, cfg)
     v_new = relative_speed(result)[idx_a : max(idx_b - 1, idx_a + 1)].ravel()
     limit = cfg["group"]["max_relative_speed_p99"]
-    p99 = {"dopo": float(np.percentile(v_new, 99))}
+    p99 = {"after": float(np.percentile(v_new, 99))}
 
     series = [("dopo (2° ordine + repulsione)", v_new, "tab:blue")]
     try:
         v_old_all = legacy_relative_speed(cfg)
         v_old = v_old_all[idx_a : max(idx_b - 1, idx_a + 1)].ravel()
         series.insert(0, ("prima (OU del 1° ordine + vincolo)", v_old, "tab:red"))
-        p99["prima"] = float(np.percentile(v_old, 99))
+        p99["before"] = float(np.percentile(v_old, 99))
     except (subprocess.CalledProcessError, FileNotFoundError) as exc:
-        print(f"confronto con il modulo originale saltato: {exc}")
+        print(f"comparison with the original module skipped: {exc}")
 
     bins = np.logspace(-2, np.log10(max(v.max() for _, v, _ in series) * 1.05), 80)
     fig, ax = plt.subplots(figsize=(9, 5))
@@ -316,14 +290,12 @@ def plot_relative_speed(result, out_dir: Path, suffix: str, cfg: dict) -> dict:
     ax.set_ylabel("densità")
     ax.set_title(f"Velocità dei nodi relativa al baricentro, a passo dt — {len(v_new)} campioni")
     ax.legend(fontsize=8)
-    fig.tight_layout()
-    fig.savefig(out_dir / f"relative_speed{suffix}.png", dpi=150)
-    plt.close(fig)
+    save_figure(fig, out_dir / f"relative_speed{suffix}.png", 150)
     return p99
 
 
 def plot_speed_profile(track: Track, out_dir: Path, suffix: str) -> None:
-    """Profilo di velocità lungo il percorso, grezzo e lisciato sovrapposti."""
+    """Speed profile along the route, raw and smoothed overlaid."""
     fig, ax = plt.subplots(figsize=(9, 4))
     ax.plot(track.s, track.speed_raw, color="0.7", linewidth=0.7, label="velocità grezza")
     ax.plot(track.s, track.speed, color="tab:blue", linewidth=1.5, label="velocità lisciata")
@@ -331,32 +303,24 @@ def plot_speed_profile(track: Track, out_dir: Path, suffix: str) -> None:
     ax.set_ylabel("velocità [m/s]")
     ax.set_title("Profilo di velocità lungo il percorso")
     ax.legend()
-    fig.tight_layout()
-    fig.savefig(out_dir / f"speed_profile{suffix}.png", dpi=150)
-    plt.close(fig)
+    save_figure(fig, out_dir / f"speed_profile{suffix}.png", 150)
 
 
 def main() -> None:
-    parser = argparse.ArgumentParser(description="Genera le figure di ispezione del modulo di mobilità")
-    parser.add_argument(
-        "config",
-        nargs="?",
-        default=str(_REPO_ROOT / "config" / "default.yaml"),
-        help="percorso del file di configurazione YAML",
-    )
+    parser = make_parser("Generate the inspection figures of the mobility module", config_help="path to the YAML configuration file")
     args = parser.parse_args()
 
     cfg = load_config(args.config)
     track = load_track(cfg)
     result = simulate_mobility(cfg)
 
-    out_dir = _REPO_ROOT / "results"
-    out_dir.mkdir(exist_ok=True)
+    out_dir = block_dir(1)
+    out_dir.mkdir(parents=True, exist_ok=True)
     suffix = _suffix(cfg)
 
     plot_path_overview(track, result, out_dir, suffix)
     if cfg["separation"]["enabled"]:
-        print("separation.enabled=true: curve_zoom saltato (istante di tornante poco significativo).")
+        print("separation.enabled=true: curve_zoom skipped (hairpin instant not meaningful).")
     else:
         plot_curve_zoom(track, result, out_dir, suffix)
     plot_pair_distances_window(result, out_dir, suffix, cfg)
@@ -368,9 +332,9 @@ def main() -> None:
     p99 = plot_relative_speed(result, out_dir, suffix, cfg)
     print_group_stats(track, result, cfg)
     for label, value in p99.items():
-        print(f"p99 della velocità relativa al baricentro, {label}: {value:.2f} m/s")
+        print(f"p99 of the speed relative to the centroid, {label}: {value:.2f} m/s")
 
-    print(f"Figure salvate in {out_dir} (suffisso '{suffix}')")
+    print(f"Figures saved in {out_dir} (suffix '{suffix}')")
 
 
 if __name__ == "__main__":

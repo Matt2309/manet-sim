@@ -1,60 +1,38 @@
 #!/usr/bin/env python3
-"""Script di ispezione visiva del Blocco 4 (rilevatore).
+"""Visual inspection script for Block 4 (detector).
 
-Legge ``results/detection/`` (da ``run_detection_experiment.py``) e rifà una
-corsa ``slowdown`` (Blocchi 1-3 dalla cache) per le figure di dettaglio.
-Salva le figure in ``results/`` e stampa R, NIS media, tabelle al punto di
-lavoro e tempi. Config: config/default.yaml se non indicata.
+Reads ``results/block4/`` (from ``run_detection_experiment.py``) and redoes a
+``slowdown`` run (Blocks 1-3 from the cache) for the detail figures.
+Saves the figures in ``results/block4/`` and prints R, mean NIS, tables at the working
+point and timings. Config: config/default.yaml if not specified.
 """
 
-import argparse
 import csv
-import sys
 from pathlib import Path
 
-_REPO_ROOT = Path(__file__).resolve().parent.parent
-sys.path.insert(0, str(_REPO_ROOT))
-
-import matplotlib
-
-matplotlib.use("Agg")
-import matplotlib.pyplot as plt
 import numpy as np
 from scipy.stats import chi2
 
-from src.detector import build_inputs, lost_alarm, pre_alarm, system_alarm
+from _cli import load_block4_config, make_parser  # noqa: E402
+from src.common.paths import block_dir
+from src.common.plotting import INK, INK_2, plt, save_figure, style_axes, ZERO_FA_PLOT
+from src.detector import build_inputs, lost_alarm, pre_alarm
 from src.experiment import load_results, print_summary
 from src.kalman import predict_links
 from src.metrics import best_over_sigma
-from src.mobility import load_config
-from src.refinement import block4_config
 from src.simulator import experiment_runs, load_or_simulate
 
-# Palette categorica (ordine fisso): blu, arancio, acqua; testo e griglia neutri.
+# Categorical palette (fixed order): blue, orange, teal; neutral text and grid.
 C_LEVEL, C_SLOPE, C_BOTH = "#2a78d6", "#eb6834", "#1baf7a"
+
+
 MODE_COLORS = {"level": C_LEVEL, "slope": C_SLOPE, "both": C_BOTH}
 MODE_LABELS = {"level": "livello", "slope": "pendenza", "both": "livello + pendenza"}
 SIGMA_COLORS = ("#2a78d6", "#eb6834", "#1baf7a", "#eda100")
-INK, INK_2, GRID = "#0b0b0b", "#52514e", "#e3e2dd"
 
-# Finestra dei grafici di dettaglio attorno al distacco, in secondi.
+# Window of the detail plots around the separation, in seconds.
 BEFORE_S = 60.0
 AFTER_S = 180.0
-# Un'ascissa log non rappresenta zero: i falsi allarmi nulli si disegnano a questo valore (solo grafica).
-ZERO_FA_PLOT = 0.03
-
-
-def style_axes(ax):
-    ax.grid(True, color=GRID, linewidth=0.6)
-    ax.set_axisbelow(True)
-    for side in ("top", "right"):
-        ax.spines[side].set_visible(False)
-    for side in ("left", "bottom"):
-        ax.spines[side].set_color(INK_2)
-    ax.tick_params(colors=INK_2, labelsize=9)
-    ax.xaxis.label.set_color(INK_2)
-    ax.yaxis.label.set_color(INK_2)
-    ax.title.set_color(INK)
 
 
 def read_runs(path: Path) -> list:
@@ -71,12 +49,12 @@ def rows_for(rows, **match):
 
 
 # ---------------------------------------------------------------------------
-# Figure 1-2: corsa di dettaglio
+# Figures 1-2: detail run
 # ---------------------------------------------------------------------------
 
 
 def detail_run(config, cache_dir, details):
-    """Rifà la prima corsa ``slowdown``: Blocco 4 con ``sigma_a`` di default."""
+    """Redoes the first ``slowdown`` run: Block 4 with the default ``sigma_a``."""
     info = next(r for r in experiment_runs(config) if r["scenario"] == "slowdown")
     run = load_or_simulate(info["config"], cache_dir)
     sigma_a = config["kalman"]["sigma_a"]
@@ -100,7 +78,7 @@ def plot_kalman_link(info, run, kres, config, path):
         ax, ax2 = axes[0, col], axes[1, col]
         beacons = kres.received[i, :, j] & (kres.times[i] >= lo) & (kres.times[i] <= hi)
         ax.plot(kres.times[i, beacons], run["rssi"][i, beacons, j], ".", ms=4, color=INK_2, label="beacon")
-        # la stima si traccia solo finché l'ultimo aggiornamento non è più vecchio di fusion.max_age
+        # the estimate is drawn only while the last update is not older than fusion.max_age
         fresh = est["age"][sel, i, j] <= config["fusion"]["max_age"]
         r = np.where(fresh, est["r"][sel, i, j], np.nan)
         sd = np.where(fresh, np.sqrt(est["p00"][sel, i, j]), np.nan)
@@ -110,7 +88,7 @@ def plot_kalman_link(info, run, kres, config, path):
         ax2.axhline(0.0, color=INK_2, linewidth=0.6)
         for a in (ax, ax2):
             a.axvline(start, color=INK, linestyle=":", linewidth=1.0)
-            style_axes(a)
+            style_axes(a, title_color=True)
         ax.set_title(title, fontsize=11)
         ax.set_ylabel("RSSI (dBm)")
         ax2.set_ylabel("pendenza (dB/s)")
@@ -119,9 +97,7 @@ def plot_kalman_link(info, run, kres, config, path):
         if col == 0:
             ax.legend(frameon=False, fontsize=9, loc="lower left")
     fig.suptitle(f"Kalman per link (σ_a = {kres.sigma_a:g} dB/s², R = {kres.measurement_noise:.2f} dB²)", color=INK)
-    fig.tight_layout()
-    fig.savefig(path, dpi=140)
-    plt.close(fig)
+    save_figure(fig, path, 140)
 
 
 def shade_intervals(ax, t, state, color, label=None):
@@ -152,8 +128,8 @@ def plot_fused_index(info, run, inputs, config, path):
         ax.axhline(thr, color=INK_2, linestyle="--", linewidth=1.0, label="soglia")
         ax.axvline(start, color=INK, linestyle=":", linewidth=1.0)
         ax.set_ylabel(label)
-        style_axes(ax)
-    # intervalli di allarme dell'osservatore mostrato (pre-allarme e "perso", ambito fuso)
+        style_axes(ax, title_color=True)
+    # alarm intervals of the observer shown (pre-alarm and "lost", fused scope)
     pre = pre_alarm(inputs.level["fused"], inputs.slope["fused"], inputs.rx_ok, t, d, valid=inputs.valid)
     lost = lost_alarm(inputs.silence, inputs.rx_ok, t, d, inputs.valid, **inputs.lost_kwargs())
     for ax in axes:
@@ -165,18 +141,16 @@ def plot_fused_index(info, run, inputs, config, path):
     axes[1].set_ylim(-4.0, 3.0)
     axes[0].set_title(f"Bersaglio = nodo separato ({node}); allarmi dell'osservatore {fused_obs} "
                       f"(modalità {d['mode']}, ambito fuso)", color=INK, fontsize=11)
-    fig.tight_layout()
-    fig.savefig(path, dpi=140)
-    plt.close(fig)
+    save_figure(fig, path, 140)
 
 
 # ---------------------------------------------------------------------------
-# Figure 3-6: risultati salvati
+# Figures 3-6: saved results
 # ---------------------------------------------------------------------------
 
 
 def curve(rows, sigma_a, scope, mode, scenario):
-    """Curva (falsi allarmi/ora, P_d) dei soli punti ammissibili, ordinata per soglia."""
+    """Curve (false alarms/hour, P_d) of the feasible points only, sorted by threshold."""
     sel = sorted(
         rows_for(rows, sigma_a=sigma_a, scope=scope, mode=mode, variant="both", scenario=scenario, feasible=1),
         key=lambda r: r["threshold"],
@@ -194,7 +168,7 @@ def tradeoff_axes(axes, config):
         ax.set_xlabel(f"falsi allarmi per ora (episodi; zero disegnato a {ZERO_FA_PLOT:g})")
         ax.set_title(scenario, fontsize=11)
         ax.set_ylim(-0.03, 1.03)
-        style_axes(ax)
+        style_axes(ax, title_color=True)
     axes[0].set_ylabel(f"probabilità di rilevamento entro {config['metrics']['success_distance']:g} m")
 
 
@@ -208,15 +182,13 @@ def plot_tradeoff(rows, config, sigmas, path):
             for ax, scenario in zip(axes, ("slowdown", "stop")):
                 x, y = curve(rows, sigma_a, scope, mode, scenario)
                 if len(x) == 0:
-                    continue  # nessun punto ammissibile
+                    continue  # no feasible point
                 ax.plot(x, y, style, color=MODE_COLORS[mode], linewidth=1.5, marker="o", ms=3,
                         label=f"{MODE_LABELS[mode]}, {'fuso' if scope == 'fused' else 'pairwise'} (σ_a={sigma_a:g})")
     axes[0].legend(frameon=False, fontsize=8, loc="lower right")
     fig.suptitle("Compromesso rilevamento / falsi allarmi (pre-allarme + perso, miglior σ_a, solo punti ammissibili)",
                  color=INK)
-    fig.tight_layout()
-    fig.savefig(path, dpi=140)
-    plt.close(fig)
+    save_figure(fig, path, 140)
 
 
 def plot_sigma_sweep(rows, config, sigmas, path):
@@ -226,13 +198,11 @@ def plot_sigma_sweep(rows, config, sigmas, path):
         for ax, scenario in zip(axes, ("slowdown", "stop")):
             x, y = curve(rows, sigma_a, "fused", "both", scenario)
             if len(x) == 0:
-                continue  # nessun punto ammissibile
+                continue  # no feasible point
             ax.plot(x, y, color=SIGMA_COLORS[n], linewidth=1.5, marker="o", ms=3, label=f"σ_a = {sigma_a:g} dB/s²")
     axes[0].legend(frameon=False, fontsize=9, loc="lower right")
     fig.suptitle("Effetto di σ_a (modalità livello + pendenza, ambito fuso, solo punti ammissibili)", color=INK)
-    fig.tight_layout()
-    fig.savefig(path, dpi=140)
-    plt.close(fig)
+    save_figure(fig, path, 140)
 
 
 def plot_delay(rows, details, config, path):
@@ -269,12 +239,10 @@ def plot_delay(rows, details, config, path):
             if field == "distance":
                 ax.axvline(dist_limit, color=INK, linestyle=":", linewidth=1.0)
             ax.legend(frameon=False, fontsize=9)
-            style_axes(ax)
+            style_axes(ax, title_color=True)
         fig.suptitle(f"Punto di lavoro: modalità livello + pendenza, ambito fuso, σ_a = {sigma_a:g}, "
                      f"soglia {best['threshold']:g} dBm", color=INK)
-    fig.tight_layout()
-    fig.savefig(path, dpi=140)
-    plt.close(fig)
+    save_figure(fig, path, 140)
 
 
 def plot_nis(details, config, sigmas, path):
@@ -296,21 +264,16 @@ def plot_nis(details, config, sigmas, path):
     ax.set_ylabel("densità")
     ax.set_title("NIS nel gruppo senza distacco", color=INK)
     ax.legend(frameon=False, fontsize=9)
-    style_axes(ax)
-    fig.tight_layout()
-    fig.savefig(path, dpi=140)
-    plt.close(fig)
+    style_axes(ax, title_color=True)
+    save_figure(fig, path, 140)
 
 
 def main() -> None:
-    parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("config", nargs="?", default=str(_REPO_ROOT / "config" / "default.yaml"))
-    parser.add_argument("--cache-dir", default=str(_REPO_ROOT / "results" / "cache"))
-    parser.add_argument("--in-dir", default=str(_REPO_ROOT / "results" / "detection"))
-    parser.add_argument("--out-dir", default=str(_REPO_ROOT / "results"))
+    parser = make_parser(__doc__, cache_dir=True, out_dir=block_dir(4))
+    parser.add_argument("--in-dir", default=str(block_dir(4)))
     args = parser.parse_args()
 
-    config = block4_config(load_config(args.config))  # Blocco 6: i default sono cambiati, qui valgono quelli del Blocco 4
+    config = load_block4_config(args.config)  # Block 6: the defaults changed, here those of Block 4 apply
     out_dir = Path(args.out_dir)
     out_dir.mkdir(parents=True, exist_ok=True)
     rows, details = load_results(Path(args.in_dir))
@@ -318,20 +281,20 @@ def main() -> None:
 
     print_summary(rows, details, config)
     print(
-        f"\nTempi: Blocco 4 su una corsa (un sigma_a) {float(details['time_block4_one_run']):.2f} s;"
-        f" sweep {float(details['time_sweep']):.1f} s; Blocchi 1-3 (con cache) {float(details['time_blocks123_cache']):.1f} s;"
-        f" esperimento intero {float(details['time_experiment']):.1f} s"
+        f"\nTimings: Block 4 on one run (one sigma_a) {float(details['time_block4_one_run']):.2f} s;"
+        f" sweep {float(details['time_sweep']):.1f} s; Blocks 1-3 (with cache) {float(details['time_blocks123_cache']):.1f} s;"
+        f" whole experiment {float(details['time_experiment']):.1f} s"
     )
 
     info, run, inputs, kres = detail_run(config, Path(args.cache_dir), details)
-    print(f"\nCorsa di dettaglio: slowdown, nodo {info['node']}, distacco a {run['sep_start']:.1f} s")
+    print(f"\nDetail run: slowdown, node {info['node']}, separation at {run['sep_start']:.1f} s")
     plot_kalman_link(info, run, kres, config, out_dir / "kalman_link.png")
     plot_fused_index(info, run, inputs, config, out_dir / "fused_index.png")
     plot_tradeoff(rows, config, sigmas, out_dir / "detection_tradeoff.png")
     plot_sigma_sweep(rows, config, sigmas, out_dir / "sigma_a_sweep.png")
     plot_delay(rows, details, config, out_dir / "detection_delay.png")
     plot_nis(details, config, sigmas, out_dir / "nis.png")
-    print(f"Figure salvate in {out_dir}")
+    print(f"Figures saved to {out_dir}")
 
 
 if __name__ == "__main__":

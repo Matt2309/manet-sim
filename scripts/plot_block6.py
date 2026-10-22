@@ -1,51 +1,32 @@
 #!/usr/bin/env python3
-"""Figure del Blocco 6 per la tesi (``results/block6/``).
+"""Block 6 figures for the thesis (``results/block6/``).
 
-Legge ``results/block6/results.pkl`` (da ``run_block6_experiment.py``). Etichette in italiano, leggibili in bianco e nero (stili di linea e marcatori
-diversi oltre al colore), niente titoli lunghi nella figura. La figura ``burst_example`` rifà dalla cache una corsa con una raffica lunga.
-Config: config/default.yaml se non indicata.
+Reads ``results/block6/results.pkl`` (from ``run_block6_experiment.py``). Labels in Italian, readable in black and white (different line styles and
+markers besides color), no long titles in the figure. The ``burst_example`` figure redoes from the cache a run with a long burst.
+Config: config/default.yaml if not given.
 """
 
-import argparse
 import math
-import sys
 from pathlib import Path
 
-_REPO_ROOT = Path(__file__).resolve().parent.parent
-sys.path.insert(0, str(_REPO_ROOT))
-
-import matplotlib
-
-matplotlib.use("Agg")
-import matplotlib.pyplot as plt
 import numpy as np
 
+from _cli import make_parser  # noqa: E402
+from src.common.config import apply_overrides
+from src.common.io import load_pickle
+from src.common.paths import block_dir
+from src.common.plotting import GRID, INK, INK_2, plt, save_figure, SCEN_LABEL, style_axes, ZERO_FA_PLOT
 from src.detector import deafness, lost_alarm, reception_features
-from src.final import LOST, sensitivity_cases
-from src.metrics import wilson_interval
+from src.final import sensitivity_cases
+from src.metrics import SEPARATED
 from src.mobility import load_config
-from src.refinement import SEPARATED, apply_overrides, load_pickle
 from src.simulator import run_from_channel
 
-INK, INK_2, GRID = "#0b0b0b", "#52514e", "#e3e2dd"
+
 COLORS = {"media": "#2a78d6", "migliore": "#eb6834", "coppia": "#52514e"}
 STYLES = {"media": "-", "migliore": "--", "coppia": ":"}
 MARKERS = {"media": "o", "migliore": "s", "coppia": "^"}
-SCEN_LABEL = {"slowdown": "rallenta", "stop": "si ferma"}
-ZERO_FA_PLOT = 0.03  # un'ascissa log non rappresenta zero: i falsi allarmi nulli si disegnano qui (solo grafica)
 DPI = 200
-
-
-def style_axes(ax):
-    ax.grid(True, color=GRID, linewidth=0.6)
-    ax.set_axisbelow(True)
-    for side in ("top", "right"):
-        ax.spines[side].set_visible(False)
-    for side in ("left", "bottom"):
-        ax.spines[side].set_color(INK_2)
-    ax.tick_params(colors=INK_2, labelsize=9)
-    ax.xaxis.label.set_color(INK_2)
-    ax.yaxis.label.set_color(INK_2)
 
 
 def figure_tradeoff(res, out):
@@ -70,9 +51,7 @@ def figure_tradeoff(res, out):
         ax.set_title(SCEN_LABEL[scenario], fontsize=10, color=INK)
     axes[0].set_ylabel("$P_d$ entro 30 m")
     axes[0].legend(frameon=False, fontsize=9, loc="lower right", title="curve; marcatore = soglia congelata", title_fontsize=8)
-    fig.tight_layout()
-    fig.savefig(out / "final_tradeoff.png", dpi=DPI)
-    plt.close(fig)
+    save_figure(fig, out / "final_tradeoff.png", DPI)
 
 
 def _cdf(values, xs):
@@ -95,9 +74,7 @@ def figure_distance(res, out):
     ax.set_xlim(0, 60)
     ax.set_ylim(0, 1.03)
     ax.legend(frameon=False, fontsize=9, loc="lower right")
-    fig.tight_layout()
-    fig.savefig(out / "detection_distance.png", dpi=DPI)
-    plt.close(fig)
+    save_figure(fig, out / "detection_distance.png", DPI)
 
 
 def figure_delay(res, out):
@@ -119,9 +96,7 @@ def figure_delay(res, out):
         if missed:
             ax.text(0.98, 0.55, f"{missed} mai rilevati", transform=ax.transAxes, ha="right", fontsize=9, color=INK_2)
     axes[0].set_ylabel("numero di corse")
-    fig.tight_layout()
-    fig.savefig(out / "detection_delay.png", dpi=DPI)
-    plt.close(fig)
+    save_figure(fig, out / "detection_delay.png", DPI)
 
 
 def _errbar(ax, x, y, lo, hi, marker, filled, color="#0b0b0b", offset=0.0, **kw):
@@ -158,9 +133,7 @@ def figure_tuning_vs_test(res, out):
     axes[0].plot([], [], "o", mfc="white", color=INK, label="taratura")
     axes[0].plot([], [], "o", color=INK, label="verifica")
     axes[0].legend(frameon=False, fontsize=9, loc="lower left")
-    fig.tight_layout()
-    fig.savefig(out / "tuning_vs_test.png", dpi=DPI)
-    plt.close(fig)
+    save_figure(fig, out / "tuning_vs_test.png", DPI)
 
 
 def figure_sensitivity(res, out):
@@ -172,7 +145,7 @@ def figure_sensitivity(res, out):
     ys = np.arange(len(cases))[::-1]
     for ax, (scenario, label) in zip(axes, panels):
         style_axes(ax)
-        ax.axhspan(ys[0] - 0.5, ys[0] + 0.5, color=GRID, alpha=0.8, zorder=0)  # la base in evidenza
+        ax.axhspan(ys[0] - 0.5, ys[0] + 0.5, color=GRID, alpha=0.8, zorder=0)  # the base highlighted
         for y, key in zip(ys, cases):
             r = sens[key]
             for block, filled, off in ((r["frozen"], True, 0.13), (r["retuned"], False, -0.13)):
@@ -197,9 +170,7 @@ def figure_sensitivity(res, out):
     axes[0].plot([], [], "o", color=INK, label="soglia congelata")
     axes[0].plot([], [], "o", mfc="white", color=INK, label="soglia ritarata")
     axes[0].legend(frameon=False, fontsize=9, loc="lower left")
-    fig.tight_layout()
-    fig.savefig(out / "sensitivity.png", dpi=DPI)
-    plt.close(fig)
+    save_figure(fig, out / "sensitivity.png", DPI)
 
 
 def figure_burst_example(res, config, cache_dir, out):
@@ -256,17 +227,12 @@ def figure_burst_example(res, config, cache_dir, out):
     axes[2].set_ylabel("allarme 'perso'\n(una riga per vicino)")
     axes[2].set_xlabel(f"tempo (s); ricevitore {node}, banda grigia = raffica di {length:.0f} s")
     axes[2].set_xlim(lo, hi)
-    fig.tight_layout()
-    fig.savefig(out / "burst_example.png", dpi=DPI)
-    plt.close(fig)
+    save_figure(fig, out / "burst_example.png", DPI)
     return best, node, length
 
 
 def main() -> None:
-    parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("config", nargs="?", default=str(_REPO_ROOT / "config" / "default.yaml"))
-    parser.add_argument("--cache-dir", default=str(_REPO_ROOT / "results" / "cache"))
-    parser.add_argument("--out-dir", default=str(_REPO_ROOT / "results" / "block6"))
+    parser = make_parser(__doc__, cache_dir=True, out_dir=block_dir(6))
     args = parser.parse_args()
     out = Path(args.out_dir)
     config = load_config(args.config)
@@ -277,7 +243,7 @@ def main() -> None:
     figure_tuning_vs_test(res, out)
     figure_sensitivity(res, out)
     best, node, length = figure_burst_example(res, config, Path(args.cache_dir), out)
-    print(f"Figure salvate in {out} (burst_example: punto {best}, ricevitore {node}, raffica di {length:.1f} s)")
+    print(f"Figures saved to {out} (burst_example: point {best}, receiver {node}, burst of {length:.1f} s)")
 
 
 if __name__ == "__main__":

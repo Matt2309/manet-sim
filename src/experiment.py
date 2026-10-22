@@ -1,11 +1,11 @@
-"""Esperimento del Blocco 4: lavoro per corsa e sweep.
+"""Block 4 experiment: per-run work and sweep.
 
-Per ogni corsa (scenario, indice) e ogni ``σ_a``: Kalman → tabelle →
-fusione → rilevatore su tutta la griglia di soglie, con i Blocchi 1-3 letti
-dalla cache (`src/simulator.py`). Le corse sono indipendenti: si eseguono in
-parallelo, e il risultato non dipende dal numero di processi.
+For each run (scenario, index) and each ``σ_a``: Kalman → tables →
+fusion → detector over the whole threshold grid, with Blocks 1-3 read
+from the cache (`src/simulator.py`). Runs are independent: they execute in
+parallel, and the result does not depend on the number of processes.
 
-Parametri: sezioni ``metrics`` e ``detector`` della config.
+Parameters: ``metrics`` and ``detector`` sections of the config.
 """
 
 from __future__ import annotations
@@ -13,57 +13,57 @@ from __future__ import annotations
 import csv
 import math
 import time
-from concurrent.futures import ProcessPoolExecutor
 from pathlib import Path
 
 import numpy as np
 
+from src.common.parallel import parallel_map
 from src.detector import build_inputs
+from src.common.enums import Scenario
 from src.metrics import (
     MODES,
     SCOPES,
     aggregate,
     best_over_sigma,
     evaluate_run,
-    min_distance_to_group,
-    summarize_none,
-    summarize_separated,
+    run_summarizer,
+    split_by_scenario,
 )
 from src.simulator import cache_path, load_or_simulate
 
 
 
 def nis_bin_edges(config: dict) -> np.ndarray:
-    """Estremi dell'istogramma della NIS da ``metrics.nis_histogram`` = [inizio, fine, passo] (solo per il grafico)."""
+    """Edges of the NIS histogram from ``metrics.nis_histogram`` = [start, stop, step] (for the plot only)."""
     start, stop, step = config["metrics"]["nis_histogram"]
     return np.linspace(start, stop, int(round((stop - start) / step)) + 1)
 
 
 def pooled_fading_variance(runs: list, cache_dir: Path) -> float:
-    """Varianza del fading (dB²) nel gruppo: media sulle corse ``none`` delle varianze fuori diagonale."""
+    """Fading variance (dB²) in the group: mean over the ``none`` runs of the off-diagonal variances."""
     values = []
     for run in runs:
-        if run["scenario"] == "none":
+        if run["scenario"] == Scenario.NONE:
             with np.load(cache_path(run["config"], cache_dir)) as f:
                 values.append(float(f["fading_var"]))
     return float(np.mean(values))
 
 
 def process_run(args: tuple) -> dict:
-    """Blocco 4 su una corsa per un ``σ_a``; `args` = (corsa, config, cartella di cache, ``σ_a``, ``R``).
+    """Block 4 on one run for one ``σ_a``; `args` = (run, config, cache directory, ``σ_a``, ``R``).
 
-    ``none``: `evaluate_run` su tutti i bersagli e NIS (somma, conteggio, istogramma, ``nis_over``);
-    con distacco: ritagliata sul nodo separato. Restituisce ``scenario``, ``index``, ``results``, ``elapsed``.
+    ``none``: `evaluate_run` on all targets and NIS (sum, count, histogram, ``nis_over``);
+    with separation: cropped to the separated node. Returns ``scenario``, ``index``, ``results``, ``elapsed``.
     """
     run_info, config, cache_dir, sigma_a, R = args
     t0 = time.perf_counter()
     run = load_or_simulate(run_info["config"], cache_dir)
     inputs, kres = build_inputs(run, config, sigma_a, R)
     out = {"scenario": run_info["scenario"], "index": run_info["index"]}
-    t = run["t"]
-    if run_info["scenario"] == "none":
-        warmup = config["detector"]["warmup"]
-        out["results"] = evaluate_run(inputs, config, lambda s: summarize_none(s, t, warmup))
+    is_none = run_info["scenario"] == Scenario.NONE
+    summarize, node = run_summarizer(run, config, is_none)
+    if is_none:
+        out["results"] = evaluate_run(inputs, config, summarize)
         nis = kres.nis[np.isfinite(kres.nis)]
         out["nis_sum"] = float(nis.sum())
         out["nis_count"] = int(len(nis))
@@ -71,35 +71,21 @@ def process_run(args: tuple) -> dict:
         out["nis_hist"] = np.histogram(nis, bins=edges)[0]
         out["nis_over"] = int((nis >= edges[-1]).sum())
     else:
-        node = run["sep_node"]
-        idx_start = int(np.searchsorted(t, run["sep_start"]))
-        distance = min_distance_to_group(run["distances"], node)
-        sliced = inputs.target_slice(node)
-        success_distance = config["metrics"]["success_distance"]
-        out["results"] = evaluate_run(sliced, config, lambda s: summarize_separated(s, t, idx_start, distance, success_distance))
+        out["results"] = evaluate_run(inputs.target_slice(node), config, summarize)
     out["elapsed"] = time.perf_counter() - t0
     return out
 
 
 def run_sweep(config: dict, runs: list, cache_dir: Path, sigma_values: list, R: float, jobs: int) -> tuple:
-    """Sweep su ``σ_a``, modalità, ambito e soglia (`process_run` su tutte le corse, poi `aggregate`).
+    """Sweep over ``σ_a``, mode, scope and threshold (`process_run` on all runs, then `aggregate`).
 
-    Restituisce (righe con ``sigma_a``, dettagli per ``σ_a``: risultati per corsa, NIS, tempi).
+    Returns (rows with ``sigma_a``, details per ``σ_a``: per-run results, NIS, timings).
     """
     rows, details = [], {}
     for sigma_a in sigma_values:
         tasks = [(r, config, cache_dir, sigma_a, R) for r in runs]
-        if jobs <= 1:
-            outs = [process_run(task) for task in tasks]
-        else:
-            with ProcessPoolExecutor(max_workers=jobs) as pool:
-                outs = list(pool.map(process_run, tasks))
-        none = sorted((o for o in outs if o["scenario"] == "none"), key=lambda o: o["index"])
-        separated = {
-            s: sorted((o for o in outs if o["scenario"] == s), key=lambda o: o["index"])
-            for s in config["metrics"]["scenarios"]
-            if s != "none"
-        }
+        outs = parallel_map(process_run, tasks, jobs)
+        none, separated = split_by_scenario(outs, [s for s in config["metrics"]["scenarios"] if s != Scenario.NONE])
         sigma_rows = aggregate(
             [o["results"] for o in none], {s: [o["results"] for o in v] for s, v in separated.items()}, config
         )
@@ -119,7 +105,7 @@ def run_sweep(config: dict, runs: list, cache_dir: Path, sigma_values: list, R: 
 
 
 # ---------------------------------------------------------------------------
-# Salvataggio, lettura e resoconto
+# Saving, loading and reporting
 # ---------------------------------------------------------------------------
 
 ROW_FIELDS = (
@@ -132,7 +118,7 @@ _INT_FIELDS = ("n_runs", "fortuitous", "feasible")
 
 
 def save_results(out_dir: Path, runs: list, rows: list, details: dict, R: float, timings: dict, config: dict) -> None:
-    """Scrive ``runs.csv``, ``sweep.csv`` e ``details.npz`` (array per corsa (corse × soglie), NIS, ``R``, tempi)."""
+    """Writes ``runs.csv``, ``sweep.csv`` and ``details.npz`` (per-run arrays (runs × thresholds), NIS, ``R``, timings)."""
     out_dir = Path(out_dir)
     out_dir.mkdir(parents=True, exist_ok=True)
     with open(out_dir / "runs.csv", "w", newline="") as f:
@@ -162,7 +148,7 @@ def save_results(out_dir: Path, runs: list, rows: list, details: dict, R: float,
 
 
 def load_results(out_dir: Path) -> tuple:
-    """Legge ``sweep.csv`` e ``details.npz``: (righe tipizzate, dizionario di array)."""
+    """Reads ``sweep.csv`` and ``details.npz``: (typed rows, dict of arrays)."""
     out_dir = Path(out_dir)
     rows = []
     with open(out_dir / "sweep.csv", newline="") as f:
@@ -186,35 +172,35 @@ def _fmt(value: float, spec: str) -> str:
 
 
 def print_summary(rows: list, details: dict, config: dict) -> None:
-    """Stampa ``R``, NIS media per ``σ_a`` e, per variante, modalità, ambito e scenario, il punto di lavoro del miglior ``σ_a`` (`best_over_sigma`)."""
+    """Prints ``R``, mean NIS per ``σ_a`` and, per variant, mode, scope and scenario, the working point of the best ``σ_a`` (`best_over_sigma`)."""
     mcfg = config["metrics"]
     level = mcfg["confidence_level"]
-    print(f"R (rumore di misura) = {float(details['R']):.3f} dB²")
-    print("NIS media nel gruppo senza distacco (attesa 1 se il filtro è consistente):")
+    print(f"R (measurement noise) = {float(details['R']):.3f} dB²")
+    print("Mean NIS in the group without separation (expected 1 if the filter is consistent):")
     for sigma_a in details["sigma_values"]:
-        print(f"  sigma_a = {sigma_a:g} dB/s²: NIS media = {float(details[f'nis_mean|{sigma_a}']):.3f}")
-    scenarios = [s for s in mcfg["scenarios"] if s != "none"]
-    titles = {"both": "pre-allarme + perso", "pre": "solo pre-allarme", "lost": "solo allarme 'perso'"}
+        print(f"  sigma_a = {sigma_a:g} dB/s²: mean NIS = {float(details[f'nis_mean|{sigma_a}']):.3f}")
+    scenarios = [s for s in mcfg["scenarios"] if s != Scenario.NONE]
+    titles = {"both": "pre-alarm + lost", "pre": "pre-alarm only", "lost": "'lost' alarm only"}
     print(
-        f"\nSuccesso = allarme prima che la distanza dal gruppo superi {mcfg['success_distance']:g} m;"
-        f" ammissibile = falsi allarmi/ora <= {mcfg['target_false_alarms_per_hour']:g} e tempo in allarme"
-        f" <= {100 * mcfg['max_alarm_time_fraction']:g}%; intervalli al {100 * level:g}%"
-        f" (Wilson per P_d, Poisson per FA/h)."
+        f"\nSuccess = alarm before the distance from the group exceeds {mcfg['success_distance']:g} m;"
+        f" feasible = false alarms/hour <= {mcfg['target_false_alarms_per_hour']:g} and time in alarm"
+        f" <= {100 * mcfg['max_alarm_time_fraction']:g}%; intervals at {100 * level:g}%"
+        f" (Wilson for P_d, Poisson for FA/h)."
     )
     for variant in ("both", "pre", "lost"):
-        print(f"\nPunto di lavoro ({titles[variant]}), miglior sigma_a:")
+        print(f"\nWorking point ({titles[variant]}), best sigma_a:")
         print(
-            f"{'modalita':>8} {'ambito':>8} {'scenario':>9} {'sigma_a':>7} {'soglia':>7} {'P_d':>5} {'Wilson':>13}"
+            f"{'mode':>8} {'scope':>8} {'scenario':>9} {'sigma_a':>7} {'thresh':>7} {'P_d':>5} {'Wilson':>13}"
             f" {'<=' + format(mcfg['success_window'], 'g') + 's':>6} {'fort.':>5}"
-            f" {'rit.med s':>9} {'rit.p90 s':>9} {'dist.med m':>10} {'dist.p90 m':>10}"
-            f" {'FA/h':>5} {'Poisson':>13} {'in allarme':>10}"
+            f" {'del.med s':>9} {'del.p90 s':>9} {'dist.med m':>10} {'dist.p90 m':>10}"
+            f" {'FA/h':>5} {'Poisson':>13} {'in alarm':>10}"
         )
         combos = [("-", "-")] if variant == "lost" else [(m, s) for m in MODES for s in SCOPES]
         for mode, scope in combos:
             best = best_over_sigma(rows, scope, mode, variant)
             for scenario in scenarios:
                 if best is None:
-                    print(f"{mode:>8} {scope:>8} {scenario:>9}   nessun punto ammissibile")
+                    print(f"{mode:>8} {scope:>8} {scenario:>9}   no feasible point")
                     continue
                 row = next(
                     r for r in rows

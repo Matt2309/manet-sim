@@ -1,8 +1,8 @@
-"""Genera `block4_reference.npz`: uscite del Blocco 4 su tre corse brevi (una per scenario).
+"""Generate `block4_reference.npz`: Block 4 outputs on three short runs (one per scenario).
 
-Va eseguito con il codice del Blocco 4 (commit 16c6180), PRIMA delle modifiche del Blocco 5;
-`tests/test_block5.py::test_default_reproduces_block4` confronta in modo esatto.
-Uso: python tests/data/make_block4_reference.py
+Must be run with the Block 4 code (commit 16c6180), BEFORE the Block 5 changes;
+`tests/test_block5.py::test_default_reproduces_block4` compares exactly.
+Usage: python tests/data/make_block4_reference.py
 """
 
 import copy
@@ -24,7 +24,7 @@ DURATION, SEED, NODE, START, SIGMA_A, R = 150.0, 5, 2, 60.0, 0.25, 9.0
 
 def reference_config() -> dict:
     cfg = load_config(_ROOT / "config" / "default.yaml")
-    for dotted, value in cfg["history"]["block4"].items():  # Blocco 6: i default sono cambiati, il Blocco 4 si fissa esplicitamente
+    for dotted, value in cfg["history"]["block4"].items():  # Block 6: the defaults changed, so Block 4 is pinned explicitly
         node = cfg
         *path, last = dotted.split(".")
         for key in path:
@@ -68,4 +68,4 @@ if __name__ == "__main__":
         for name, arr in reference_outputs(scenario, copy.deepcopy(config)).items():
             arrays[f"{scenario}/{name}"] = arr
     np.savez_compressed(Path(__file__).with_name("block4_reference.npz"), **arrays)
-    print(f"{len(arrays)} array salvati")
+    print(f"{len(arrays)} arrays saved")

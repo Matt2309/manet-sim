@@ -1,18 +1,18 @@
-"""Test del Blocco 3 (pacchetti).
+"""Block 3 tests (packets).
 
-Ogni test verifica un fatto noto (teoria o formula chiusa) su canali costruiti a mano o corse brevi.
-Tolleranze statistiche a 4 deviazioni standard binomiali.
+Each test checks a known fact (theory or closed formula) on hand-built channels or short runs.
+Statistical tolerances at 4 binomial standard deviations.
 """
 
 import copy
 import math
-from pathlib import Path
 
 import numpy as np
 import pytest
 
-from src.channel import ChannelResult, simulate_channel
-from src.mobility import MobilityResult, load_config, simulate_mobility
+from tests.helpers import manual_channel, static_mobility
+from src.channel import simulate_channel
+from src.mobility import simulate_mobility
 from src.packets import (
     beacon_schedule,
     logistic_parameters,
@@ -20,70 +20,17 @@ from src.packets import (
     simulate_packets,
 )
 
-CONFIG_PATH = Path(__file__).resolve().parent.parent / "config" / "default.yaml"
-
 
 # ---------------------------------------------------------------------------
-# Fixture e utilità
+# Fixtures and utilities
 # ---------------------------------------------------------------------------
-
-
-@pytest.fixture(scope="session")
-def base_config():
-    return load_config(CONFIG_PATH)
-
-
-@pytest.fixture
-def cfg(base_config):
-    return copy.deepcopy(base_config)
-
-
-def _mobility(n_steps: int, n_nodes: int, dt: float) -> MobilityResult:
-    """`MobilityResult` con nodi fermi."""
-    positions = np.zeros((n_steps, n_nodes, 2))
-    positions[:, :, 0] = np.arange(n_nodes)[None, :]
-    diff = positions[:, :, None, :] - positions[:, None, :, :]
-    return MobilityResult(
-        t=np.arange(n_steps) * dt,
-        positions=positions,
-        s_nodes=np.zeros((n_steps, n_nodes)),
-        s_centroid=np.zeros(n_steps),
-        distances=np.linalg.norm(diff, axis=-1),
-        headings=np.tile([1.0, 0.0], (n_steps, n_nodes, 1)),
-        lateral_offsets=np.zeros((n_steps, n_nodes)),
-        metadata={},
-    )
-
-
-def _channel(rssi: np.ndarray, dt: float) -> ChannelResult:
-    """`ChannelResult` a mano da un RSSI vero (T, N, N); il misurato è l'intero più vicino."""
-    rssi = np.array(rssi, dtype=float)
-    n_steps, n, _ = rssi.shape
-    idx = np.arange(n)
-    rssi[:, idx, idx] = np.nan
-    zeros = np.zeros_like(rssi)
-    return ChannelResult(
-        t=np.arange(n_steps) * dt,
-        rssi_true=rssi,
-        rssi_measured=np.round(rssi),
-        rssi_path_loss=rssi.copy(),
-        shadowing=zeros,
-        body_own=zeros,
-        body_others=zeros,
-        fading=zeros,
-        obstacles=zeros,
-        tx_offset=np.zeros(n),
-        rx_offset=np.zeros(n),
-        shadow_field=None,
-        metadata={},
-    )
 
 
 def _constant(cfg: dict, level: float, n_steps: int):
-    """Mobilità e canale con RSSI costante `level` su tutti i link."""
+    """Mobility and channel with constant RSSI `level` on all links."""
     n = cfg["group"]["n_nodes"]
     dt = cfg["simulation"]["dt"]
-    return _mobility(n_steps, n, dt), _channel(np.full((n_steps, n, n), level), dt)
+    return static_mobility(n_steps, n, dt), manual_channel(np.full((n_steps, n, n), level), dt)
 
 
 def _run(cfg: dict, level: float, n_steps: int):
@@ -92,7 +39,7 @@ def _run(cfg: dict, level: float, n_steps: int):
 
 
 def _logistic_independent(x, sensitivity, success, width):
-    """Logistica scritta in altro modo: passa per 0,1 e 0,9 a ±width/2 dal centro."""
+    """Logistic written another way: passes through 0.1 and 0.9 at ±width/2 from the center."""
     centre = sensitivity - (width / 2.0) * math.log(success / (1.0 - success)) / math.log(9.0)
     return 1.0 / (1.0 + 9.0 ** (-2.0 * (np.asarray(x) - centre) / width))
 
@@ -102,14 +49,14 @@ def _binomial_tol(p: float, n: int) -> float:
 
 
 def _off(arr: np.ndarray, valid: np.ndarray) -> np.ndarray:
-    """Elementi (i, k, j) con i != j e beacon valido."""
+    """Elements (i, k, j) with i != j and valid beacon."""
     n = arr.shape[0]
     mask = (~np.eye(n, dtype=bool))[:, None, :] & valid[:, :, None]
     return arr[mask]
 
 
 # ---------------------------------------------------------------------------
-# 1. Istanti dei beacon
+# 1. Beacon instants
 # ---------------------------------------------------------------------------
 
 
@@ -127,7 +74,7 @@ def test_beacon_schedule(cfg):
         assert (len(tt) - 1) / (tt[-1] - tt[0]) == pytest.approx(1.0 / period, rel=0.01)
         assert 0.0 <= tt[0] < period
         assert tt[-1] <= t_end
-    # gli intervalli coprono t_end: l'ultima colonna è sempre NaN
+    # the intervals cover t_end: the last column is always NaN
     assert np.all(np.isnan(times[:, -1]))
 
     phases = times[:, 0]
@@ -140,7 +87,7 @@ def test_beacon_schedule(cfg):
 
 
 # ---------------------------------------------------------------------------
-# 2. Curva di ricezione
+# 2. Reception curve
 # ---------------------------------------------------------------------------
 
 
@@ -167,11 +114,11 @@ def test_reception_curve(cfg):
     assert reception_probability(np.array([s - 0.01, s - 20.0]), rc_thr).tolist() == [0.0, 0.0]
 
     with pytest.raises(ValueError):
-        reception_probability(xs, dict(rc, model="altro"))
+        reception_probability(xs, dict(rc, model="other"))
 
 
 # ---------------------------------------------------------------------------
-# 3. Frequenza empirica
+# 3. Empirical rate
 # ---------------------------------------------------------------------------
 
 
@@ -189,7 +136,7 @@ def test_empirical_reception_rate(cfg, offset):
 
 
 # ---------------------------------------------------------------------------
-# 4. Perdita di fondo
+# 4. Background loss
 # ---------------------------------------------------------------------------
 
 
@@ -207,7 +154,7 @@ def test_background_losses_independent(cfg):
     cfg["packets"]["reception"]["background_loss"] = q
     res = _run(cfg, -40.0, 40000)
 
-    # nel tempo: lunghezza delle serie di perdite consecutive geometrica
+    # in time: length of runs of consecutive losses is geometric
     lengths = []
     for i in range(5):
         for j in range(5):
@@ -225,7 +172,7 @@ def test_background_losses_independent(cfg):
         assert frac == pytest.approx(expected, abs=_binomial_tol(expected, n_runs))
     assert lengths.mean() == pytest.approx(1.0 / (1.0 - q), rel=0.05)
 
-    # fra ricevitori: stesso beacon di i, ricevitori j1 e j2
+    # across receivers: same beacon of i, receivers j1 and j2
     n_valid = int(np.sum(~np.isnan(res.beacon_times[0])))
     a = (~res.received[0, :n_valid, 1]).astype(float)
     b = (~res.received[0, :n_valid, 2]).astype(float)
@@ -234,7 +181,7 @@ def test_background_losses_independent(cfg):
 
 
 # ---------------------------------------------------------------------------
-# 5. RSSI riportato
+# 5. Reported RSSI
 # ---------------------------------------------------------------------------
 
 
@@ -242,9 +189,9 @@ def test_reported_rssi(cfg):
     n, dt, n_steps = 5, cfg["simulation"]["dt"], 3000
     rng = np.random.default_rng(3)
     rssi = -98.4 + rng.normal(0.0, 3.0, size=(n_steps, n, n))
-    ch = _channel(rssi, dt)
-    res = simulate_packets(_mobility(n_steps, n, dt), ch, cfg)
-    assert res.received.any() and not res.received.all()  # il test vede sia ricevuti sia persi
+    ch = manual_channel(rssi, dt)
+    res = simulate_packets(static_mobility(n_steps, n, dt), ch, cfg)
+    assert res.received.any() and not res.received.all()  # the test sees both received and lost
     for i in range(n):
         for k in range(res.beacon_steps.shape[1]):
             s = res.beacon_steps[i, k]
@@ -260,20 +207,20 @@ def test_reported_rssi(cfg):
 
 
 # ---------------------------------------------------------------------------
-# 6. Conoscenza, caso deterministico
+# 6. Knowledge, deterministic case
 # ---------------------------------------------------------------------------
 
 
 def _deterministic(cfg):
     cfg["packets"]["reception"]["background_loss"] = 0.0
     n, dt, n_steps = 5, cfg["simulation"]["dt"], 3000
-    # RSSI alto, variabile nel tempo e diverso per ogni link: così i valori
-    # inoltrati si possono ricondurre al beacon d'origine
+    # High RSSI, time-varying and different for each link: so the forwarded
+    # values can be traced back to the originating beacon
     steps = np.arange(n_steps)[:, None, None]
     link = np.arange(n)[None, :, None] * 5 + np.arange(n)[None, None, :]
     rssi = -60.0 + (steps * 7 + link * 3) % 23
-    ch = _channel(rssi, dt)
-    return ch, simulate_packets(_mobility(n_steps, n, dt), ch, cfg)
+    ch = manual_channel(rssi, dt)
+    return ch, simulate_packets(static_mobility(n_steps, n, dt), ch, cfg)
 
 
 def test_knowledge_deterministic(cfg):
@@ -290,13 +237,13 @@ def test_knowledge_deterministic(cfg):
             age = res.knowledge_age[warm:, m, i, m]
             assert np.all(np.isfinite(age))
             assert age.min() >= 0.0 and age.max() < period + jitter
-            assert age.max() > period - jitter - dt  # dente di sega che sale fino a circa un periodo
+            assert age.max() > period - jitter - dt  # sawtooth rising up to about one period
             assert age.min() < dt
-            # dente di sega: l'età cresce di dt a ogni passo, salvo i ritorni a zero
+            # sawtooth: the age grows by dt at each step, except for the returns to zero
             d = np.diff(age)
             assert np.all((np.abs(d - dt) < 1e-4) | (d < 0))
 
-    # link inoltrati: età < 2 (period + jitter), valori del beacon d'origine
+    # forwarded links: age < 2 (period + jitter), values of the originating beacon
     for m in range(n):
         for i in range(n):
             for j in range(n):
@@ -305,7 +252,7 @@ def test_knowledge_deterministic(cfg):
                 age = res.knowledge_age[warm:, m, i, j]
                 assert np.all(np.isfinite(age))
                 assert age.min() >= 0.0 and age.max() < 2.0 * (period + jitter)
-                # origine: beacon di i con istante t - età
+                # origin: beacon of i at instant t - age
                 for s in range(warm, res.knowledge_age.shape[0], 97):
                     origin = ch.t[s] - float(res.knowledge_age[s, m, i, j])
                     k = int(np.nanargmin(np.abs(res.beacon_times[i] - origin)))
@@ -314,7 +261,7 @@ def test_knowledge_deterministic(cfg):
 
 
 # ---------------------------------------------------------------------------
-# 7. Conoscenza, nodo isolato
+# 7. Knowledge, isolated node
 # ---------------------------------------------------------------------------
 
 
@@ -324,20 +271,20 @@ def test_knowledge_isolated_node(cfg):
     rssi = np.full((n_steps, n, n), -50.0)
     rssi[:, 4, :] = -150.0
     rssi[:, :, 4] = -150.0
-    res = simulate_packets(_mobility(n_steps, n, dt), _channel(rssi, dt), cfg)
+    res = simulate_packets(static_mobility(n_steps, n, dt), manual_channel(rssi, dt), cfg)
 
     assert not res.received[4].any() and not res.received[:, :, 4].any()
     assert np.all(np.isnan(res.knowledge_rssi[:, :, 4, :]))
     assert np.all(np.isnan(res.knowledge_rssi[:, :, :, 4]))
     assert np.all(np.isnan(res.knowledge_age[:, :, 4, :]))
     assert np.all(np.isnan(res.knowledge_age[:, :, :, 4]))
-    # gli altri si conoscono a vicenda
+    # the others know each other
     assert np.isfinite(res.knowledge_rssi[-1, 0, 1, 2])
     assert np.isfinite(res.knowledge_rssi[-1, 0, 1, 0])
 
 
 # ---------------------------------------------------------------------------
-# 8. Riproducibilità e indipendenza
+# 8. Reproducibility and independence
 # ---------------------------------------------------------------------------
 
 
@@ -363,7 +310,7 @@ def test_reproducibility_and_independence(cfg):
     np.testing.assert_array_equal(r1.beacon_times, r4.beacon_times)
     assert not np.array_equal(r1.passed_background, r4.passed_background)
 
-    # cambiare i parametri dei pacchetti non cambia il canale e viceversa
+    # changing the packet parameters does not change the channel and vice versa
     cfg4 = copy.deepcopy(cfg)
     cfg4["simulation"]["duration"] = 30.0
     cfg4["separation"]["enabled"] = False
@@ -380,7 +327,7 @@ def test_reproducibility_and_independence(cfg):
 
 
 # ---------------------------------------------------------------------------
-# 9. Distacco
+# 9. Detachment
 # ---------------------------------------------------------------------------
 
 
@@ -399,11 +346,11 @@ def test_separation_stops_reception(cfg):
         sel = (r.beacon_times[node] >= t_lo) & (r.beacon_times[node] < t_hi)
         return r.received[node][sel][:, others].mean()
 
-    assert fraction(res, 100.0, 250.0) > 0.9  # nel gruppo il nodo viene sentito
+    assert fraction(res, 100.0, 250.0) > 0.9  # within the group the node is heard
     assert fraction(res, t_end - 60.0, t_end + 1.0) == 0.0
 
     cfg_lo = copy.deepcopy(cfg)
     cfg_lo["packets"]["reception"]["sensitivity_dbm"] = -92.0
     res_lo = simulate_packets(mob, ch, cfg_lo)
-    assert np.all(res.received[res_lo.received])  # ricevuti con -92 ⊆ ricevuti con -98,4
+    assert np.all(res.received[res_lo.received])  # received with -92 ⊆ received with -98.4
     assert res.received.sum() > res_lo.received.sum()

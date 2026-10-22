@@ -1,55 +1,60 @@
-"""Blocco 7 — Esperimento del routing verso il capogruppo: corse, riassunti, aggregazione, verdetto.
+"""Block 7 — Routing-to-leader experiment: runs, summaries, aggregation, verdict.
 
-Gruppo lungo (sostituzioni di ``routing.scenario_overrides``), scenari ``none`` / ``slowdown`` / ``stop`` con ``routing.n_runs`` corse ciascuno. Semi delle corse e nodo/istante del
-distacco dai generatori ``routing.seed_keys.runs`` / ``separation`` (comuni ai tre scenari: confronto a coppie), capogruppo dal generatore ``leader`` (mai il nodo che si stacca, stesso nei tre
-scenari), frazione di tempo del SOS dal generatore ``sos``. Il rilevatore NON si valuta qui (vedi `src/routing.py`). Ogni corsa è indipendente (`process_run_routing`): il risultato non dipende
-dal numero di processi. Nessuna cache su disco: ogni processo simula la propria corsa.
+Long group (overrides of ``routing.scenario_overrides``), scenarios ``none`` / ``slowdown`` / ``stop`` with ``routing.n_runs`` runs each. Run seeds and detachment node/instant
+from the generators ``routing.seed_keys.runs`` / ``separation`` (shared by the three scenarios: paired comparison), group leader from the ``leader`` generator (never the node that detaches, same across the three
+scenarios), SOS time fraction from the ``sos`` generator. The detector is NOT evaluated here (see `src/routing.py`). Each run is independent (`process_run_routing`): the result does not depend
+on the number of processes. No disk cache: each process simulates its own run.
 
-Parametri: sezione ``routing`` della config.
+Parameters: ``routing`` section of the config.
 """
 
 from __future__ import annotations
 
 import copy
 import time
-from concurrent.futures import ProcessPoolExecutor
 
 import numpy as np
 
-from src.final import bootstrap_rng
-from src.metrics import min_distance_to_group, nearest_rank
+from src.channel import distance_from_path_loss
+from src.common.enums import Scenario, Strategy
+from src.common.parallel import parallel_map
+from src.common.stats import percentile_interval, resample_indices
+from src.common.rng import bootstrap_rng, spawn_rng
+from src.metrics import SEPARATED, min_distance_to_group, nearest_rank
 from src.refinement import apply_overrides
-from src.routing import prepare_run, simulate_strategy
+from src.routing import KIND_ALARM, KIND_SOS, prepare_run, second_stride, simulate_strategy
 from src.simulator import draw_separations, experiment_runs
 
 POSITIONS = ("coda", "centro", "testa")
+SCENARIOS = tuple(s.value for s in Scenario)
+VIEW_AGE_BINS = 60
 
 
 # ---------------------------------------------------------------------------
-# Insiemi di corse
+# Sets of runs
 # ---------------------------------------------------------------------------
 
 
 def block7_config(config: dict, profile: str | None = None) -> dict:
-    """Copia della config con le sostituzioni del Blocco 7: gruppo lungo (``routing.scenario_overrides``) e profilo di canale.
+    """Copy of the config with the Block 7 overrides: long group (``routing.scenario_overrides``) and channel profile.
 
-    `profile` è ``nominal`` o ``heltec_run`` (default ``routing.channel_profile``); le sostituzioni del profilo stanno in ``routing.channel_profiles``.
-    ``nominal`` non cambia nulla rispetto al primo punto di lavoro del Blocco 7.
+    `profile` is ``nominal`` or ``heltec_run`` (default ``routing.channel_profile``); the profile overrides live in ``routing.channel_profiles``.
+    ``nominal`` changes nothing with respect to the first Block 7 operating point.
     """
     rcfg = config["routing"]
     profile = rcfg["channel_profile"] if profile is None else profile
     if profile not in rcfg["channel_profiles"]:
-        raise KeyError(f"routing.channel_profile sconosciuto: {profile!r} (disponibili: {', '.join(rcfg['channel_profiles'])})")
+        raise KeyError(f"unknown routing.channel_profile: {profile!r} (available: {', '.join(rcfg['channel_profiles'])})")
     cfg = apply_overrides(config, rcfg["scenario_overrides"])
     return apply_overrides(cfg, rcfg["channel_profiles"][profile] or {})
 
 
 def group_median_rssi(config: dict, duration: float = 300.0) -> float:
-    """Mediana dell'RSSI misurato fra i nodi del gruppo da 5 compatti, scenario ``none``, canale base del Blocco 2.
+    """Median of the RSSI measured among the nodes of the compact 5-node group, scenario ``none``, base channel of Block 2.
 
-    Serve a tarare ``channel.tx_power`` del profilo ``heltec_run``: la potenza trovata è una potenza EQUIVALENTE (EIRP comprensivo delle perdite di antenna,
-    montaggio sul braccio e corpi), NON un valore impostabile sull'ESP32. Stessa statistica di ``scripts/plot_channel.py`` (mediana −51 dBm a 10 dBm).
-    `config`: config base con le sostituzioni di canale da provare (qui NON si applica il gruppo lungo). Output: dBm.
+    Used to calibrate ``channel.tx_power`` of the ``heltec_run`` profile: the power found is an EQUIVALENT power (EIRP including antenna losses,
+    arm mounting and bodies), NOT a value that can be set on the ESP32. Same statistic as ``scripts/plot_channel.py`` (median −51 dBm at 10 dBm).
+    `config`: base config with the channel overrides to try (the long group is NOT applied here). Output: dBm.
     """
     from src.channel import simulate_channel
     from src.mobility import simulate_mobility
@@ -63,23 +68,23 @@ def group_median_rssi(config: dict, duration: float = 300.0) -> float:
 
 
 def draw_leaders(config: dict, sep_nodes: np.ndarray) -> np.ndarray:
-    """Capogruppo di ogni corsa: uniforme fra i nodi diversi da quello che si stacca (generatore ``SeedSequence(simulation.seed, spawn_key=(seed_keys.leader,))``).
+    """Group leader of each run: uniform among the nodes other than the one that detaches (generator ``SeedSequence(simulation.seed, spawn_key=(seed_keys.leader,))``).
 
-    Input: `config` (del Blocco 7), `sep_nodes` (n_runs,) nodi estratti per il distacco. Procedimento: indice uniforme fra ``N − 1`` posizioni, saltando il nodo del distacco. Output (n_runs,) int.
+    Input: `config` (Block 7), `sep_nodes` (n_runs,) nodes drawn for the detachment. Procedure: uniform index among ``N − 1`` positions, skipping the detachment node. Output (n_runs,) int.
     """
-    rng = np.random.default_rng(np.random.SeedSequence(config["simulation"]["seed"], spawn_key=(config["routing"]["seed_keys"]["leader"],)))
+    rng = spawn_rng(config["simulation"]["seed"], config["routing"]["seed_keys"]["leader"])
     u = rng.integers(0, config["group"]["n_nodes"] - 1, size=len(sep_nodes))
     return (u + (u >= sep_nodes)).astype(int)
 
 
 def draw_sos_fractions(config: dict, n_runs: int) -> np.ndarray:
-    """Istante del SOS come frazione di ``sos_window`` dopo il distacco: uniformi (0, 1) dal generatore ``spawn_key=(seed_keys.sos,)``, una per corsa (uguale nei tre scenari)."""
-    rng = np.random.default_rng(np.random.SeedSequence(config["simulation"]["seed"], spawn_key=(config["routing"]["seed_keys"]["sos"],)))
+    """SOS instant as a fraction of ``sos_window`` after the detachment: uniforms (0, 1) from the generator ``spawn_key=(seed_keys.sos,)``, one per run (same across the three scenarios)."""
+    rng = spawn_rng(config["simulation"]["seed"], config["routing"]["seed_keys"]["sos"])
     return rng.random(n_runs)
 
 
 def routing_runs(config: dict) -> list:
-    """Corse del Blocco 7 (`experiment_runs` con chiavi 12/13 e ``routing.n_runs``), ciascuna con ``leader`` e ``sos`` (frazione). `config` è quella del Blocco 7 (`block7_config`)."""
+    """Block 7 runs (`experiment_runs` with keys 12/13 and ``routing.n_runs``), each with ``leader`` and ``sos`` (fraction). `config` is the Block 7 one (`block7_config`)."""
     rcfg = config["routing"]
     keys = {"runs": rcfg["seed_keys"]["runs"], "separation": rcfg["seed_keys"]["separation"]}
     runs = experiment_runs(config, keys, rcfg["n_runs"])
@@ -91,7 +96,7 @@ def routing_runs(config: dict) -> list:
 
 
 # ---------------------------------------------------------------------------
-# Riassunto di una strategia su una corsa
+# Summary of a strategy on a run
 # ---------------------------------------------------------------------------
 
 
@@ -99,23 +104,7 @@ def _keys(origin: np.ndarray, seq: np.ndarray) -> np.ndarray:
     return np.asarray(origin).astype(np.int64) * 10_000_000 + np.asarray(seq).astype(np.int64)
 
 
-def summarize_strategy(out: dict, rd: dict, rcfg: dict, scenario: str) -> dict:
-    """Riduce l'uscita di `simulate_strategy` a poche cifre per corsa.
-
-    Input: uscita della simulazione, corsa preparata `rd`, `rcfg`, scenario.
-    Procedimento: record normali creati fra ``warmup`` e ``fine − end_margin``, divisi in classe ``group`` e ``sep`` (record del nodo separato dopo il distacco); per ciascuna: creati,
-    consegnati, ritardi, istogramma dei salti, record arrivati via carry (con ritardi), consegna per fascia di distanza dal capogruppo. Età della vista del capogruppo (da quanto non riceve un
-    record NUOVO di un nodo: ``t − max t_creazione`` dei record arrivati) campionata ogni secondo da ``warmup``: istogramma (60 contenitori da 1 s, l'ultimo raccoglie il resto) e conteggi oltre le
-    soglie ``view_age_thresholds``. Separato: ultimo record fresco (età < ``fresh_age``), con tempo dal distacco e distanza dal capogruppo e dal gruppo. Allarme oracolo e SOS: consegnati e ritardo.
-    Carico: tempo d'aria e tentativi per nodo (al secondo), occupazione massima del buffer, record persi, salti mediani annunciati.
-    Output: dizionario di scalari e piccoli array.
-    """
-    t, L, sep, sep_start, dt = rd["t"], rd["leader"], rd["sep_node"], rd["sep_start"], rd["dt"]
-    n_nodes = rd["ann_grid"].shape[1]
-    with_sep = scenario != "none"
-    duration = float(t[-1])
-    lo, hi = rcfg["warmup"], duration - rcfg["end_margin"]
-    created, log = out["created"], out["log"]
+def _log_lookup(log: dict):
     lkey = _keys(log["origin"], log["seq"])
     sorter = np.argsort(lkey)
 
@@ -126,6 +115,11 @@ def summarize_strategy(out: dict, rd: dict, rcfg: dict, scenario: str) -> dict:
         idx = sorter[pos]
         return lkey[idx] == ck, idx
 
+    return lookup
+
+
+def _class_summaries(created: np.ndarray, log: dict, lookup, rd: dict, rcfg: dict, with_sep: bool, lo: float, hi: float) -> dict:
+    L, sep, sep_start = rd["leader"], rd["sep_node"], rd["sep_start"]
     normal = (created[:, 3] == 0) & (created[:, 2] >= lo) & (created[:, 2] <= hi)
     cn = created[normal]
     hit, idx = lookup(_keys(cn[:, 0], cn[:, 1]))
@@ -145,13 +139,16 @@ def summarize_strategy(out: dict, rd: dict, rcfg: dict, scenario: str) -> dict:
             "dist_created": np.histogram(dist[mask], bins=edges)[0], "dist_delivered": np.histogram(dist[got], bins=edges)[0],
         }  # fmt: skip
 
-    classes = {"group": class_stats(~is_sep), "sep": class_stats(is_sep)}
+    return {"group": class_stats(~is_sep), "sep": class_stats(is_sep)}
 
-    # età della vista del capogruppo
+
+def _view_age(log: dict, rd: dict, rcfg: dict, with_sep: bool, lo: float, duration: float) -> dict:
+    L, sep, sep_start = rd["leader"], rd["sep_node"], rd["sep_start"]
+    n_nodes = rd["ann_grid"].shape[1]
     thresholds = rcfg["view_age_thresholds"]
     grid = np.arange(lo, duration, 1.0)
-    age_edges = np.arange(0.0, 61.0, 1.0)
-    view = {c: {"hist": np.zeros(60, dtype=np.int64), "n": 0, "over": np.zeros(len(thresholds), dtype=np.int64)} for c in ("group", "sep")}
+    age_edges = np.arange(0.0, VIEW_AGE_BINS + 1.0, 1.0)
+    view = {c: {"hist": np.zeros(VIEW_AGE_BINS, dtype=np.int64), "n": 0, "over": np.zeros(len(thresholds), dtype=np.int64)} for c in ("group", "sep")}
     for node in range(n_nodes):
         if node == L:
             continue
@@ -168,11 +165,14 @@ def summarize_strategy(out: dict, rd: dict, rcfg: dict, scenario: str) -> dict:
         sep_time = (with_sep and node == sep) & (grid >= sep_start)
         for name, mask in (("group", ~sep_time), ("sep", sep_time)):
             a = age[mask]
-            view[name]["hist"] += np.histogram(np.minimum(a, 60.0), bins=age_edges)[0]
+            view[name]["hist"] += np.histogram(np.minimum(a, float(VIEW_AGE_BINS)), bins=age_edges)[0]
             view[name]["n"] += len(a)
             view[name]["over"] += np.array([(a > th).sum() for th in thresholds])
+    return view
 
-    # nodo separato: ultimo record fresco, allarme oracolo e SOS
+
+def _fresh_record(log: dict, rd: dict, rcfg: dict, with_sep: bool) -> dict:
+    t, L, sep, sep_start, dt = rd["t"], rd["leader"], rd["sep_node"], rd["sep_start"], rd["dt"]
     sep_out = {"fresh_time": np.nan, "fresh_dist_leader": np.nan, "fresh_dist_group": np.nan}
     if with_sep:
         sel = (log["origin"] == sep) & (log["kind"] == 0) & (log["t_create"] >= sep_start) & (log["t_arrive"] - log["t_create"] < rcfg["fresh_age"])
@@ -184,17 +184,45 @@ def summarize_strategy(out: dict, rd: dict, rcfg: dict, scenario: str) -> dict:
                 "fresh_dist_leader": float(rd["distances"][step, sep, L]),
                 "fresh_dist_group": float(min_distance_to_group(rd["distances"][step : step + 1], sep)[0]),
             }
+    return sep_out
 
-    def message(kind):
-        rows = created[created[:, 3] == kind]
-        if len(rows) == 0:
-            return {"created": False, "delivered": False, "delay": np.nan}
-        ok, i = lookup(_keys(rows[:, 0], rows[:, 1]))
-        return {"created": True, "delivered": bool(ok[0]), "delay": float(log["t_arrive"][i[0]] - rows[0, 2]) if ok[0] else np.nan}
 
-    hops_med = np.array([np.median(rd["ann_grid"][:, n][rd["ann_grid"][:, n] < 255]) if (rd["ann_grid"][:, n] < 255).any() else np.nan for n in range(n_nodes)])
+def _message_outcome(created: np.ndarray, log: dict, lookup, kind: int) -> dict:
+    rows = created[created[:, 3] == kind]
+    if len(rows) == 0:
+        return {"created": False, "delivered": False, "delay": np.nan}
+    ok, i = lookup(_keys(rows[:, 0], rows[:, 1]))
+    return {"created": True, "delivered": bool(ok[0]), "delay": float(log["t_arrive"][i[0]] - rows[0, 2]) if ok[0] else np.nan}
+
+
+def _hops_median(ann_grid: np.ndarray) -> np.ndarray:
+    n_nodes = ann_grid.shape[1]
+    return np.array([np.median(ann_grid[:, n][ann_grid[:, n] < 255]) if (ann_grid[:, n] < 255).any() else np.nan for n in range(n_nodes)])
+
+
+def summarize_strategy(out: dict, rd: dict, rcfg: dict, scenario: str) -> dict:
+    """Reduces the output of `simulate_strategy` to a few figures per run.
+
+    Input: simulation output, prepared run `rd`, `rcfg`, scenario.
+    Procedure: normal records created between ``warmup`` and ``end − end_margin``, split into classes ``group`` and ``sep`` (records of the separated node after the detachment); for each: created,
+    delivered, delays, hop histogram, records that arrived via carry (with delays), delivery by distance band from the leader. Age of the leader's view (how long since it received a
+    NEW record from a node: ``t − max t_create`` of the arrived records) sampled every second from ``warmup``: histogram (60 bins of 1 s, the last collects the rest) and counts beyond the
+    thresholds ``view_age_thresholds``. Separated: last fresh record (age < ``fresh_age``), with time since the detachment and distance from the leader and from the group. Oracle alarm and SOS: delivered and delay.
+    Load: airtime and attempts per node (per second), maximum buffer occupancy, lost records, median announced hops.
+    Output: dict of scalars and small arrays.
+    """
+    t = rd["t"]
+    with_sep = scenario != Scenario.NONE
+    duration = float(t[-1])
+    lo, hi = rcfg["warmup"], duration - rcfg["end_margin"]
+    created, log = out["created"], out["log"]
+    lookup = _log_lookup(log)
+    classes = _class_summaries(created, log, lookup, rd, rcfg, with_sep, lo, hi)
+    view = _view_age(log, rd, rcfg, with_sep, lo, duration)
+    sep_out = _fresh_record(log, rd, rcfg, with_sep)
+    hops_med = _hops_median(rd["ann_grid"])
     return {
-        "classes": classes, "view": view, "sep": sep_out, "oracle": message(1), "sos": message(2),
+        "classes": classes, "view": view, "sep": sep_out, "oracle": _message_outcome(created, log, lookup, KIND_ALARM), "sos": _message_outcome(created, log, lookup, KIND_SOS),
         "breaks": out["breaks"], "break_episodes": out["break_episodes"], "fail_both": out["fail_both"], "bridge_changes": out["bridge_changes"],
         "ttl_drops": out["ttl_drops"], "duplicates": out["duplicates"], "cycles": out["cycles"], "capacity": out["capacity"], "max_packet_bytes_sent": out["max_packet_bytes_sent"],
         "airtime_per_s": out["tx_airtime"] / duration, "packets_per_s": out["attempts"] / duration, "max_occupancy": out["max_occupancy"],
@@ -203,16 +231,16 @@ def summarize_strategy(out: dict, rd: dict, rcfg: dict, scenario: str) -> dict:
 
 
 # ---------------------------------------------------------------------------
-# Lavoro per corsa
+# Work per run
 # ---------------------------------------------------------------------------
 
 
 def process_run_routing(args: tuple) -> dict:
-    """Una corsa del Blocco 7: la prepara una volta (`prepare_run`) e valuta tutte le strategie sulla stessa corsa (stesse stime, stessi beacon, stesso generatore degli unicast).
+    """One Block 7 run: prepares it once (`prepare_run`) and evaluates all strategies on the same run (same estimates, same beacons, same unicast generator).
 
-    Input: `args` = (corsa di `routing_runs`, strategie, dimensioni di pacchetto del confronto ESP-NOW v2 (per `dqrem`), `trace`).
-    Output: ``scenario``, ``index``, ``leader``, ``pos_class``, ``rank``, ``extent``, ``wrong`` (salti sbagliati), ``strategies`` (nome → `summarize_strategy`), ``bytes`` (dimensione → riassunto di `dqrem`),
-    ``elapsed``, ``trace`` (solo se richiesto: decisioni del separato, record del separato, distanza dal gruppo).
+    Input: `args` = (run from `routing_runs`, strategies, packet sizes of the ESP-NOW v2 comparison (for `dqrem`), `trace`).
+    Output: ``scenario``, ``index``, ``leader``, ``pos_class``, ``rank``, ``extent``, ``wrong`` (wrong hops), ``strategies`` (name → `summarize_strategy`), ``bytes`` (size → summary of `dqrem`),
+    ``elapsed``, ``trace`` (only if requested: decisions of the separated node, records of the separated node, distance from the group).
     """
     run, strategies, byte_sweep, trace = args
     t0 = time.perf_counter()
@@ -227,21 +255,21 @@ def process_run_routing(args: tuple) -> dict:
     traced = None
     for name in strategies:
         t1 = time.perf_counter()
-        out = simulate_strategy(rd, name, rcfg, trace=trace and name == "dqrem")
+        out = simulate_strategy(rd, name, rcfg, trace=trace and name == Strategy.DQREM)
         res["strategies"][name] = summarize_strategy(out, rd, rcfg, run["scenario"])
         res["times"][name] = time.perf_counter() - t1
         if "ahp_weights" in out:
             res["weights"][name] = (out["ahp_weights"], out["cr"])
-        if trace and name == "dqrem":
+        if trace and name == Strategy.DQREM:
             traced = out
     for size in byte_sweep:
-        out = simulate_strategy(rd, "dqrem", rcfg, max_packet_bytes=size)
+        out = simulate_strategy(rd, Strategy.DQREM, rcfg, max_packet_bytes=size)
         res["bytes"][size] = summarize_strategy(out, rd, rcfg, run["scenario"])
     if trace and traced is not None and rd["sep_node"] >= 0:
         sep, L = rd["sep_node"], rd["leader"]
         log = traced["log"]
         sel = (log["origin"] == sep) & (log["kind"] == 0)
-        stride = int(round(1.0 / rd["dt"]))
+        stride = second_stride(rd["dt"])
         res["trace"] = {
             "t": rd["t"][::stride], "sep_start": rd["sep_start"], "sep_node": sep, "leader": L,
             "dist_group": min_distance_to_group(rd["distances"][::stride], sep), "dist_leader": rd["distances"][::stride, sep, L].astype(float),
@@ -255,31 +283,27 @@ def process_run_routing(args: tuple) -> dict:
 
 
 def run_all(runs: list, strategies: list, byte_sweep: list, jobs: int, reference: tuple, done: dict | None = None) -> list:
-    """`process_run_routing` su tutte le corse (in parallelo se ``jobs > 1``; risultato indipendente da `jobs`). `reference` = (scenario, indice) della corsa con la traccia; `done` = risultati già pronti per (scenario, indice)."""
+    """`process_run_routing` on all runs (in parallel if ``jobs > 1``; result independent of `jobs`). `reference` = (scenario, index) of the run with the trace; `done` = results already available by (scenario, index)."""
     done = done or {}
     todo = [r for r in runs if (r["scenario"], r["index"]) not in done]
     tasks = [(r, strategies, byte_sweep, (r["scenario"], r["index"]) == reference) for r in todo]
-    if jobs <= 1:
-        outs = [process_run_routing(task) for task in tasks]
-    else:
-        with ProcessPoolExecutor(max_workers=jobs) as pool:
-            outs = list(pool.map(process_run_routing, tasks, chunksize=1))
+    outs = parallel_map(process_run_routing, tasks, jobs)
     allout = list(done.values()) + outs
     return sorted(allout, key=lambda o: (o["scenario"], o["index"]))
 
 
 # ---------------------------------------------------------------------------
-# Aggregazione
+# Aggregation
 # ---------------------------------------------------------------------------
 
 
 def select(outs: list, scenario: str | None = None, pos: int | None = None) -> list:
-    """Corse di `outs` di uno scenario (None = tutti) e con il capogruppo in una posizione (0 coda, 1 centro, 2 testa; None = tutte)."""
+    """Runs of `outs` for a scenario (None = all) and with the leader in a position (0 tail, 1 centre, 2 head; None = all)."""
     return [o for o in outs if (scenario is None or o["scenario"] == scenario) and (pos is None or o["pos_class"] == pos)]
 
 
 def pooled(outs: list, strategy: str, cls: str) -> dict:
-    """Somma sulle corse delle statistiche di una classe (``group`` o ``sep``): creati, consegnati, ritardi concatenati, salti, carry, consegna per fascia di distanza."""
+    """Sum over the runs of the statistics of a class (``group`` or ``sep``): created, delivered, concatenated delays, hops, carry, delivery by distance band."""
     parts = [o["strategies"][strategy]["classes"][cls] for o in outs]
     if not parts:
         return {"created": 0, "delivered": 0, "delays": np.zeros(0), "hops": 0, "carried": 0, "carry_delays": np.zeros(0), "dist_created": 0, "dist_delivered": 0}
@@ -292,21 +316,21 @@ def pooled(outs: list, strategy: str, cls: str) -> dict:
 
 
 def delivery_stats(p: dict) -> tuple:
-    """(frazione consegnata, ritardo mediano s, ritardo p95 s) di una classe già sommata; NaN se non ci sono record."""
+    """(delivered fraction, median delay s, p95 delay s) of an already summed class; NaN if there are no records."""
     frac = p["delivered"] / p["created"] if p["created"] else float("nan")
     return frac, nearest_rank(p["delays"], 0.5), nearest_rank(p["delays"], 0.95)
 
 
 def view_over(outs: list, strategy: str, cls: str) -> tuple:
-    """Frazione di tempo con età della vista oltre ogni soglia (``view_age_thresholds``) e campioni, sommando le corse."""
+    """Fraction of time with view age beyond each threshold (``view_age_thresholds``) and samples, summed over the runs."""
     n = sum(o["strategies"][strategy]["view"][cls]["n"] for o in outs)
     over = sum(o["strategies"][strategy]["view"][cls]["over"] for o in outs) if outs else 0
     return (over / n if n else np.full(2, np.nan)), n
 
 
 def per_run_values(outs: list, strategy: str) -> dict:
-    """Valori per corsa di una strategia (per il confronto a coppie): ``breaks`` (tentativi falliti dopo tutte le ritrasmissioni al primo candidato), ``delivery`` (frazione consegnata, nodi nel gruppo),
-    ``age5`` (frazione di tempo con età della vista > prima soglia, nodi nel gruppo)."""
+    """Per-run values of a strategy (for the paired comparison): ``breaks`` (attempts failed after all retransmissions to the first candidate), ``delivery`` (delivered fraction, nodes in the group),
+    ``age5`` (fraction of time with view age > first threshold, nodes in the group)."""
     breaks = np.array([o["strategies"][strategy]["breaks"] for o in outs], dtype=float)
     delivery = np.array([o["strategies"][strategy]["classes"]["group"]["delivered"] / max(o["strategies"][strategy]["classes"]["group"]["created"], 1) for o in outs])
     age5 = np.array([o["strategies"][strategy]["view"]["group"]["over"][0] / max(o["strategies"][strategy]["view"]["group"]["n"], 1) for o in outs])
@@ -314,18 +338,18 @@ def per_run_values(outs: list, strategy: str) -> dict:
 
 
 def paired_bootstrap(a: dict, b: dict, config: dict) -> dict:
-    """Confronto a coppie `a` (es. ``dqrem``) contro `b` (es. ``best_rssi``) con bootstrap per corsa (generatore ``final.seed_keys.bootstrap`` = chiave 11, ``final.bootstrap_samples`` ricampionamenti).
+    """Paired comparison of `a` (e.g. ``dqrem``) against `b` (e.g. ``best_rssi``) with per-run bootstrap (generator ``final.seed_keys.bootstrap`` = key 11, ``final.bootstrap_samples`` resamples).
 
-    Input: valori per corsa (`per_run_values`) delle due strategie sulle stesse corse. Procedimento: si ricampionano le CORSE con reinserimento, lo stesso ricampionamento per entrambe.
-    Output: ``break_reduction`` = ``1 − Σ rotture(a) / Σ rotture(b)`` (valore e intervallo percentile al livello ``metrics.confidence_level``), ``delivery_diff`` e ``age5_diff`` = medie delle differenze (a − b).
+    Input: per-run values (`per_run_values`) of the two strategies on the same runs. Procedure: the RUNS are resampled with replacement, the same resampling for both.
+    Output: ``break_reduction`` = ``1 − Σ breaks(a) / Σ breaks(b)`` (value and percentile interval at level ``metrics.confidence_level``), ``delivery_diff`` and ``age5_diff`` = means of the differences (a − b).
     """
     rng = bootstrap_rng(config)
     n = len(a["breaks"])
-    idx = rng.integers(0, n, size=(config["final"]["bootstrap_samples"], n))
-    alpha = 1.0 - config["metrics"]["confidence_level"]
+    idx = resample_indices(rng, n, config["final"]["bootstrap_samples"])
+    level = config["metrics"]["confidence_level"]
 
     def interval(values):
-        return tuple(float(x) for x in np.quantile(values, [alpha / 2.0, 1.0 - alpha / 2.0]))
+        return percentile_interval(values, level)
 
     def reduction(ia):
         sb = b["breaks"][ia].sum(axis=-1)
@@ -342,19 +366,19 @@ def paired_bootstrap(a: dict, b: dict, config: dict) -> dict:
 
 
 def predictive_verdict(outs: list, config: dict) -> dict:
-    """La parte predittiva ripaga? ``dqrem`` contro ``best_rssi`` e contro ``dqrem_no_slope`` (`paired_bootstrap`) su tutte le corse e per scenario.
+    """Does the predictive part pay off? ``dqrem`` against ``best_rssi`` and against ``dqrem_no_slope`` (`paired_bootstrap`) over all runs and per scenario.
 
-    Regola fissata prima dei risultati: DQREM "ripaga" rispetto a ``best_rssi`` se riduce le rotture di almeno ``min_break_reduction`` e NON peggiora la consegna, cioè l'estremo superiore
-    dell'intervallo della differenza di consegna è ≥ 0 (la differenza non è significativamente negativa).
-    Output: ``{"all": {...}, scenario: {...}}``, ciascuno con ``vs_best_rssi``, ``vs_no_slope`` e ``pays`` (bool; per tutte le corse e per scenario).
+    Rule fixed before the results: DQREM "pays off" with respect to ``best_rssi`` if it reduces breaks by at least ``min_break_reduction`` and does NOT worsen delivery, i.e. the upper end
+    of the interval of the delivery difference is ≥ 0 (the difference is not significantly negative).
+    Output: ``{"all": {...}, scenario: {...}}``, each with ``vs_best_rssi``, ``vs_no_slope`` and ``pays`` (bool; for all runs and per scenario).
     """
     need = config["routing"]["min_break_reduction"]
     out = {}
-    for key, subset in (("all", outs), *((s, select(outs, s)) for s in ("none", "slowdown", "stop"))):
+    for key, subset in (("all", outs), *((s, select(outs, s)) for s in SCENARIOS)):
         if not subset:
             continue
-        dq = per_run_values(subset, "dqrem")
-        res = {name: paired_bootstrap(dq, per_run_values(subset, other), config) for name, other in (("vs_best_rssi", "best_rssi"), ("vs_no_slope", "dqrem_no_slope"))}
+        dq = per_run_values(subset, Strategy.DQREM.value)
+        res = {name: paired_bootstrap(dq, per_run_values(subset, other), config) for name, other in (("vs_best_rssi", Strategy.BEST_RSSI.value), ("vs_no_slope", Strategy.DQREM_NO_SLOPE.value))}
         v = res["vs_best_rssi"]
         reduction = v["break_reduction"][0]
         res["pays"] = bool(np.isfinite(reduction) and reduction >= need and v["delivery_diff"][1][1] >= 0.0)
@@ -363,7 +387,7 @@ def predictive_verdict(outs: list, config: dict) -> dict:
 
 
 # ---------------------------------------------------------------------------
-# Stampa
+# Printing
 # ---------------------------------------------------------------------------
 
 
@@ -372,27 +396,27 @@ def _f(x, spec):
 
 
 def calibration_text(outs: list, config: dict) -> str:
-    """Calibrazione del gruppo lungo: sigma, estensione mediana/p95 osservata (longitudinale e laterale, media sulle corse ``none``)."""
+    """Calibration of the long group: sigma, observed median/p95 extent (longitudinal and lateral, mean over the ``none`` runs)."""
     none = select(outs, "none") or outs
     e = [o["extent"] for o in none]
     mean = lambda k: float(np.mean([x[k] for x in e]))  # noqa: E731
     g = config["group"]
     return (
-        f"Gruppo lungo: {g['n_nodes']} nodi, estensione longitudinale richiesta p95 {g['longitudinal_spread']:g} m, laterale {g['lateral_spread']:g} m\n"
+        f"Long group: {g['n_nodes']} nodes, requested longitudinal extent p95 {g['longitudinal_spread']:g} m, lateral {g['lateral_spread']:g} m\n"
         f"  sigma_long = {mean('sigma_long'):.3f} m, sigma_lat = {mean('sigma_lat'):.3f} m\n"
-        f"  estensione osservata (media sulle {len(none)} corse): longitudinale mediana {mean('long_median'):.1f} m, p95 {mean('long_p95'):.1f} m;"
-        f" laterale mediana {mean('lat_median'):.1f} m, p95 {mean('lat_p95'):.1f} m"
+        f"  observed extent (mean over the {len(none)} runs): longitudinal median {mean('long_median'):.1f} m, p95 {mean('long_p95'):.1f} m;"
+        f" lateral median {mean('lat_median'):.1f} m, p95 {mean('lat_p95'):.1f} m"
     )
 
 
 def delivery_table(outs: list, config: dict, pos: int | None = None) -> str:
-    """Tabella per strategia e scenario: consegna e ritardo (nodi nel gruppo e separato), età della vista, rotture, cambi di ponte, scarti TTL (per corsa)."""
+    """Table per strategy and scenario: delivery and delay (nodes in the group and separated), view age, breaks, bridge changes, TTL drops (per run)."""
     thr = config["routing"]["view_age_thresholds"]
     lines = [
-        f"{'strategia':<15} {'scen.':<9} {'gr.cons':>7} {'med s':>6} {'p95 s':>6} {'sep.cons':>8} {'med s':>6} {'p95 s':>6}"
-        f" {'>' + format(thr[0], 'g') + 's gr':>7} {'>' + format(thr[1], 'g') + 's gr':>7} {'>' + format(thr[0], 'g') + 's sep':>8} {'rotture/c':>9} {'ep./c':>6} {'ponti/c':>7} {'TTL/c':>5}"
+        f"{'strategy':<15} {'scen.':<9} {'gr.deliv':>7} {'med s':>6} {'p95 s':>6} {'sep.deliv':>8} {'med s':>6} {'p95 s':>6}"
+        f" {'>' + format(thr[0], 'g') + 's gr':>7} {'>' + format(thr[1], 'g') + 's gr':>7} {'>' + format(thr[0], 'g') + 's sep':>8} {'breaks/r':>9} {'ep./r':>6} {'bridges/r':>7} {'TTL/r':>5}"
     ]
-    for scen in ("none", "slowdown", "stop"):
+    for scen in SCENARIOS:
         sub = select(outs, scen, pos)
         if not sub:
             continue
@@ -410,11 +434,11 @@ def delivery_table(outs: list, config: dict, pos: int | None = None) -> str:
 
 
 def separated_table(outs: list, config: dict) -> str:
-    """Nodo separato: ultimo record fresco (tempo dal distacco e distanza), carry (record e ritardo), allarme oracolo e SOS (consegnati e ritardo), per strategia e scenario."""
+    """Separated node: last fresh record (time since the detachment and distance), carry (records and delay), oracle alarm and SOS (delivered and delay), per strategy and scenario."""
     lines = [
-        f"{'strategia':<15} {'scen.':<9} {'fresco t s':>10} {'dist.cap m':>10} {'dist.gr m':>9} {'carry rec':>9} {'carry rit.med s':>15} {'oracolo':>9} {'rit.s':>6} {'SOS':>9} {'rit.s':>6}"
+        f"{'strategy':<15} {'scen.':<9} {'fresh t s':>10} {'dist.ld m':>10} {'dist.gr m':>9} {'carry rec':>9} {'carry med.dly s':>15} {'oracle':>9} {'dly s':>6} {'SOS':>9} {'dly s':>6}"
     ]
-    for scen in ("slowdown", "stop"):
+    for scen in SEPARATED:
         sub = select(outs, scen)
         for name in config["routing"]["strategies"]:
             rows = [o["strategies"][name] for o in sub]
@@ -431,8 +455,8 @@ def separated_table(outs: list, config: dict) -> str:
 
 
 def load_table(outs: list, config: dict) -> str:
-    """Carico: tempo d'aria (frazione del tempo) e pacchetti/s per nodo, massimo fra i nodi e media, per strategia; occupazione massima del buffer e record persi per buffer pieno."""
-    lines = [f"{'strategia':<15} {'aria max %':>10} {'aria media %':>12} {'pkt/s max':>9} {'pkt/s media':>11} {'buffer max':>10} {'persi/corsa':>11} {'duplicati/c':>11}"]
+    """Load: airtime (fraction of time) and packets/s per node, maximum over the nodes and mean, per strategy; maximum buffer occupancy and records lost to a full buffer."""
+    lines = [f"{'strategy':<15} {'air max %':>10} {'air mean %':>12} {'pkt/s max':>9} {'pkt/s mean':>11} {'buffer max':>10} {'lost/run':>11} {'dupl./r':>11}"]
     for name in config["routing"]["strategies"]:
         air = np.array([o["strategies"][name]["airtime_per_s"] for o in outs])
         pkt = np.array([o["strategies"][name]["packets_per_s"] for o in outs])
@@ -444,9 +468,9 @@ def load_table(outs: list, config: dict) -> str:
 
 
 def hops_table(outs: list, config: dict) -> str:
-    """Distribuzione dei salti dei record consegnati (nodi nel gruppo), per strategia, in percentuale."""
+    """Distribution of the hops of the delivered records (nodes in the group), per strategy, in percent."""
     k = config["routing"]["max_hops"] + 1
-    lines = [f"{'strategia':<15} " + " ".join(f"{h:>6d}" for h in range(k)) + "  salti medi"]
+    lines = [f"{'strategia':<15} " + " ".join(f"{h:>6d}" for h in range(k)) + "  mean hops"]
     for name in config["routing"]["strategies"]:
         h = pooled(outs, name, "group")["hops"]
         h = np.asarray(h, dtype=float)
@@ -456,51 +480,46 @@ def hops_table(outs: list, config: dict) -> str:
 
 
 def wrong_hops_text(outs: list) -> str:
-    """Salti annunciati sbagliati: nodi che annunciano un valore finito senza una strada vera (episodi di campioni a 1 s): durata mediana/p95/massima e valore massimo annunciato."""
+    """Wrong announced hops: nodes announcing a finite value without a real path (episodes of 1 s samples): median/p95/maximum duration and maximum announced value."""
     d = np.concatenate([o["wrong"]["durations"] for o in outs])
     peak = np.concatenate([o["wrong"]["max_announced"] for o in outs])
     frac = float(np.mean([o["wrong"]["wrong_fraction"] for o in outs]))
     if len(d) == 0:
-        return "Salti sbagliati: nessun episodio."
+        return "Wrong hops: no episodes."
     return (
-        f"Salti sbagliati dopo aver perso la strada: {len(d)} episodi in {len(outs)} corse ({frac * 100:.2f}% del tempo-nodo); durata mediana {np.median(d):.0f} s, p95 {nearest_rank(d, 0.95):.0f} s,"
-        f" massima {d.max():.0f} s; valore massimo annunciato mediano {np.median(peak):.0f} (max {peak.max()})"
+        f"Wrong hops after losing the path: {len(d)} episodes in {len(outs)} runs ({frac * 100:.2f}% of node-time); median duration {np.median(d):.0f} s, p95 {nearest_rank(d, 0.95):.0f} s,"
+        f" maximum {d.max():.0f} s; median peak announced value {np.median(peak):.0f} (max {peak.max()})"
     )
 
 
 def verdict_text(verdict: dict, config: dict) -> str:
-    """Testo del verdetto: per ciascun insieme di corse, riduzione delle rotture, differenza di consegna ed età con intervalli, e se la parte predittiva ripaga."""
+    """Verdict text: for each set of runs, break reduction, delivery and age difference with intervals, and whether the predictive part pays off."""
     need = config["routing"]["min_break_reduction"]
-    lines = [f"Regola: DQREM ripaga se riduce le rotture di almeno {100 * need:.0f}% rispetto a best_rssi E l'intervallo della differenza di consegna non sta tutto sotto lo zero."]
+    lines = [f"Rule: DQREM pays off if it reduces breaks by at least {100 * need:.0f}% with respect to best_rssi AND the interval of the delivery difference is not entirely below zero."]
     ci = lambda x: f"{x[0]:+.3f} [{x[1][0]:+.3f}, {x[1][1]:+.3f}]"  # noqa: E731
     for key, res in verdict.items():
-        for name, label in (("vs_best_rssi", "dqrem contro best_rssi"), ("vs_no_slope", "dqrem contro dqrem_no_slope")):
+        for name, label in (("vs_best_rssi", "dqrem vs best_rssi"), ("vs_no_slope", "dqrem vs dqrem_no_slope")):
             v = res[name]
             red = v["break_reduction"]
             lines.append(
-                f"  [{key:<8}] {label:<30} rotture {100 * red[0]:+6.1f}% [{100 * red[1][0]:+6.1f}, {100 * red[1][1]:+6.1f}]  consegna {ci(v['delivery_diff'])}  vista>5s {ci(v['age5_diff'])}  (n={v['n_runs']})"
+                f"  [{key:<8}] {label:<30} breaks {100 * red[0]:+6.1f}% [{100 * red[1][0]:+6.1f}, {100 * red[1][1]:+6.1f}]  delivery {ci(v['delivery_diff'])}  view>5s {ci(v['age5_diff'])}  (n={v['n_runs']})"
             )
-        lines.append(f"  [{key:<8}] la parte predittiva RIPAGA rispetto a best_rssi: {'SI' if res['pays'] else 'NO'}")
+        lines.append(f"  [{key:<8}] the predictive part PAYS OFF with respect to best_rssi: {'YES' if res['pays'] else 'NO'}")
     return "\n".join(lines)
 
 
 # ---------------------------------------------------------------------------
-# Portata, connettività, carry del gruppo, confronto fra profili
+# Range, connectivity, group carry, comparison between profiles
 # ---------------------------------------------------------------------------
 
 
 def distance_range(level_dbm: float, config: dict) -> float:
-    """Distanza (m) a cui il solo path loss (``channel.tx_power`` + guadagni − ``PL0 + 10 n log10(d/d0)``) dà `level_dbm`; inversione analitica di `path_loss_db`."""
-    from src.channel import reference_path_loss
-
-    ch = config["channel"]
-    pl = ch["tx_power"] + ch["antenna_gain_tx"] + ch["antenna_gain_rx"] - level_dbm
-    pl0 = reference_path_loss(ch["frequency"], ch["path_loss"]["reference_distance"])
-    return float(ch["path_loss"]["reference_distance"] * 10.0 ** ((pl - pl0) / (10.0 * ch["path_loss"]["exponent"])))
+    """Distance (m) at which path loss alone (``channel.tx_power`` + gains − ``PL0 + 10 n log10(d/d0)``) gives `level_dbm`; analytical inversion of `path_loss_db`."""
+    return distance_from_path_loss(level_dbm, config["channel"])
 
 
 def median_curve(outs: list) -> tuple:
-    """Mediana del segnale (path loss e corpi, senza shadowing, fading e scarti delle schede) per distanza, dall'istogramma sommato sulle corse. Output: (centri di distanza, mediane dBm, campioni)."""
+    """Median of the signal (path loss and bodies, without shadowing, fading and board offsets) per distance, from the histogram summed over the runs. Output: (distance centres, medians dBm, samples)."""
     from src.routing import RANGE_RSSI_EDGES, RANGE_STEP
 
     hist = sum(o["range_hist"].astype(np.int64) for o in outs)
@@ -514,19 +533,19 @@ def median_curve(outs: list) -> tuple:
 
 
 def range_text(outs: list, config: dict) -> str:
-    """Portata stimata: distanza a cui l'RSSI mediano scende a −88 e −96 dBm, solo con la distanza (analitica) e con i corpi (curva delle mediane, corse di tutti gli scenari)."""
+    """Estimated range: distance at which the median RSSI drops to −88 and −96 dBm, with distance only (analytical) and with the bodies (median curve, runs of all scenarios)."""
     dist, med, n = median_curve(outs)
     ok = (n >= 200) & np.isfinite(med)
-    lines = [f"Portata stimata (potenza equivalente {config['channel']['tx_power']:g} dBm; mediane senza shadowing e fading):"]
+    lines = [f"Estimated range (equivalent power {config['channel']['tx_power']:g} dBm; medians without shadowing and fading):"]
     for level in (-88.0, -96.0):
         below = np.flatnonzero(ok & (med <= level))
-        with_body = f"{dist[below[0]]:.1f} m" if len(below) else f"oltre {dist[ok][-1]:.0f} m"
-        lines.append(f"  RSSI mediano {level:g} dBm: solo distanza {distance_range(level, config):.1f} m, con i corpi {with_body}")
+        with_body = f"{dist[below[0]]:.1f} m" if len(below) else f"beyond {dist[ok][-1]:.0f} m"
+        lines.append(f"  median RSSI {level:g} dBm: distance only {distance_range(level, config):.1f} m, with bodies {with_body}")
     return "\n".join(lines)
 
 
 def connectivity_by_rank(outs: list, n_nodes: int) -> tuple:
-    """Frazione di tempo con una strada verso il capogruppo per rango longitudinale del nodo (0 = coda), escluso il capogruppo. Output: (frazioni (N,), campioni (N,))."""
+    """Fraction of time with a path to the leader per longitudinal rank of the node (0 = tail), leader excluded. Output: (fractions (N,), samples (N,))."""
     num, den = np.zeros(n_nodes), np.zeros(n_nodes)
     for o in outs:
         c, rank = o["connectivity"], o["node_rank"]
@@ -538,7 +557,7 @@ def connectivity_by_rank(outs: list, n_nodes: int) -> tuple:
 
 
 def connectivity_summary(outs: list, n_nodes: int) -> dict:
-    """Connettività dell'insieme di corse: frazione media (nodi nel gruppo, capogruppo escluso), frazione di tempo con il gruppo spezzato, frazione del separato dopo il distacco."""
+    """Connectivity of the set of runs: mean fraction (nodes in the group, leader excluded), fraction of time with the group split, fraction of the separated node after the detachment."""
     frac, den = connectivity_by_rank(outs, n_nodes)
     num = sum(float(f * d) for f, d in zip(np.nan_to_num(frac), den))
     split = sum(o["connectivity"]["split"] for o in outs) / max(sum(o["connectivity"]["split_n"] for o in outs), 1)
@@ -548,10 +567,10 @@ def connectivity_summary(outs: list, n_nodes: int) -> dict:
 
 
 def connectivity_table(outs: list, config: dict) -> str:
-    """Connettività verso il capogruppo per scenario: per rango del nodo (0 coda … N−1 testa), media, tempo con il gruppo spezzato, separato dopo il distacco."""
+    """Connectivity to the leader per scenario: by node rank (0 tail … N−1 head), mean, time with the group split, separated node after the detachment."""
     n_nodes = config["group"]["n_nodes"]
-    lines = [f"{'scen.':<9} " + " ".join(f"{'r' + str(r):>6}" for r in range(n_nodes)) + f" {'media':>7} {'spezzato':>9} {'separato':>9}"]
-    for scen in ("none", "slowdown", "stop"):
+    lines = [f"{'scen.':<9} " + " ".join(f"{'r' + str(r):>6}" for r in range(n_nodes)) + f" {'mean':>7} {'split':>9} {'separated':>9}"]
+    for scen in SCENARIOS:
         sub = select(outs, scen)
         if not sub:
             continue
@@ -562,8 +581,8 @@ def connectivity_table(outs: list, config: dict) -> str:
 
 
 def group_carry_text(outs: list, config: dict) -> str:
-    """Telemetria dei nodi nel gruppo che passa per carry (record fermi in coda perché nessun candidato) anche senza distacco: frazione dei consegnati e ritardo mediano/p95, per strategia."""
-    lines = [f"{'strategia':<15} {'carry %':>8} {'carry rit.med s':>15} {'carry rit.p95 s':>15}"]
+    """Telemetry of the nodes in the group that goes through carry (records held in the queue because there is no candidate) even without detachment: fraction of the delivered and median/p95 delay, per strategy."""
+    lines = [f"{'strategy':<15} {'carry %':>8} {'carry med.dly s':>15} {'carry p95 dly s':>15}"]
     for name in config["routing"]["strategies"]:
         p = pooled(outs, name, "group")
         lines.append(f"{name:<15} {100 * p['carried'] / max(p['delivered'], 1):>8.2f} {_f(nearest_rank(p['carry_delays'], 0.5), '15.1f'):>15} {_f(nearest_rank(p['carry_delays'], 0.95), '15.1f'):>15}")
@@ -576,10 +595,10 @@ def hops_mean(outs: list, name: str) -> float:
 
 
 def profile_comparison_text(by_profile: dict, configs: dict) -> str:
-    """Confronto fianco a fianco fra profili di canale (`by_profile`: nome → corse; `configs`: nome → config) per ``best_rssi`` e ``dqrem``, su tutte le corse: consegna e ritardo del gruppo, età della vista,
-    salti, carry, consegna del separato, allarme oracolo e SOS, rotture, riduzione delle rotture (e verdetto), connettività, tempo spezzato, tempo d'aria."""
+    """Side-by-side comparison of channel profiles (`by_profile`: name → runs; `configs`: name → config) for ``best_rssi`` and ``dqrem``, over all runs: group delivery and delay, view age,
+    hops, carry, separated node delivery, oracle alarm and SOS, breaks, break reduction (and verdict), connectivity, split time, airtime."""
     names = list(by_profile)
-    cols = [(p, s) for p in names for s in ("best_rssi", "dqrem")]
+    cols = [(p, s) for p in names for s in (Strategy.BEST_RSSI.value, Strategy.DQREM.value)]
     rows = []
 
     def add(label, fn):
@@ -596,24 +615,24 @@ def profile_comparison_text(by_profile: dict, configs: dict) -> str:
             return (sum(x["delivered"] for x in m) / made if made else float("nan")), (float(np.median(d)) if d else float("nan"))
         return fn
 
-    add("consegna gruppo", lambda o, c, s: f"{delivery(o, c, s)[0]:.4f}")
-    add("ritardo mediano / p95 (s)", lambda o, c, s: f"{_f(delivery(o, c, s)[1], '.1f')} / {_f(delivery(o, c, s)[2], '.1f')}")
-    add("vista > 5 s (gruppo)", lambda o, c, s: f"{float(view_over(o, s, 'group')[0][0]):.4f}")
-    add("vista > 10 s (gruppo)", lambda o, c, s: f"{float(view_over(o, s, 'group')[0][1]):.4f}")
-    add("salti medi", lambda o, c, s: f"{hops_mean(o, s):.2f}")
-    add("carry nel gruppo (%)", lambda o, c, s: f"{100 * pooled(o, s, 'group')['carried'] / max(pooled(o, s, 'group')['delivered'], 1):.2f}")
-    add("consegna separato", lambda o, c, s: _f(delivery_stats(pooled(o, s, "sep"))[0], ".3f"))
-    add("oracolo: consegna / ritardo s", lambda o, c, s: f"{_f(message('oracle')(o, c, s)[0], '.2f')} / {_f(message('oracle')(o, c, s)[1], '.1f')}")
-    add("SOS: consegna / ritardo s", lambda o, c, s: f"{_f(message('sos')(o, c, s)[0], '.2f')} / {_f(message('sos')(o, c, s)[1], '.1f')}")
-    add("rotture per corsa", lambda o, c, s: f"{np.mean([x['strategies'][s]['breaks'] for x in o]):.1f}")
-    add("connettività verso il capogruppo", lambda o, c, s: f"{connectivity_summary(o, c['group']['n_nodes'])['nodes']:.3f}")
-    add("tempo con il gruppo spezzato", lambda o, c, s: f"{connectivity_summary(o, c['group']['n_nodes'])['split']:.3f}")
-    add("tempo d'aria max (%)", lambda o, c, s: f"{100 * max(x['strategies'][s]['airtime_per_s'].max() for x in o):.2f}")
+    add("group delivery", lambda o, c, s: f"{delivery(o, c, s)[0]:.4f}")
+    add("median / p95 delay (s)", lambda o, c, s: f"{_f(delivery(o, c, s)[1], '.1f')} / {_f(delivery(o, c, s)[2], '.1f')}")
+    add("view > 5 s (group)", lambda o, c, s: f"{float(view_over(o, s, 'group')[0][0]):.4f}")
+    add("view > 10 s (group)", lambda o, c, s: f"{float(view_over(o, s, 'group')[0][1]):.4f}")
+    add("mean hops", lambda o, c, s: f"{hops_mean(o, s):.2f}")
+    add("carry in group (%)", lambda o, c, s: f"{100 * pooled(o, s, 'group')['carried'] / max(pooled(o, s, 'group')['delivered'], 1):.2f}")
+    add("separated delivery", lambda o, c, s: _f(delivery_stats(pooled(o, s, "sep"))[0], ".3f"))
+    add("oracle: delivery / delay s", lambda o, c, s: f"{_f(message('oracle')(o, c, s)[0], '.2f')} / {_f(message('oracle')(o, c, s)[1], '.1f')}")
+    add("SOS: delivery / delay s", lambda o, c, s: f"{_f(message('sos')(o, c, s)[0], '.2f')} / {_f(message('sos')(o, c, s)[1], '.1f')}")
+    add("breaks per run", lambda o, c, s: f"{np.mean([x['strategies'][s]['breaks'] for x in o]):.1f}")
+    add("connectivity to the leader", lambda o, c, s: f"{connectivity_summary(o, c['group']['n_nodes'])['nodes']:.3f}")
+    add("time with the group split", lambda o, c, s: f"{connectivity_summary(o, c['group']['n_nodes'])['split']:.3f}")
+    add("max airtime (%)", lambda o, c, s: f"{100 * max(x['strategies'][s]['airtime_per_s'].max() for x in o):.2f}")
     width = max(len(r[0]) for r in rows)
     head = f"{'':<{width}} " + " ".join(f"{p + ' ' + s:>26}" for p, s in cols)
     lines = [head] + [f"{label:<{width}} " + " ".join(f"{v:>26}" for v in vals) for label, vals in rows]
     for p in names:
         v = predictive_verdict(by_profile[p], configs[p])["all"]
         red = v["vs_best_rssi"]["break_reduction"]
-        lines.append(f"[{p}] dqrem contro best_rssi: rotture {100 * red[0]:+.1f}% [{100 * red[1][0]:+.1f}, {100 * red[1][1]:+.1f}], ripaga: {'SI' if v['pays'] else 'NO'}")
+        lines.append(f"[{p}] dqrem vs best_rssi: breaks {100 * red[0]:+.1f}% [{100 * red[1][0]:+.1f}, {100 * red[1][1]:+.1f}], pays off: {'YES' if v['pays'] else 'NO'}")
     return "\n".join(lines)

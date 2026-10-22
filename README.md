@@ -1,15 +1,14 @@
 # manet-sim
 
-Simulatore Python per validare, prima di avere l'hardware, l'algoritmo di rilevamento
-della separazione di una MANET predittiva per il monitoraggio e la sicurezza di gruppi
-podistici. La rete è una mesh di dispositivi indossabili basati su ESP32 che rileva
-quando un corridore si separa dal gruppo, analizzando l'andamento dell'RSSI dei link
-radio.
+Python simulator to validate, before the hardware is available, the separation-detection
+algorithm of a predictive MANET for monitoring and safety of running groups.
+The network is a mesh of ESP32-based wearable devices that detects when a runner
+separates from the group by analysing the trend of the RSSI of the radio links.
 
 
 ## Setup
 
-Python 3.13.1 (sviluppato e testato con questa versione), librerie con versioni esatte in `requirements.txt`.
+Python 3.13.1 (developed and tested with this version), libraries with exact versions in `requirements.txt`.
 
 ```bash
 python3 -m venv venv
@@ -17,96 +16,96 @@ source venv/bin/activate
 pip install -r requirements.txt
 ```
 
-## Test
+## Tests
 
 ```bash
 pytest
 ```
 
-## Ispezione visiva
+## Visual inspection
 
 ```bash
-python scripts/plot_mobility.py                    # usa config/default.yaml
-python scripts/plot_mobility.py path/al/config.yaml # configurazione alternativa
-python scripts/plot_channel.py                     # Blocco 2: RSSI, shadowing, corpi (3 simulazioni)
-python scripts/plot_packets.py                     # Blocco 3: beacon, ricezione, conoscenza dei nodi
-python scripts/run_detection_experiment.py         # Blocco 4: corse, sweep, risultati in results/detection/
-python scripts/run_detection_experiment.py --jobs 4  # numero di processi (default: tutti i core)
-python scripts/plot_detector.py                    # Blocco 4: figure e riepilogo a console
-python scripts/run_block5_experiment.py            # Blocco 5: varianti A-F, risultati in results/block5/
-python scripts/run_block5_experiment.py --jobs 8   # numero di processi
-python scripts/plot_block5.py                      # Blocco 5: sette figure in results/block5/
-python scripts/run_block6_experiment.py            # Blocco 6: soglie congelate, verifica, verdetto, sensibilità (results/block6/)
-python scripts/plot_block6.py                      # Blocco 6: sei figure in results/block6/
-python scripts/reproduce_all.py                    # TUTTO: figure dei Blocchi 1-6 e results/final_summary.md
-python scripts/reproduce_all.py --clean            # idem, ripartendo senza cache
+python scripts/plot_mobility.py                    # uses config/default.yaml
+python scripts/plot_mobility.py path/to/config.yaml # alternative configuration
+python scripts/plot_channel.py                     # Block 2: RSSI, shadowing, bodies (3 simulations)
+python scripts/plot_packets.py                     # Block 3: beacons, reception, node knowledge
+python scripts/run_detection_experiment.py         # Block 4: runs, sweeps, results in results/block4/
+python scripts/run_detection_experiment.py --jobs 4  # number of processes (default: all cores)
+python scripts/plot_detector.py                    # Block 4: figures and console summary
+python scripts/run_block5_experiment.py            # Block 5: variants A-F, results in results/block5/
+python scripts/run_block5_experiment.py --jobs 8   # number of processes
+python scripts/plot_block5.py                      # Block 5: seven figures in results/block5/
+python scripts/run_block6_experiment.py            # Block 6: frozen thresholds, verification, verdict, sensitivity (results/block6/)
+python scripts/plot_block6.py                      # Block 6: six figures in results/block6/
+python scripts/reproduce_all.py                    # EVERYTHING: figures of Blocks 1-7 and results/final_summary.md
+python scripts/reproduce_all.py --clean            # same, starting without cache
 ```
 
-Gli script dei Blocchi 4-5 rimettono i valori del Blocco 4 (`history.block4` in `config/default.yaml`): i default di `config/default.yaml`
-descrivono dal Blocco 6 il rilevatore finale (soglia congelata, spegnimento 30 s).
+The Block 4-5 scripts restore the Block 4 values (`history.block4` in `config/default.yaml`): since Block 6, the defaults of `config/default.yaml`
+describe the final detector (frozen threshold, 30 s release).
 
-`run_detection_experiment.py` mette in cache i Blocchi 1-3 di ogni corsa in `results/cache/`
-(chiave = seme + hash della configurazione usata): la prima esecuzione è lenta, le successive no.
+`run_detection_experiment.py` caches Blocks 1-3 of every run in `results/cache/`
+(key = seed + hash of the configuration used): the first execution is slow, later ones are not.
 
-Le figure vengono salvate in `results/` (cartella ignorata da git).
+The figures are saved in `results/blockN/` (folder ignored by git).
 
-## Configurazione
+## Configuration
 
-Tutti i parametri numerici del modello vivono in `config/default.yaml` — nessuna
-costante è cablata nel codice.
+All the numeric parameters of the model live in `config/default.yaml` — no
+constant is hard-coded in the code.
 
-## Stato
+## Status
 
-- [x] **Blocco 1 — Mobilità**: traiettorie dei nodi lungo una traccia GPX reale,
-  formazione del gruppo con un processo del secondo ordine a smorzamento critico e repulsione fra i corridori, evento di separazione.
-- [x] **Blocco 2 — Modello di canale**: RSSI per coppia ordinata (attenuazione con la distanza,
-  shadowing correlato a mappa condivisa, torso e altri corridori, fading di Rice, scarti delle schede,
-  saturazione e quantizzazione).
-- [x] **Blocco 3 — Pacchetti e beacon**: istanti dei beacon ESP-NOW con jitter, ricezione
-  (curva logistica sulla sensibilità × perdita di fondo), RSSI riportato, tabella dei vicini nei beacon
-  e conoscenza di ogni nodo (con età dell'informazione).
-- [x] **Blocco 4 — Rilevatore**: Kalman per link (accelerazione casuale continua), tabella dei vicini
-  a 5 byte, fusione per bersaglio, pre-allarme e allarme "nodo perso", allarme di sistema, metriche
-  (probabilità di rilevamento, ritardo, falsi allarmi per ora) e sweep su `sigma_a`, modalità, ambito e soglia.
-  Dal distacco in poi la repulsione del Blocco 1 è a senso unico: il nodo separato non la subisce
-  (il gruppo lo aggira), così la sua velocità è esattamente quella imposta (anche 0).
-- [x] **Blocco 5 — Rilevatore rifinito**: cinque modifiche opzionali, ognuna con default che riproduce
-  esattamente il Blocco 4 (test `test_default_reproduces_block4`, su un riferimento generato con il codice del
-  Blocco 4): (A) regola di fusione `weighted_mean` | `median` | `max` (`src/fusion.py`) e `min_observers`;
-  (B) livello relativo, cioè calo rispetto a una linea di base per link che si congela durante il distacco
-  (`src/relative.py`, ciclo sequenziale in numba); (C) spegnimento lento (`release_time`); (D) robustezza del
-  Kalman ai salti da corpo (`kalman.robust`: `inflate` | `nis_gate`); (E) shadowing indipendente invece che condiviso.
-  Ogni variante si confronta con la base a coppie (corse guadagnate e perse) sulle stesse 150 corse in cache; la
-  regola di scelta è in `src/refinement.py`. Poi si combinano le vincenti (F).
-- [x] **Blocco 6 — Numeri finali, sensibilità e chiusura** (vedi sotto)
-- [x] Blocco 7 — Routing
+- [x] **Block 1 — Mobility**: node trajectories along a real GPX track,
+  group formation with a critically damped second-order process and repulsion between runners, separation event.
+- [x] **Block 2 — Channel model**: RSSI per ordered pair (distance attenuation,
+  correlated shadowing on a shared map, torso and other runners, Rician fading, board offsets,
+  saturation and quantization).
+- [x] **Block 3 — Packets and beacons**: ESP-NOW beacon times with jitter, reception
+  (logistic curve on the sensitivity × background loss), reported RSSI, neighbour table in the beacons
+  and knowledge of each node (with age of the information).
+- [x] **Block 4 — Detector**: per-link Kalman (continuous random acceleration), 5-byte neighbour
+  table, per-target fusion, pre-alarm and "lost node" alarm, system alarm, metrics
+  (detection probability, delay, false alarms per hour) and sweeps over `sigma_a`, mode, scope and threshold.
+  From the separation onwards the repulsion of Block 1 is one-way: the separated node does not feel it
+  (the group goes around it), so its speed is exactly the imposed one (even 0).
+- [x] **Block 5 — Refined detector**: five optional changes, each with a default that exactly reproduces
+  Block 4 (test `test_default_reproduces_block4`, on a reference generated with the Block 4 code):
+  (A) fusion rule `weighted_mean` | `median` | `max` (`src/fusion.py`) and `min_observers`;
+  (B) relative level, i.e. drop with respect to a per-link baseline that freezes during the separation
+  (`src/relative.py`, sequential loop in numba); (C) slow release (`release_time`); (D) Kalman robustness
+  to body jumps (`kalman.robust`: `inflate` | `nis_gate`); (E) independent shadowing instead of shared.
+  Each variant is compared with the base pairwise (runs gained and lost) on the same 150 cached runs; the
+  selection rule is in `src/refinement.py`. Then the winners are combined (F).
+- [x] **Block 6 — Final numbers, sensitivity and wrap-up** (see below)
+- [x] Block 7 — Routing
 
-`numba` è una dipendenza del solo livello relativo (`pip install -r requirements.txt`); senza numba il codice
-gira in Python puro, molto più lento.
+`numba` is a dependency of the relative level only (`pip install -r requirements.txt`); without numba the code
+runs in pure Python, much more slowly.
 
-**Riproduzione con un comando:** `python scripts/reproduce_all.py` (circa 1,5 minuti con la cache e i risultati già presenti; con `--clean`
-ricalcola tutto: cache, esperimenti dei Blocchi 4-6, vedi i tempi stampati; la cache occupa circa 5 GB).
+**One-command reproduction:** `python scripts/reproduce_all.py` (about 1.5 minutes with the cache and results already present; with `--clean`
+it recomputes everything: cache, experiments of Blocks 4-6, see the printed timings; the cache takes about 5 GB).
 
-| Figura | Script |
+| Figure | Script |
 | --- | --- |
-| Blocchi 1-3 (mobilità, canale, pacchetti) | `plot_mobility.py`, `plot_channel.py`, `plot_packets.py` |
-| Blocco 4 (`results/*.png`) | `plot_detector.py` (dopo `run_detection_experiment.py`) |
-| Blocco 5 (`results/block5/*.png`) | `plot_block5.py` (dopo `run_block5_experiment.py`) |
-| `final_tradeoff.png`, `detection_distance.png`, `detection_delay.png`, `tuning_vs_test.png`, `sensitivity.png`, `burst_example.png` | `plot_block6.py` (dopo `run_block6_experiment.py`) |
-| `results/final_summary.md` | `reproduce_all.py` (generato dal codice) |
+| Blocks 1-3 (`results/block1/`, `block2/`, `block3/`) | `plot_mobility.py`, `plot_channel.py`, `plot_packets.py` |
+| Block 4 (`results/block4/*.png`) | `plot_detector.py` (after `run_detection_experiment.py`) |
+| Block 5 (`results/block5/*.png`) | `plot_block5.py` (after `run_block5_experiment.py`) |
+| `final_tradeoff.png`, `detection_distance.png`, `detection_delay.png`, `tuning_vs_test.png`, `sensitivity.png`, `burst_example.png` | `plot_block6.py` (after `run_block6_experiment.py`) |
+| `results/final_summary.md` | `reproduce_all.py` (generated by the code) |
 
-**Generatori casuali** (`SeedSequence(simulation.seed, spawn_key=(k,))`, o il seme della corsa per i Blocchi 3):
+**Random generators** (`SeedSequence(simulation.seed, spawn_key=(k,))`, or the run seed for Block 3):
 
-| Chiave | Uso |
+| Key | Use |
 | --- | --- |
-| 0-3 | Blocco 2: mappa di shadowing, shadowing indipendente, scarti delle schede, fading (`ss.spawn(4)` di `SeedSequence(seed)`) |
-| 4 | Blocco 3: istanti dei beacon |
-| 5 | Blocco 3: ricezione (segnale e fondo) |
-| 6 | Blocchi 4-5 (taratura): nodo e istante del distacco |
-| 7 | Blocchi 4-5 (taratura): semi delle corse |
-| 8 | Blocco 6 (verifica): semi delle corse |
-| 9 | Blocco 6 (verifica): nodo e istante del distacco |
-| 10 | Blocco 3: raffiche di Gilbert-Elliott (`background_model: bursty`) |
-| 11 | Blocco 6: ricampionamenti del bootstrap (scelta mia, non prevista dalla specifica) |
+| 0-3 | Block 2: shadowing map, independent shadowing, board offsets, fading (`ss.spawn(4)` of `SeedSequence(seed)`) |
+| 4 | Block 3: beacon times |
+| 5 | Block 3: reception (signal and background) |
+| 6 | Blocks 4-5 (tuning): node and time of the separation |
+| 7 | Blocks 4-5 (tuning): run seeds |
+| 8 | Block 6 (verification): run seeds |
+| 9 | Block 6 (verification): node and time of the separation |
+| 10 | Block 3: Gilbert-Elliott bursts (`background_model: bursty`) |
+| 11 | Block 6: bootstrap resamplings (my choice, not foreseen by the specification) |
 
-Il Blocco 1 usa un generatore unico `default_rng(seed)` (e `calibration.seed` per la calibrazione).
+Block 1 uses a single generator `default_rng(seed)` (and `calibration.seed` for the calibration).

@@ -1,10 +1,9 @@
-"""Test del Blocco 6: config del Blocco 4 e pacchetti intatti, insiemi separati, soglie congelate, Gilbert-Elliott, `not_deaf`, verdetto, bootstrap, cache.
+"""Block 6 tests: Block 4 config and packets intact, separate sets, frozen thresholds, Gilbert-Elliott, `not_deaf`, verdict, bootstrap, cache.
 
-Ogni test verifica un fatto noto (riferimento generato con il codice precedente, formula chiusa, calcolo a mano o confronto indipendente).
+Each test checks a known fact (reference generated with the previous code, closed formula, hand calculation or independent comparison).
 """
 
 import copy
-import importlib.util
 import math
 from pathlib import Path
 
@@ -12,38 +11,24 @@ import numpy as np
 import pytest
 from scipy.stats import expon
 
-from src.mobility import load_config
+from src.common.paths import REPO_ROOT as ROOT
+from tests.helpers import load_module, short_config
 
-ROOT = Path(__file__).resolve().parent.parent
-CONFIG_PATH = ROOT / "config" / "default.yaml"
 DATA = Path(__file__).resolve().parent / "data"
 
 
-@pytest.fixture(scope="session")
-def base_config():
-    return load_config(CONFIG_PATH)
-
-
-@pytest.fixture
-def cfg(base_config):
-    return copy.deepcopy(base_config)
-
-
 def _load(name):
-    spec = importlib.util.spec_from_file_location(name, DATA / f"{name}.py")
-    module = importlib.util.module_from_spec(spec)
-    spec.loader.exec_module(module)
-    return module
+    return load_module(name, DATA / f"{name}.py")
 
 
 # ---------------------------------------------------------------------------
-# 1. Blocchi 3, 4 e 5 intatti
+# 1. Blocks 3, 4 and 5 intact
 # ---------------------------------------------------------------------------
 
 
 @pytest.mark.parametrize("scenario", ["none", "slowdown", "stop"])
 def test_block4_config_still_reproduces_block4(scenario):
-    """Con la config del Blocco 4 fissata esplicitamente (release_time 5 s compreso) allarmi e metriche coincidono con il riferimento del Blocco 4."""
+    """With the Block 4 config fixed explicitly (release_time 5 s included) alarms and metrics match the Block 4 reference."""
     module = _load("make_block4_reference")
     config = module.reference_config()
     assert config["detector"]["release_time"] == 5.0 and config["kalman"]["sigma_a"] == 0.5 and config["detector"]["lost_rule"] == "any"
@@ -57,7 +42,7 @@ def test_block4_config_still_reproduces_block4(scenario):
 
 @pytest.mark.parametrize("scenario", ["none", "slowdown", "stop"])
 def test_independent_model_reproduces_block3(scenario):
-    """Con ``background_model: independent`` pacchetti e conoscenza coincidono bit per bit con il riferimento generato prima dell'opzione (commit 0b8c38d)."""
+    """With ``background_model: independent`` packets and knowledge match bit for bit the reference generated before the option (commit 0b8c38d)."""
     module = _load("make_block3_reference")
     config = module.reference_config()
     assert config["packets"]["reception"]["background_model"] == "independent"
@@ -70,7 +55,7 @@ def test_independent_model_reproduces_block3(scenario):
 
 
 def test_lost_rule_any_alarms_identical_to_default_call(cfg):
-    """`lost_alarm` con ``lost_rule: any`` (anche passando i dati di sordità) dà gli stessi allarmi della chiamata di prima."""
+    """`lost_alarm` with ``lost_rule: any`` (even when passing the deafness data) gives the same alarms as the earlier call."""
     from src.detector import lost_alarm
 
     t = np.arange(0, 100.0, 0.1)
@@ -86,39 +71,39 @@ def test_lost_rule_any_alarms_identical_to_default_call(cfg):
 
 
 # ---------------------------------------------------------------------------
-# 2. Insiemi separati
+# 2. Separate sets
 # ---------------------------------------------------------------------------
 
 
 def test_tuning_and_verification_sets_are_disjoint_and_paired(cfg):
-    """Nessun seme in comune fra taratura e verifica; slowdown e stop di verifica hanno stessi semi, nodi e istanti (nell'intervallo di config)."""
+    """No seed in common between tuning and verification; verification slowdown and stop have the same seeds, nodes and instants (within the config range)."""
     from src.final import run_sets
 
     tuning, verification = run_sets(cfg)
     assert len(tuning) == 3 * cfg["metrics"]["n_runs"] and len(verification) == 3 * cfg["final"]["n_runs"]
     seeds_t, seeds_v = {r["seed"] for r in tuning}, {r["seed"] for r in verification}
     assert not seeds_t & seeds_v
-    assert len({r["seed"] for r in verification if r["scenario"] == "none"}) == cfg["final"]["n_runs"]  # semi distinti
+    assert len({r["seed"] for r in verification if r["scenario"] == "none"}) == cfg["final"]["n_runs"]  # distinct seeds
     by = lambda s: [r for r in verification if r["scenario"] == s]  # noqa: E731
     for a, b in zip(by("slowdown"), by("stop")):
         assert (a["seed"], a["node"], a["start"]) == (b["seed"], b["node"], b["start"])
     lo, hi = cfg["metrics"]["separation_start_range"]
     assert all(lo <= r["start"] <= hi and 0 <= r["node"] < cfg["group"]["n_nodes"] for r in verification)
-    # le chiavi sono quelle dichiarate: i semi di verifica riproducibili da SeedSequence(seed, spawn_key=(8,))
+    # the keys are the declared ones: verification seeds reproducible from SeedSequence(seed, spawn_key=(8,))
     expect = np.random.SeedSequence(cfg["simulation"]["seed"], spawn_key=(8,)).generate_state(cfg["final"]["n_runs"]).astype(np.int64)
     assert [r["seed"] for r in by("none")] == expect.tolist()
-    # la taratura è quella dei Blocchi 4-5 (chiave 7), invariata
+    # tuning is that of Blocks 4-5 (key 7), unchanged
     expect_t = np.random.SeedSequence(cfg["simulation"]["seed"], spawn_key=(7,)).generate_state(cfg["metrics"]["n_runs"]).astype(np.int64)
     assert [r["seed"] for r in tuning if r["scenario"] == "none"] == expect_t.tolist()
 
 
 # ---------------------------------------------------------------------------
-# 3. Soglie congelate
+# 3. Frozen thresholds
 # ---------------------------------------------------------------------------
 
 
 def _synthetic_outs(n_runs, best_threshold_index, seed=0):
-    """Esiti sintetici (corse none e con distacco) per una configurazione ``media``: P_d massima alla soglia `best_threshold_index`, nessun falso allarme."""
+    """Synthetic outcomes (none and separation runs) for a ``media`` configuration: maximum P_d at threshold `best_threshold_index`, no false alarms."""
     grid = np.array([-80.0, -75.0, -70.0])
     rng = np.random.default_rng(seed)
     outs = []
@@ -142,16 +127,16 @@ def _synthetic_outs(n_runs, best_threshold_index, seed=0):
 
 
 def test_evaluation_uses_frozen_threshold_not_the_best_on_verification(cfg):
-    """`evaluate_at` usa la soglia che gli si dà (quella del file): sulla verifica il massimo è a -70, ma si valuta a -75; cambiare le corse non sposta la soglia."""
+    """`evaluate_at` uses the threshold it is given (the file one): on verification the maximum is at -70, but it evaluates at -75; changing the runs does not move the threshold."""
     from src.final import evaluate_at, load_frozen, write_frozen
 
-    outs = _synthetic_outs(20, best_threshold_index=2)  # sulla verifica la soglia migliore sarebbe -70
+    outs = _synthetic_outs(20, best_threshold_index=2)  # on verification the best threshold would be -70
     e75 = evaluate_at(outs, "media", "any", -75.0, cfg)
     e70 = evaluate_at(outs, "media", "any", -70.0, cfg)
     assert e75["summary"]["sep"]["stop"]["p_detect"] == 0.0 and e70["summary"]["sep"]["stop"]["p_detect"] > 0.5
     with pytest.raises(ValueError):
-        evaluate_at(outs, "media", "any", -73.0, cfg)  # una soglia fuori griglia non si arrotonda in silenzio
-    # il file: scritto una volta, riletto; con altre corse il valore letto non cambia
+        evaluate_at(outs, "media", "any", -73.0, cfg)  # an off-grid threshold is not silently rounded
+    # the file: written once, read back; with other runs the value read does not change
     import tempfile
 
     path = Path(tempfile.mkdtemp()) / "frozen.yaml"
@@ -164,7 +149,7 @@ def test_evaluation_uses_frozen_threshold_not_the_best_on_verification(cfg):
 
 
 def test_only_freeze_thresholds_chooses_a_threshold():
-    """Nel codice di valutazione e degli script di verifica non c'è altra scelta di soglia: `working_point` si usa solo in `freeze_thresholds`, `retuned_point` (informativo)."""
+    """In the evaluation code and verification scripts there is no other threshold choice: `working_point` is used only in `freeze_thresholds`, `retuned_point` (informative)."""
     import re
 
     text = (ROOT / "src" / "final.py").read_text()
@@ -184,7 +169,7 @@ def test_only_freeze_thresholds_chooses_a_threshold():
 
 @pytest.mark.parametrize("loss, burst", [(0.02, 1.0), (0.05, 3.0)])
 def test_gilbert_elliott_fraction_duration_and_exponential_bursts(loss, burst):
-    """Su una catena lunga: frazione disturbata = L, durata media = T_b (entro 5%), raffiche oltre 10 s ≈ exp(-10/T_b) (esponenziali)."""
+    """On a long chain: disturbed fraction = L, mean duration = T_b (within 5%), bursts over 10 s ≈ exp(-10/T_b) (exponential)."""
     from src.packets import burst_lengths, gilbert_elliott_states
 
     dt = 0.1
@@ -194,20 +179,20 @@ def test_gilbert_elliott_fraction_duration_and_exponential_bursts(loss, burst):
     assert abs(state.mean() / loss - 1.0) < 0.05
     lengths = burst_lengths(state, dt)
     assert len(lengths) > 500
-    # la discretizzazione a passo dt dà una durata geometrica con media dt / (1 - exp(-dt/T_b)) ≈ T_b + dt/2: si confronta con quella
+    # discretization at step dt gives a geometric duration with mean dt / (1 - exp(-dt/T_b)) ≈ T_b + dt/2: compare with that
     expected_mean = dt / (1.0 - math.exp(-dt / burst))
     assert abs(lengths.mean() / expected_mean - 1.0) < 0.05
-    assert abs(lengths.mean() / burst - 1.0) < 0.07  # e con T_b, nei limiti della discretizzazione
+    assert abs(lengths.mean() / burst - 1.0) < 0.07  # and with T_b, within the discretization limits
     tail = (lengths > 10.0).mean()
     assert abs(tail - math.exp(-10.0 / burst)) < 4 * math.sqrt(math.exp(-10.0 / burst) * (1 - math.exp(-10.0 / burst)) / len(lengths)) + 0.01
-    # esponenziale: Kolmogorov-Smirnov contro la durata continua (tolleranza della discretizzazione)
+    # exponential: Kolmogorov-Smirnov against the continuous duration (discretization tolerance)
     from scipy.stats import kstest
 
     assert kstest(lengths - dt / 2.0, expon(scale=burst).cdf).statistic < 0.06
 
 
 def test_gilbert_elliott_start_is_stationary_and_chain_independent():
-    """Lo stato iniziale è estratto dalla stazionaria (frazione L su molte catene); catene diverse non sono identiche."""
+    """The initial state is drawn from the stationary distribution (fraction L over many chains); different chains are not identical."""
     from src.packets import gilbert_elliott_states
 
     state = gilbert_elliott_states(2, (20000,), 0.1, {"mean_loss": 0.3, "mean_burst": 2.0}, np.random.default_rng(0))
@@ -216,7 +201,7 @@ def test_gilbert_elliott_start_is_stationary_and_chain_independent():
 
 
 def _simulate_with_strong_signal(cfg, scope, seed=3, duration=400.0):
-    """`simulate_packets` con un canale finto a segnale fortissimo (la prova del segnale passa sempre): si vedono solo le perdite di fondo."""
+    """`simulate_packets` with a fake very-strong-signal channel (the signal test always passes): only background losses show."""
     from types import SimpleNamespace
 
     from src.packets import simulate_packets
@@ -235,7 +220,7 @@ def _simulate_with_strong_signal(cfg, scope, seed=3, duration=400.0):
 
 
 def test_bursty_receiver_scope_loses_all_beacons_to_that_receiver_together(cfg):
-    """Con ``burst_scope: receiver`` e segnale forte, un beacon è perso esattamente quando il RICEVITORE è nello stato disturbato (qualunque il trasmettitore)."""
+    """With ``burst_scope: receiver`` and strong signal, a beacon is lost exactly when the RECEIVER is in the disturbed state (whatever the transmitter)."""
     pk, cfg2 = _simulate_with_strong_signal(cfg, "receiver")
     state = pk.background_state  # (T, N)
     assert state.ndim == 2
@@ -247,29 +232,29 @@ def test_bursty_receiver_scope_loses_all_beacons_to_that_receiver_together(cfg):
                 continue
             ok = pk.beacon_steps[i] >= 0
             bad = state[pk.beacon_steps[i][ok], j]
-            np.testing.assert_array_equal(pk.received[i][ok, j], ~bad)  # perso <=> disturbato, senza eccezioni (loss_bad = 1)
+            np.testing.assert_array_equal(pk.received[i][ok, j], ~bad)  # lost <=> disturbed, no exceptions (loss_bad = 1)
             checked += int(bad.sum())
-    assert checked > 100  # il test non è vuoto
-    # nello stesso istante i beacon di trasmettitori diversi verso j si perdono insieme: la frazione di tempo disturbato di j è la stessa per tutti
+    assert checked > 100  # the test is not empty
+    # at the same instant beacons from different transmitters to j are lost together: the disturbed-time fraction of j is the same for all
     assert 0.05 < state.mean() < 0.2
 
 
 def test_bursty_link_scope_is_independent_between_links(cfg):
-    """Con ``burst_scope: link`` lo stato è per coppia (T, N, N) e due link verso lo stesso ricevitore non sono perfettamente correlati."""
+    """With ``burst_scope: link`` the state is per pair (T, N, N) and two links to the same receiver are not perfectly correlated."""
     pk, _ = _simulate_with_strong_signal(cfg, "link")
     state = pk.background_state
     assert state.ndim == 3 and not np.array_equal(state[:, 0, 2], state[:, 1, 2])
 
 
 def test_bursty_does_not_touch_streams_4_and_5(cfg):
-    """Con ``bursty`` gli istanti dei beacon (chiave 4) e le uniformi del segnale (chiave 5) sono gli stessi che con ``independent``."""
+    """With ``bursty`` the beacon instants (key 4) and the signal uniforms (key 5) are the same as with ``independent``."""
     from types import SimpleNamespace
 
     from src.packets import simulate_packets
 
     cfg = copy.deepcopy(cfg)
     t = np.arange(0.0, 200.0, cfg["simulation"]["dt"])
-    rssi = np.full((len(t), 4, 4), -95.0)  # nella zona di transizione: il segnale decide in parte
+    rssi = np.full((len(t), 4, 4), -95.0)  # in the transition zone: the signal partly decides
     ch = SimpleNamespace(t=t, rssi_true=rssi, rssi_measured=rssi.copy())
     a = simulate_packets(None, ch, cfg)
     cfg["packets"]["reception"]["background_model"] = "bursty"
@@ -284,7 +269,7 @@ def test_bursty_does_not_touch_streams_4_and_5(cfg):
 
 
 def _beacons(n_nodes, t_end, period=0.5):
-    """Beacon periodici sfasati (nodo k a k * period / n_nodes)."""
+    """Periodic staggered beacons (node k at k * period / n_nodes)."""
     times = np.array([np.arange(k * period / n_nodes, t_end, period) for k in range(n_nodes)])
     return times
 
@@ -301,29 +286,29 @@ def _lost_system_for_observer(cfg, received, times, t, rule, m=0):
 
 @pytest.mark.parametrize("rule", ["not_deaf", "not_deaf_episode"])
 def test_not_deaf_deaf_observer_does_not_alarm_but_blind_to_one_target_does(cfg, rule):
-    """Osservatore 0 che non sente nessuno per 15 s: niente "perso" con `not_deaf` (sì con `any`); osservatore che sente gli altri ma non `i`: "perso" (come `any`)."""
+    """Observer 0 hearing no one for 15 s: no "lost" with `not_deaf` (yes with `any`); observer hearing the others but not `i`: "lost" (as with `any`)."""
     n, t_end = 5, 120.0
     t = np.arange(0.0, t_end, 0.1)
     times = _beacons(n, t_end)
-    # (a) 0 sordo per 15 s (da 40 a 55 s): non riceve nessun beacon in quell'intervallo
+    # (a) 0 deaf for 15 s (from 40 to 55 s): receives no beacon in that interval
     received = np.ones((n, times.shape[1], n), bool)
     received[np.arange(n), :, np.arange(n)] = False
     deaf = (times >= 40.0) & (times < 55.0)
     received[:, :, 0] &= ~deaf
     any_ = _lost_system_for_observer(cfg, received, times, t, "any")
     nd = _lost_system_for_observer(cfg, received, times, t, rule)
-    assert any_[:, 1:].any()  # senza la regola l'osservatore sordo dichiara persi i vicini
-    window = (t > 20.0) & (t < 54.0)  # il periodo sordo è 40-55 s
+    assert any_[:, 1:].any()  # without the rule the deaf observer declares the neighbors lost
+    window = (t > 20.0) & (t < 54.0)  # the deaf period is 40-55 s
     if rule == "not_deaf_episode":
-        assert not nd[window].any()  # decisione per episodio: nessun "perso" da parte dell'osservatore sordo
+        assert not nd[window].any()  # per-episode decision: no "lost" from the deaf observer
     else:
-        # regola letterale (finestra mobile di `lost_silence`): i beacon dei vicini sono sfasati, quindi ogni vicino supera 10 s di silenzio mentre `m`
-        # ha ancora sentito qualcuno nella finestra (i vicini con ultimo beacon più recente) e il "perso" a scatto resta acceso. Solo l'ultimo vicino
-        # sentito (finestra ormai vuota) è soppresso: su 4 vicini ne restano in allarme 3. Con `any` sono 4.
+        # literal rule (sliding window of `lost_silence`): neighbor beacons are staggered, so each neighbor exceeds 10 s of silence while `m`
+        # has still heard someone in the window (neighbors with the most recent last beacon) and the latched "lost" stays on. Only the last neighbor
+        # heard (window now empty) is suppressed: out of 4 neighbors 3 remain in alarm. With `any` it is 4.
         assert nd[window][:, 1:].any(axis=0).sum() == 3 and any_[window][:, 1:].any(axis=0).sum() == 4
-        # al rientro (55-60 s) la regola letterale perde di nuovo: `m` sente un vicino prima degli altri e i silenzi residui (> 10 s) scattano
+        # on return (55-60 s) the literal rule loses again: `m` hears one neighbor before the others and the residual silences (> 10 s) fire
         assert nd[(t > 55.0) & (t < 60.0)][:, 1:].any(axis=0).sum() >= 3
-    # (b) 0 sente tutti ma non 3, da 40 s in poi: il "perso" su 3 scatta come con `any`
+    # (b) 0 hears everyone but not 3, from 40 s on: the "lost" on 3 fires as with `any`
     received = np.ones((n, times.shape[1], n), bool)
     received[np.arange(n), :, np.arange(n)] = False
     received[3, times[3] >= 40.0, 0] = False
@@ -334,7 +319,7 @@ def test_not_deaf_deaf_observer_does_not_alarm_but_blind_to_one_target_does(cfg,
 
 
 def test_not_deaf_equals_any_on_a_run_without_bursts(cfg, tmp_path):
-    """Corsa ``none`` breve senza raffiche e senza silenzi lunghi: gli allarmi "perso" e di sistema di `any` e `not_deaf` coincidono."""
+    """Short ``none`` run without bursts and without long silences: the "lost" and system alarms of `any` and `not_deaf` coincide."""
     from src.detector import build_inputs, lost_alarm
     from src.kalman import filter_all
     from src.simulator import load_or_simulate
@@ -347,36 +332,36 @@ def test_not_deaf_equals_any_on_a_run_without_bursts(cfg, tmp_path):
         a = lost_alarm(inputs.silence, inputs.rx_ok, inputs.t, {**cfg["detector"], "lost_rule": "any"}, inputs.valid, **inputs.lost_kwargs())
         b = lost_alarm(inputs.silence, inputs.rx_ok, inputs.t, {**cfg["detector"], "lost_rule": rule}, inputs.valid, **inputs.lost_kwargs())
         np.testing.assert_array_equal(a, b)
-    assert not inputs.deaf_window[inputs.t > cfg["detector"]["warmup"]].any()  # nessun ricevitore sordo in questa corsa
+    assert not inputs.deaf_window[inputs.t > cfg["detector"]["warmup"]].any()  # no deaf receiver in this run
 
 
 # ---------------------------------------------------------------------------
-# 6. Verdetto
+# 6. Verdict
 # ---------------------------------------------------------------------------
 
 
 def _success(gain, loss, n=20):
-    """Coppie di esiti: `gain` corse solo di `migliore`, `loss` solo di `media`, il resto uguale."""
-    media = np.zeros(n, bool)
-    migliore = np.zeros(n, bool)
-    migliore[:gain] = True
-    media[gain : gain + loss] = True
-    media[n - 5 :] = migliore[n - 5 :] = True  # corse concordanti
-    return media, migliore
+    """Pairs of outcomes: `gain` runs only of `migliore`, `loss` only of `media`, the rest equal."""
+    mean_ok = np.zeros(n, bool)
+    best_ok = np.zeros(n, bool)
+    best_ok[:gain] = True
+    mean_ok[gain : gain + loss] = True
+    mean_ok[n - 5 :] = best_ok[n - 5 :] = True  # concordant runs
+    return mean_ok, best_ok
 
 
 def test_verdict_rule_on_synthetic_outcomes():
-    """+4/-1 con falsi allarmi uguali: migliore; +4/-1 con falsi allarmi più alti: media; +2/-0: media (netto sotto 3); McNemar a mano."""
+    """+4/-1 with equal false alarms: migliore; +4/-1 with higher false alarms: media; +2/-0: media (net below 3); McNemar by hand."""
     from src.final import decide_verdict, mcnemar_exact
 
-    media, migliore = _success(4, 1)
-    v = decide_verdict(media, migliore, 0.8, 0.8, 3)
+    mean_ok, best_ok = _success(4, 1)
+    v = decide_verdict(mean_ok, best_ok, 0.8, 0.8, 3)
     assert (v["gained"], v["lost"], v["net"], v["adopted"]) == (4, 1, 3, "migliore")
-    assert decide_verdict(media, migliore, 0.8, 0.81, 3)["adopted"] == "media"
-    assert decide_verdict(media, migliore, 0.8, 0.5, 3)["adopted"] == "migliore"
-    media, migliore = _success(2, 0)
-    assert decide_verdict(media, migliore, 0.8, 0.8, 3)["adopted"] == "media"
-    # McNemar esatto: 4 contro 1 -> n = 5, P(X <= 1) = 6/32, bilaterale 12/32 = 0,375; nessuna discordanza -> 1; 5 contro 0 -> 2/32
+    assert decide_verdict(mean_ok, best_ok, 0.8, 0.81, 3)["adopted"] == "media"
+    assert decide_verdict(mean_ok, best_ok, 0.8, 0.5, 3)["adopted"] == "migliore"
+    mean_ok, best_ok = _success(2, 0)
+    assert decide_verdict(mean_ok, best_ok, 0.8, 0.8, 3)["adopted"] == "media"
+    # Exact McNemar: 4 against 1 -> n = 5, P(X <= 1) = 6/32, two-sided 12/32 = 0.375; no discordance -> 1; 5 against 0 -> 2/32
     assert mcnemar_exact(4, 1) == pytest.approx(0.375)
     assert mcnemar_exact(0, 0) == 1.0
     assert mcnemar_exact(5, 0) == pytest.approx(2 / 32)
@@ -389,7 +374,7 @@ def test_verdict_rule_on_synthetic_outcomes():
 
 
 def test_bootstrap_similar_to_poisson_for_independent_runs_and_wider_for_clustered_events():
-    """Corse indipendenti con eventi di Poisson: bootstrap e Garwood simili; stessi eventi totali raggruppati in poche corse: il bootstrap è più largo."""
+    """Independent runs with Poisson events: bootstrap and Garwood similar; same total events clustered in few runs: the bootstrap is wider."""
     from src.final import bootstrap_rate_interval
     from src.metrics import poisson_interval
 
@@ -399,31 +384,28 @@ def test_bootstrap_similar_to_poisson_for_independent_runs_and_wider_for_cluster
     lo, hi = bootstrap_rate_interval(counts, hours, 2000, 0.95, np.random.default_rng(1))
     plo, phi = poisson_interval(int(counts.sum()), float(hours.sum()), 0.95)
     assert abs((hi - lo) / (phi - plo) - 1.0) < 0.25
-    # stesso numero totale di eventi, ma tutti in 5 corse su 100 (a raffiche): Poisson non lo vede, il bootstrap sì
+    # same total number of events, but all in 5 runs out of 100 (bursty): Poisson does not see it, the bootstrap does
     clustered = np.zeros(n_runs, int)
     clustered[:5] = counts.sum() // 5
     lo_c, hi_c = bootstrap_rate_interval(clustered, hours, 2000, 0.95, np.random.default_rng(1))
     assert (hi_c - lo_c) > 1.5 * (hi - lo)
     plo_c, phi_c = poisson_interval(int(clustered.sum()), float(hours.sum()), 0.95)
     assert (hi_c - lo_c) > 1.5 * (phi_c - plo_c)
-    # stesso generatore, stesso risultato
+    # same generator, same result
     assert bootstrap_rate_interval(counts, hours, 2000, 0.95, np.random.default_rng(1)) == (lo, hi)
 
 
 # ---------------------------------------------------------------------------
-# 8. Riproducibilità e cache
+# 8. Reproducibility and cache
 # ---------------------------------------------------------------------------
 
 
 def _short(cfg, duration=120.0):
-    cfg["simulation"]["duration"] = duration
-    cfg["metrics"]["level_threshold_sweep"] = [-90.0, -65.0, 5.0]
-    cfg["detector"]["warmup"] = 5.0
-    return cfg
+    return short_config(cfg, duration)
 
 
 def test_process_run_final_reproducible_and_sensitivity_point_does_not_touch_base_cache(cfg, tmp_path):
-    """Stesso seme, stesso risultato; un punto di sensibilità non scrive nella cache delle corse (né modifica la base); base dal canale = base dalla cache."""
+    """Same seed, same result; a sensitivity point does not write to the run cache (nor modify the base); base from the channel = base from the cache."""
     import os
 
     from src.final import process_run_final
@@ -447,16 +429,16 @@ def test_process_run_final_reproducible_and_sensitivity_point_does_not_touch_bas
     for key, res in p1["results"].items():
         for field, arr in res.items():
             np.testing.assert_array_equal(arr, p2["results"][key][field])
-    assert {p.name for p in tmp_path.glob("*.npz")} == files_before  # nessun nuovo file nella cache delle corse
+    assert {p.name for p in tmp_path.glob("*.npz")} == files_before  # no new file in the run cache
     assert base_file.stat().st_mtime_ns == stamp and os.path.exists(tmp_path / "channel")
-    # la chiave di cache con bursty è diversa da quella con independent, e con independent è quella di prima (opzioni del Blocco 6 non hashate)
+    # the cache key with bursty differs from the one with independent, and with independent it is the earlier one (Block 6 options not hashed)
     bursty = copy.deepcopy(info["config"])
     bursty["packets"]["reception"]["background_model"] = "bursty"
     assert cache_key(bursty) != cache_key(info["config"])
     explicit = copy.deepcopy(info["config"])
-    explicit["packets"]["reception"]["bursty"]["mean_loss"] = 0.5  # con independent non conta
+    explicit["packets"]["reception"]["bursty"]["mean_loss"] = 0.5  # with independent it does not matter
     assert cache_key(explicit) == cache_key(info["config"])
-    # base dal canale = base dalla cache, bit per bit
+    # base from the channel = base from the cache, bit for bit
     chan = process_run_final((info, cfg, tmp_path, 9.0, {**spec_cache, "mode": "channel"}))
     for key, res in first["results"].items():
         for field, arr in res.items():

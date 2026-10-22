@@ -1,17 +1,17 @@
-"""Blocco 7 — Routing verso il capogruppo: ponte, DQREM, carry.
+"""Block 7 — Routing to the group leader: bridge, DQREM, carry.
 
-Chi non sente più il capogruppo fa passare record di telemetria, allarmi e SOS di salto in salto attraverso i compagni. Indici ``[i, ..., j]`` = trasmette
-`i`, riceve `j`; ``[t, m, j]`` = nodo `m` che guarda il vicino `j` all'istante `t` della griglia.
+Whoever no longer hears the group leader relays telemetry records, alarms and SOS hop by hop through its companions. Indices ``[i, ..., j]`` = transmits
+`i`, receives `j`; ``[t, m, j]`` = node `m` looking at neighbour `j` at grid instant `t`.
 
-Pezzi (ognuno testabile da solo):
+Pieces (each testable on its own):
 
-- salti annunciati nel beacon (`announce_hops`) e stato dei collegamenti visto da ogni nodo (`link_state`);
-- criteri C1-C5, pesi AHP e da entropia, punteggio (`ahp_weights`, `entropy_weights`, `time_to_break`, `dqrem_scores`, `Chooser`);
-- unicast con conferma (`unicast_attempts`), pacchetti (`select_packet`), code, buffer e carry (`simulate_strategy`);
-- preparazione di una corsa dai Blocchi 1-3 e dal Kalman del Blocco 4 (`prepare_run`).
+- hops announced in the beacon (`announce_hops`) and link state seen by each node (`link_state`);
+- criteria C1-C5, AHP and entropy weights, score (`ahp_weights`, `entropy_weights`, `time_to_break`, `dqrem_scores`, `Chooser`);
+- unicast with acknowledgement (`unicast_attempts`), packets (`select_packet`), queues, buffer and carry (`simulate_strategy`);
+- preparation of a run from Blocks 1-3 and the Block 4 Kalman filter (`prepare_run`).
 
-Il rilevatore NON si valuta qui: gli allarmi da trasportare vengono dalla ground truth (allarme oracolo) e dal SOS del separato.
-Collisioni non modellate; si conta il tempo d'aria. Parametri: sezione ``routing`` della config.
+The detector is NOT evaluated here: the alarms to carry come from the ground truth (oracle alarm) and from the SOS of the separated node.
+Collisions are not modelled; airtime is counted. Parameters: ``routing`` section of the config.
 """
 
 from __future__ import annotations
@@ -22,59 +22,60 @@ from collections import defaultdict, deque
 
 import numpy as np
 
-from src.channel import simulate_channel
-from src.detector import _INT8, _SLOPE, _quantize
+from src.common.enums import Strategy
+from src.common.rng import spawn_rng
+from src.detector import INT8_RANGE, SLOPE_CODE_RANGE, quantize
 from src.kalman import filter_all, measurement_noise, predict_links
 from src.metrics import min_distance_to_group
-from src.mobility import simulate_mobility
-from src.packets import _neighbour_tables, reception_probability, simulate_packets
+from src.packets import neighbour_tables, reception_probability
+from src.simulator import off_diagonal_variance, separation_fields, simulate_pipeline
 
-ISOLATED = 255  # salti annunciati da un nodo isolato
-STRATEGIES = ("direct", "best_rssi", "dqrem", "dqrem_no_slope")
+ISOLATED = 255  # hops announced by an isolated node
+STRATEGIES = tuple(s.value for s in Strategy)
 CRITERIA = ("segnale", "tempo_rottura", "salti", "ricezione", "coda")
-BENEFIT = np.array([True, True, False, True, False])  # C3 (salti) e C5 (coda) sono costi
-NO_SLOPE_COLUMNS = (0, 2, 3, 4)  # `dqrem_no_slope`: senza C2
+BENEFIT = np.array([True, True, False, True, False])  # C3 (hops) and C5 (queue) are costs
+NO_SLOPE_COLUMNS = (0, 2, 3, 4)  # `dqrem_no_slope`: without C2
 KIND_NORMAL, KIND_ALARM, KIND_SOS = 0, 1, 2
-ALARM_SEQ_BASE, SOS_SEQ_BASE = 1_000_000, 2_000_000  # numeri progressivi dei messaggi di allarme e SOS (non collidono con i record)
+ALARM_SEQ_BASE, SOS_SEQ_BASE = 1_000_000, 2_000_000  # sequence numbers of alarm and SOS messages (do not collide with records)
 
-# indici dei campi di un record: [t_creazione, origine, progressivo, tipo, ttl, salti, carry, t_in_coda]
+# indices of a record's fields: [t_creation, origin, sequence, kind, ttl, hops, carry, t_enqueued]
 R_T, R_ORIGIN, R_SEQ, R_KIND, R_TTL, R_HOPS, R_CARRY, R_ENQ = range(8)
 
 
 # ---------------------------------------------------------------------------
-# Dimensioni e tempo d'aria
+# Sizes and airtime
 # ---------------------------------------------------------------------------
 
 
 def record_bytes(n_nodes: int) -> int:
-    """Byte di un record di telemetria: come il beacon, ``8 + 5·d`` con ``d = n_nodes − 1`` vicini in tabella (53 con 10 nodi)."""
+    """Bytes of a telemetry record: like the beacon, ``8 + 5·d`` with ``d = n_nodes − 1`` neighbours in the table (53 with 10 nodes)."""
     return 8 + 5 * (n_nodes - 1)
 
 
 def records_per_packet(rcfg: dict, n_nodes: int, max_packet_bytes: int | None = None) -> int:
-    """Record che entrano in un pacchetto: ``min(max_records, (max_packet_bytes − intestazione) // byte per record)`` (4 con 250 B e 10 nodi, 10 con 1470 B)."""
+    """Records that fit in a packet: ``min(max_records, (max_packet_bytes − header) // bytes per record)`` (4 with 250 B and 10 nodes, 10 with 1470 B)."""
     limit = rcfg["max_packet_bytes"] if max_packet_bytes is None else max_packet_bytes
     fit = (limit - rcfg["packet_header_bytes"]) // record_bytes(n_nodes)
     return int(max(1, min(rcfg["max_records"], fit)))
 
 
 def airtime(n_bytes: int, rcfg: dict) -> float:
-    """Tempo d'aria in s di una trama: preambolo + byte (802.11b a 1 Mbit/s: 192 µs + 8 µs per byte)."""
+    """Airtime in s of a frame: preamble + bytes (802.11b at 1 Mbit/s: 192 µs + 8 µs per byte)."""
     a = rcfg["airtime"]
     return (a["preamble_us"] + a["us_per_byte"] * n_bytes) * 1e-6
 
 
 # ---------------------------------------------------------------------------
-# Pesi, criteri e punteggio DQREM
+# Weights, criteria and DQREM score
 # ---------------------------------------------------------------------------
 
 
 def ahp_weights(matrix, random_index: dict) -> tuple:
-    """Pesi AHP e rapporto di consistenza dalla matrice dei confronti a coppie (scala di Saaty).
+    """AHP weights and consistency ratio from the pairwise comparison matrix (Saaty scale).
 
-    Input: `matrix` (n, n) e `random_index` (indice casuale di Saaty per n).
-    Procedimento: autovettore principale (autovalore reale massimo) normalizzato a somma 1; ``CI = (λmax − n)/(n − 1)``, ``CR = CI / RI``.
-    Output: (pesi (n,), CR).
+    Input: `matrix` (n, n) and `random_index` (Saaty random index for n).
+    Procedure: principal eigenvector (largest real eigenvalue) normalised to sum 1; ``CI = (λmax − n)/(n − 1)``, ``CR = CI / RI``.
+    Output: (weights (n,), CR).
     """
     a = np.asarray(matrix, dtype=float)
     n = a.shape[0]
@@ -87,12 +88,12 @@ def ahp_weights(matrix, random_index: dict) -> tuple:
 
 
 def entropy_weights(samples: np.ndarray, benefit: np.ndarray) -> np.ndarray:
-    """Pesi da entropia di Shannon dei criteri sui campioni raccolti.
+    """Shannon entropy weights of the criteria over the collected samples.
 
-    Input: `samples` (n, c) valori dei criteri (una riga per candidato visto), `benefit` (c,) bool.
-    Procedimento: per colonna, normalizzazione min-max sulle righe (costi invertiti); proporzioni ``p = x / Σx``; ``E = −Σ p ln p / ln n``; peso ∝ ``1 − E``.
-    Una colonna che non varia (o con meno di 2 righe) ha peso 0.
-    Output: (c,) con somma 1, oppure tutti zeri se nessun criterio varia.
+    Input: `samples` (n, c) criteria values (one row per candidate seen), `benefit` (c,) bool.
+    Procedure: per column, min-max normalisation over the rows (costs inverted); proportions ``p = x / Σx``; ``E = −Σ p ln p / ln n``; weight ∝ ``1 − E``.
+    A column that does not vary (or with fewer than 2 rows) has weight 0.
+    Output: (c,) summing to 1, or all zeros if no criterion varies.
     """
     x = np.asarray(samples, dtype=float)
     n, c = x.shape
@@ -118,13 +119,13 @@ def entropy_weights(samples: np.ndarray, benefit: np.ndarray) -> np.ndarray:
 
 
 def combine_weights(w_ahp: np.ndarray, w_entropy: np.ndarray, alpha: float) -> np.ndarray:
-    """``w = α·w_AHP + (1 − α)·w_entropia``, rinormalizzato a somma 1."""
+    """``w = α·w_AHP + (1 − α)·w_entropy``, renormalised to sum 1."""
     w = alpha * np.asarray(w_ahp) + (1.0 - alpha) * np.asarray(w_entropy)
     return w / w.sum()
 
 
 def time_to_break(signal, slope, threshold: float, cap: float):
-    """Tempo alla rottura C2 in s: ``(segnale − soglia) / (−pendenza)`` se la pendenza è negativa, altrimenti `cap`; limitato a ``[0, cap]``."""
+    """Time to break C2 in s: ``(signal − threshold) / (−slope)`` if the slope is negative, otherwise `cap`; clipped to ``[0, cap]``."""
     signal = np.asarray(signal, dtype=float)
     slope = np.asarray(slope, dtype=float)
     falling = slope < 0
@@ -134,9 +135,9 @@ def time_to_break(signal, slope, threshold: float, cap: float):
 
 
 def dqrem_scores(x: np.ndarray, weights: np.ndarray, benefit: np.ndarray) -> np.ndarray:
-    """Punteggio DQREM dei candidati: ogni criterio normalizzato min-max sui candidati del momento (costi invertiti; criterio uguale per tutti, o un solo candidato → 1), poi somma pesata.
+    """DQREM score of the candidates: each criterion min-max normalised over the current candidates (costs inverted; criterion equal for all, or a single candidate → 1), then weighted sum.
 
-    Input: `x` (n, c) criteri dei candidati, `weights` (c,), `benefit` (c,) bool. Output: (n,) punteggi (più alto = meglio).
+    Input: `x` (n, c) candidate criteria, `weights` (c,), `benefit` (c,) bool. Output: (n,) scores (higher = better).
     """
     x = np.asarray(x, dtype=float)
     lo, hi = x.min(axis=0), x.max(axis=0)
@@ -150,16 +151,27 @@ def dqrem_scores(x: np.ndarray, weights: np.ndarray, benefit: np.ndarray) -> np.
 
 
 class Chooser:
-    """Sceglie il prossimo salto fra i candidati con la strategia `strategy` (`best_rssi`, `dqrem`, `dqrem_no_slope`).
+    """Picks the next hop among the candidates with strategy `strategy` (`best_rssi`, `dqrem`, `dqrem_no_slope`).
 
-    Input: `rcfg` (sezione ``routing``), numero di nodi. Stato: per nodo, i criteri dei candidati visti negli ultimi ``entropy_window`` s.
-    `dqrem_no_slope` toglie C2 e ricalcola i pesi AHP sulla sottomatrice 4×4 (stessi confronti a coppie), entropia sui 4 criteri.
+    Input: `rcfg` (``routing`` section), number of nodes. State: per node, the criteria of the candidates seen in the last ``entropy_window`` s.
+    `dqrem_no_slope` drops C2 and recomputes the AHP weights on the 4×4 submatrix (same pairwise comparisons), entropy over the 4 criteria.
     """
 
-    def __init__(self, strategy: str, rcfg: dict, n_nodes: int):
+    def rank(self, node: int, t_now: float, criteria: np.ndarray, hops: np.ndarray) -> np.ndarray:
+        """Candidate indices from best to worst. `criteria` (n, 5) is ``[C1..C5]``, `hops` (n,) the announced hops (tie-break of `best_rssi`)."""
+        raise NotImplementedError
+
+
+class BestRssiChooser(Chooser):
+    def rank(self, node: int, t_now: float, criteria: np.ndarray, hops: np.ndarray) -> np.ndarray:
+        return np.lexsort((hops, -criteria[:, 0]))
+
+
+class DqremChooser(Chooser):
+    def __init__(self, strategy: Strategy, rcfg: dict, n_nodes: int):
         self.strategy = strategy
         self.rcfg = rcfg
-        self.columns = list(NO_SLOPE_COLUMNS) if strategy == "dqrem_no_slope" else list(range(len(CRITERIA)))
+        self.columns = list(NO_SLOPE_COLUMNS) if strategy == Strategy.DQREM_NO_SLOPE else list(range(len(CRITERIA)))
         matrix = np.asarray(rcfg["ahp_matrix"], dtype=float)[np.ix_(self.columns, self.columns)]
         self.w_ahp, self.cr = ahp_weights(matrix, rcfg["ahp_random_index"])
         self.benefit = BENEFIT[self.columns]
@@ -167,16 +179,13 @@ class Chooser:
         self.last_weights = None
 
     def weights(self, node: int) -> np.ndarray:
-        """Pesi finali del nodo: solo AHP con meno di ``entropy_min_samples`` campioni, altrimenti ``α·AHP + (1 − α)·entropia``."""
+        """Final weights of the node: AHP only with fewer than ``entropy_min_samples`` samples, otherwise ``α·AHP + (1 − α)·entropy``."""
         rows = np.vstack([x for _, x in self.samples[node]])
         if len(rows) < self.rcfg["entropy_min_samples"]:
             return self.w_ahp
         return combine_weights(self.w_ahp, entropy_weights(rows, self.benefit), self.rcfg["alpha"])
 
     def rank(self, node: int, t_now: float, criteria: np.ndarray, hops: np.ndarray) -> np.ndarray:
-        """Indici dei candidati dal migliore al peggiore. `criteria` (n, 5) è ``[C1..C5]``, `hops` (n,) i salti annunciati (spareggio di `best_rssi`)."""
-        if self.strategy == "best_rssi":
-            return np.lexsort((hops, -criteria[:, 0]))
         x = criteria[:, self.columns]
         window = self.samples[node]
         window.append((t_now, x))
@@ -187,19 +196,28 @@ class Chooser:
         return np.argsort(-dqrem_scores(x, w, self.benefit), kind="stable")
 
 
+def make_chooser(strategy: str, rcfg: dict, n_nodes: int) -> Chooser | None:
+    strategy = Strategy(strategy)
+    if strategy == Strategy.DIRECT:
+        return None
+    if strategy == Strategy.BEST_RSSI:
+        return BestRssiChooser()
+    return DqremChooser(strategy, rcfg, n_nodes)
+
+
 # ---------------------------------------------------------------------------
-# Salti annunciati e stato dei collegamenti
+# Announced hops and link state
 # ---------------------------------------------------------------------------
 
 
 def announce_hops(times: np.ndarray, steps: np.ndarray, received: np.ndarray, est_r: np.ndarray, leader: int, rcfg: dict) -> np.ndarray:
-    """Distanza in salti dal capogruppo che ogni nodo annuncia a ogni beacon.
+    """Distance in hops from the group leader that each node announces at every beacon.
 
-    Input: `times`, `steps` (N, K) (istanti e indici di griglia dei beacon, NaN / −1 oltre la fine), `received` (N, K, N), `est_r` (T, N, N) ``[t, i, j]`` stima di `j` sul
-    link ``i → j`` (NaN se nessuna), `leader`, `rcfg`.
-    Procedimento: si percorrono i beacon in ordine di tempo. Il capogruppo annuncia 0; ogni altro nodo ``1 + min`` dei salti annunciati dai suoi vicini validi (beacon ricevuto da
-    meno di ``neighbour_max_age`` s e segnale stimato ≥ ``candidate_threshold``). Senza vicini validi, o oltre ``max_hops``, annuncia 255 (isolato).
-    Output: (N, K) int16, 255 dove il beacon non esiste.
+    Input: `times`, `steps` (N, K) (beacon instants and grid indices, NaN / −1 past the end), `received` (N, K, N), `est_r` (T, N, N) ``[t, i, j]`` estimate by `j` of the
+    link ``i → j`` (NaN if none), `leader`, `rcfg`.
+    Procedure: the beacons are walked in time order. The leader announces 0; every other node announces ``1 + min`` of the hops announced by its valid neighbours (beacon received
+    less than ``neighbour_max_age`` s ago and estimated signal ≥ ``candidate_threshold``). With no valid neighbours, or beyond ``max_hops``, it announces 255 (isolated).
+    Output: (N, K) int16, 255 where the beacon does not exist.
     """
     n_nodes, n_beacons = times.shape
     max_age, threshold, max_hops = rcfg["neighbour_max_age"], rcfg["candidate_threshold"], rcfg["max_hops"]
@@ -226,7 +244,7 @@ def announce_hops(times: np.ndarray, steps: np.ndarray, received: np.ndarray, es
 
 
 def announced_grid(t: np.ndarray, times: np.ndarray, ann: np.ndarray) -> np.ndarray:
-    """Salti correnti di ogni nodo sulla griglia: valore dell'ultimo beacon proprio ``<= t``, 255 prima del primo. Output (T, N) int16."""
+    """Current hops of each node on the grid: value of its own last beacon ``<= t``, 255 before the first. Output (T, N) int16."""
     n_nodes = times.shape[0]
     out = np.full((len(t), n_nodes), ISOLATED, dtype=np.int16)
     for j in range(n_nodes):
@@ -239,19 +257,19 @@ def announced_grid(t: np.ndarray, times: np.ndarray, ann: np.ndarray) -> np.ndar
 def link_state(
     t: np.ndarray, times: np.ndarray, received: np.ndarray, est_r: np.ndarray, est_s: np.ndarray, pay_r: np.ndarray, pay_s: np.ndarray, rcfg: dict, beacon_period: float
 ) -> dict:
-    """Che cosa sa il nodo `m` del vicino `j` a ogni istante, per scegliere il prossimo salto.
+    """What node `m` knows about neighbour `j` at every instant, to choose the next hop.
 
-    Input: griglia `t` (T,), beacon (`times` (N, K), `received` (N, K, N)), stime del Kalman sulla griglia `est_r`, `est_s` (T, N, N) ``[t, i, j]`` (link ``i → j`` visto da `j`),
-    carico dei beacon `pay_r`, `pay_s` (N, K, N) ``[i, k, j]`` (stima di ``i → j`` dopo il beacon `k` di `i`, già quantizzata come nella tabella dei vicini), `rcfg`, periodo dei beacon.
-    Procedimento: per ogni coppia ``(m, j)``: ``lastk`` = ultimo beacon di `j` ricevuto da `m`; ``valid`` se ha meno di ``neighbour_max_age`` s e il segnale stimato ``j → m`` è
-    ≥ ``candidate_threshold``; C1 e pendenza di ``m → j`` dalla voce di `m` nella tabella di quel beacon (``r + s·età``), se più vecchia di ``neighbour_max_age`` s o assente dalla
-    stima propria di ``j → m`` (reciprocità); C4 = beacon di `j` ricevuti da `m` in ``reception_window`` s / attesi.
-    Output: dizionario di array (T, N, N) ``[t, m, j]``: ``lastk`` int32 (−1 se nessuno), ``valid`` bool, ``c1`` e ``slope`` float32, ``c4`` float32; più ``any_valid`` (T, N).
+    Input: grid `t` (T,), beacons (`times` (N, K), `received` (N, K, N)), Kalman estimates on the grid `est_r`, `est_s` (T, N, N) ``[t, i, j]`` (link ``i → j`` seen by `j`),
+    beacon payload `pay_r`, `pay_s` (N, K, N) ``[i, k, j]`` (estimate of ``i → j`` after beacon `k` of `i`, already quantised as in the neighbour table), `rcfg`, beacon period.
+    Procedure: for each pair ``(m, j)``: ``lastk`` = last beacon of `j` received by `m`; ``valid`` if it is less than ``neighbour_max_age`` s old and the estimated signal ``j → m`` is
+    ≥ ``candidate_threshold``; C1 and slope of ``m → j`` from `m`'s entry in that beacon's table (``r + s·age``), or, if older than ``neighbour_max_age`` s or missing, from the
+    own estimate of ``j → m`` (reciprocity); C4 = beacons of `j` received by `m` in ``reception_window`` s / expected.
+    Output: dict of (T, N, N) arrays ``[t, m, j]``: ``lastk`` int32 (−1 if none), ``valid`` bool, ``c1`` and ``slope`` float32, ``c4`` float32; plus ``any_valid`` (T, N).
     """
     n_nodes = times.shape[0]
     n_steps = len(t)
     max_age, threshold, window = rcfg["neighbour_max_age"], rcfg["candidate_threshold"], rcfg["reception_window"]
-    tables, origin = _neighbour_tables(times, received, {"r": pay_r, "s": pay_s})
+    tables, origin = neighbour_tables(times, received, {"r": pay_r, "s": pay_s})
     shape = (n_steps, n_nodes, n_nodes)
     lastk = np.full(shape, -1, dtype=np.int32)
     valid = np.zeros(shape, dtype=bool)
@@ -271,7 +289,7 @@ def link_state(
             has = pos >= 0
             safe = np.maximum(pos, 0)
             kk = got[safe]
-            sig = est_r[:, j, m]  # segnale ``j → m`` stimato da `m`
+            sig = est_r[:, j, m]  # signal ``j → m`` estimated by `m`
             valid[:, m, j] = has & (t - rx[safe] <= max_age) & (sig >= threshold)
             lastk[:, m, j] = np.where(has, kk, -1)
             org = origin[j, kk, m]
@@ -285,12 +303,12 @@ def link_state(
 
 
 # ---------------------------------------------------------------------------
-# Unicast, pacchetti
+# Unicast, packets
 # ---------------------------------------------------------------------------
 
 
 class UniformStream:
-    """Uniformi (0, 1) da un generatore, a blocchi (stessa sequenza dei singoli ``random()``)."""
+    """Uniforms (0, 1) from a generator, in blocks (same sequence as single ``random()`` calls)."""
 
     def __init__(self, rng: np.random.Generator, chunk: int = 1 << 16):
         self.rng, self.chunk = rng, chunk
@@ -304,10 +322,10 @@ class UniformStream:
 
 
 def unicast_attempts(p_forward: float, p_return: float, max_retries: int, stream: UniformStream) -> tuple:
-    """Unicast con conferma: ogni tentativo riesce se il pacchetto arriva (probabilità `p_forward`) **e** la conferma torna (`p_return`), con estrazioni nuove a ogni tentativo.
+    """Unicast with acknowledgement: each attempt succeeds if the packet arrives (probability `p_forward`) **and** the ack comes back (`p_return`), with fresh draws at every attempt.
 
-    Input: probabilità di ricezione dell'andata e del ritorno, `max_retries` ritrasmissioni, flusso di uniformi (due estrazioni per tentativo).
-    Output: (riuscito, tentativi fatti ≤ ``1 + max_retries``, quante volte il pacchetto è arrivato). Se il pacchetto arriva ma la conferma no, il mittente ritrasmette.
+    Input: reception probability of the forward and return legs, `max_retries` retransmissions, stream of uniforms (two draws per attempt).
+    Output: (succeeded, attempts made ≤ ``1 + max_retries``, how many times the packet arrived). If the packet arrives but the ack does not, the sender retransmits.
     """
     arrivals = 0
     for attempt in range(1, max_retries + 2):
@@ -320,9 +338,9 @@ def unicast_attempts(p_forward: float, p_return: float, max_retries: int, stream
 
 
 def select_packet(queue: list, capacity: int, n_priority: int) -> list:
-    """Record del prossimo pacchetto (senza toglierli dalla coda): prima gli allarmi e gli SOS (coda prioritaria), poi i più vecchi, fino a `capacity`.
+    """Records of the next packet (without removing them from the queue): alarms and SOS first (priority queue), then the oldest, up to `capacity`.
 
-    `queue` è ordinata per istante di creazione; `n_priority` = quanti record prioritari contiene.
+    `queue` is sorted by creation instant; `n_priority` = how many priority records it holds.
     """
     if n_priority == 0:
         return queue[:capacity]
@@ -333,257 +351,300 @@ def select_packet(queue: list, capacity: int, n_priority: int) -> list:
 
 
 # ---------------------------------------------------------------------------
-# Simulazione di una strategia
+# Simulation of a strategy
 # ---------------------------------------------------------------------------
 
 
-def simulate_strategy(rd: dict, strategy: str, rcfg: dict, max_packet_bytes: int | None = None, trace: bool = False) -> dict:
-    """Trasporto dei record verso il capogruppo con la strategia `strategy`, sulla griglia di simulazione.
+def second_stride(dt: float) -> int:
+    return int(round(1.0 / dt))
 
-    Input: `rd` (corsa preparata: `prepare_run` o sintetica, vedi sotto), `strategy` in `STRATEGIES`, `rcfg`, `max_packet_bytes` (default ``routing.max_packet_bytes``), `trace`.
-    `rd` contiene: ``dt``, ``t``, ``times``, ``steps``, ``ann``, ``ann_grid``, i campi di `link_state`, ``p`` (T, N, N) probabilità di ricezione del link ``i → j``, ``leader``,
-    ``events`` (lista ``(passo, nodo, tipo)`` di allarmi e SOS), ``seed`` (della corsa), ``sep_node`` (−1 se nessuno).
-    Procedimento: a ogni passo ogni nodo crea 1 record/s (``record_period``; a buffer pieno solo a ``degraded_period``, sovrascrivendo i più vecchi non-SOS); trasmette se ha un
-    prioritario, un pacchetto pieno o il primo record in coda da ``max_wait`` s. Candidati = vicini validi con salti strettamente minori dei propri; `direct` solo il capogruppo.
-    Un tentativo = unicast con conferma (`unicast_attempts`), fino a ``max_retries`` ritrasmissioni al primo candidato, poi una prova sul secondo; se fallisce anche quello i record
-    restano in coda (carry). Il ricevente inserisce i record nella propria coda (scarta quelli già visti; TTL ``max_hops``); il capogruppo scarta i duplicati (origine, progressivo).
-    Un nodo non supera ``dt`` s di tempo d'aria per passo. Il generatore degli unicast è ``SeedSequence(seme della corsa, spawn_key=(seed_keys.unicast,))``.
-    Output: dizionario con il registro del capogruppo (``log``: liste origine, progressivo, t_creazione, t_arrivo, salti, tipo, carry), i record creati (``created``), contatori
-    (``breaks``, ``break_episodes``, ``fail_both``, ``bridge_changes``, ``ttl_drops``, ``duplicates``, ``max_packet_bytes_sent``) e per nodo ``tx_airtime``, ``attempts``,
-    ``max_occupancy``, ``lost_buffer``; con `trace` anche ``decisions`` del nodo separato.
-    """
-    n_nodes = rd["ann_grid"].shape[1]
-    n_steps, dt, leader = len(rd["t"]), rd["dt"], rd["leader"]
-    capacity = records_per_packet(rcfg, n_nodes, max_packet_bytes)
-    rec_bytes = record_bytes(n_nodes)
-    buffer_size, max_hops, max_wait, retries = rcfg["buffer_records"], rcfg["max_hops"], rcfg["max_wait"], rcfg["max_retries"]
-    rec_step = int(round(rcfg["record_period"] / dt))
-    deg_step = int(round(rcfg["degraded_period"] / dt))
-    ack_air = airtime(rcfg["airtime"]["ack_bytes"], rcfg)
-    p, valid, any_valid, lastk = rd["p"], rd["valid"], rd["any_valid"], rd["lastk"]
-    c1, slope, c4, ann, ann_grid = rd["c1"], rd["slope"], rd["c4"], rd["ann"], rd["ann_grid"]
-    fill = np.zeros(ann.shape, dtype=np.int16)  # riempimento della coda annunciato in ogni beacon (4 bit)
-    stream = UniformStream(np.random.default_rng(np.random.SeedSequence(rd["seed"], spawn_key=(rcfg["seed_keys"]["unicast"],))))
-    chooser = None if strategy in ("direct", "best_rssi") else Chooser(strategy, rcfg, n_nodes)
-    ranker = Chooser("best_rssi", rcfg, n_nodes) if strategy == "best_rssi" else chooser
 
+def _beacons_by_step(steps: np.ndarray, n_nodes: int) -> defaultdict:
     beacons_at = defaultdict(list)
     for j in range(n_nodes):
-        for k in np.flatnonzero(rd["steps"][j] >= 0):
-            beacons_at[int(rd["steps"][j, k])].append((j, int(k)))
+        for k in np.flatnonzero(steps[j] >= 0):
+            beacons_at[int(steps[j, k])].append((j, int(k)))
+    return beacons_at
+
+
+def _events_by_step(raw_events) -> defaultdict:
     events = defaultdict(list)
-    for step, node, kind in rd["events"]:
+    for step, node, kind in raw_events:
         events[int(step)].append((int(node), int(kind)))
+    return events
 
-    queues = [[] for _ in range(n_nodes)]
-    n_pri = [0] * n_nodes
-    seen = [set() for _ in range(n_nodes)]
-    wait_since = [None] * n_nodes
-    stuck_last = [-math.inf] * n_nodes
-    seq = [0] * n_nodes
-    last_primary = [-1] * n_nodes
-    last_failed = [False] * n_nodes
-    tx_airtime = np.zeros(n_nodes)
-    attempts_count = np.zeros(n_nodes, dtype=np.int64)
-    max_occ = np.zeros(n_nodes, dtype=np.int64)
-    lost_buffer = np.zeros(n_nodes, dtype=np.int64)
-    counters = dict(breaks=0, break_episodes=0, fail_both=0, bridge_changes=0, ttl_drops=0, duplicates=0, max_packet_bytes_sent=0, cycles=0)
-    log = {k: [] for k in ("origin", "seq", "t_create", "t_arrive", "hops", "kind", "carry")}
-    leader_seen = set()
-    created = []
-    decisions = []
-    break_times = []
-    alarm_counter = [0, 0]
 
-    def insert(m: int, rec: list, t_now: float) -> None:
-        """Mette `rec` nella coda di `m` (ordinata per creazione); a buffer pieno sovrascrive il più vecchio non-SOS, mai un SOS (se sono tutti SOS scarta il nuovo)."""
-        q = queues[m]
-        if len(q) >= buffer_size:
+class _Transport:
+    def __init__(self, rd: dict, strategy: Strategy, rcfg: dict, max_packet_bytes: int | None, trace: bool):
+        n_nodes = rd["ann_grid"].shape[1]
+        dt = rd["dt"]
+        self.rd, self.strategy, self.rcfg, self.trace = rd, strategy, rcfg, trace
+        self.n_nodes, self.n_steps, self.dt, self.leader = n_nodes, len(rd["t"]), dt, rd["leader"]
+        self.capacity = records_per_packet(rcfg, n_nodes, max_packet_bytes)
+        self.rec_bytes = record_bytes(n_nodes)
+        self.buffer_size, self.max_hops, self.max_wait, self.retries = rcfg["buffer_records"], rcfg["max_hops"], rcfg["max_wait"], rcfg["max_retries"]
+        self.rec_step = int(round(rcfg["record_period"] / dt))
+        self.deg_step = int(round(rcfg["degraded_period"] / dt))
+        self.ack_air = airtime(rcfg["airtime"]["ack_bytes"], rcfg)
+        self.p, self.valid, self.any_valid, self.lastk = rd["p"], rd["valid"], rd["any_valid"], rd["lastk"]
+        self.c1, self.slope, self.c4, self.ann, self.ann_grid = rd["c1"], rd["slope"], rd["c4"], rd["ann"], rd["ann_grid"]
+        self.fill = np.zeros(self.ann.shape, dtype=np.int16)  # queue fill announced in each beacon (4 bits)
+        self.stream = UniformStream(spawn_rng(rd["seed"], rcfg["seed_keys"]["unicast"]))
+        self.ranker = make_chooser(strategy, rcfg, n_nodes)
+        self.chooser = self.ranker if isinstance(self.ranker, DqremChooser) else None
+
+        self.beacons_at = _beacons_by_step(rd["steps"], n_nodes)
+        self.events = _events_by_step(rd["events"])
+
+        self.queues = [[] for _ in range(n_nodes)]
+        self.n_pri = [0] * n_nodes
+        self.seen = [set() for _ in range(n_nodes)]
+        self.wait_since = [None] * n_nodes
+        self.stuck_last = [-math.inf] * n_nodes
+        self.seq = [0] * n_nodes
+        self.last_primary = [-1] * n_nodes
+        self.last_failed = [False] * n_nodes
+        self.tx_airtime = np.zeros(n_nodes)
+        self.attempts_count = np.zeros(n_nodes, dtype=np.int64)
+        self.max_occ = np.zeros(n_nodes, dtype=np.int64)
+        self.lost_buffer = np.zeros(n_nodes, dtype=np.int64)
+        self.counters = dict(breaks=0, break_episodes=0, fail_both=0, bridge_changes=0, ttl_drops=0, duplicates=0, max_packet_bytes_sent=0, cycles=0)
+        self.log = {k: [] for k in ("origin", "seq", "t_create", "t_arrive", "hops", "kind", "carry")}
+        self.leader_seen = set()
+        self.created = []
+        self.decisions = []
+        self.break_times = []
+        self.alarm_counter = [0, 0]
+
+    def insert(self, m: int, rec: list, t_now: float) -> None:
+        """Puts `rec` in the queue of `m` (sorted by creation); with a full buffer it overwrites the oldest non-SOS, never an SOS (if all are SOS it drops the new one)."""
+        q = self.queues[m]
+        if len(q) >= self.buffer_size:
             for idx, old in enumerate(q):
                 if old[R_KIND] != KIND_SOS:
                     if old[R_KIND] != KIND_NORMAL:
-                        n_pri[m] -= 1
+                        self.n_pri[m] -= 1
                     del q[idx]
-                    lost_buffer[m] += 1
+                    self.lost_buffer[m] += 1
                     break
             else:
-                lost_buffer[m] += 1
+                self.lost_buffer[m] += 1
                 return
         rec[R_ENQ] = t_now
         insort(q, rec)
         if rec[R_KIND] != KIND_NORMAL:
-            n_pri[m] += 1
-        if wait_since[m] is None:
-            wait_since[m] = t_now
-        if len(q) > max_occ[m]:
-            max_occ[m] = len(q)
+            self.n_pri[m] += 1
+        if self.wait_since[m] is None:
+            self.wait_since[m] = t_now
+        if len(q) > self.max_occ[m]:
+            self.max_occ[m] = len(q)
 
-    def deliver_to_leader(rec: list, t_now: float) -> None:
+    def deliver_to_leader(self, rec: list, t_now: float) -> None:
         key = (rec[R_ORIGIN], rec[R_SEQ])
-        if key in leader_seen:
-            counters["duplicates"] += 1
+        if key in self.leader_seen:
+            self.counters["duplicates"] += 1
             return
-        leader_seen.add(key)
-        for name, value in zip(log, (rec[R_ORIGIN], rec[R_SEQ], rec[R_T], t_now, rec[R_HOPS], rec[R_KIND], rec[R_CARRY])):
-            log[name].append(value)
+        self.leader_seen.add(key)
+        for name, value in zip(self.log, (rec[R_ORIGIN], rec[R_SEQ], rec[R_T], t_now, rec[R_HOPS], rec[R_KIND], rec[R_CARRY])):
+            self.log[name].append(value)
 
-    def create(m: int, kind: int, t_now: float, step: int) -> None:
+    def create(self, m: int, kind: int, t_now: float, step: int) -> None:
         if kind == KIND_NORMAL:
-            s = seq[m]
-            seq[m] += 1
+            s = self.seq[m]
+            self.seq[m] += 1
         else:
             base = ALARM_SEQ_BASE if kind == KIND_ALARM else SOS_SEQ_BASE
-            s = base + alarm_counter[kind - 1]
-            alarm_counter[kind - 1] += 1
-        rec = [t_now, m, s, kind, max_hops, 0, False, t_now]
-        created.append((m, s, t_now, kind, step))
-        if m == leader:
-            deliver_to_leader(rec, t_now)
+            s = base + self.alarm_counter[kind - 1]
+            self.alarm_counter[kind - 1] += 1
+        rec = [t_now, m, s, kind, self.max_hops, 0, False, t_now]
+        self.created.append((m, s, t_now, kind, step))
+        if m == self.leader:
+            self.deliver_to_leader(rec, t_now)
         else:
-            insert(m, rec, t_now)
+            self.insert(m, rec, t_now)
 
-    def receive(pkt: list, m: int, j: int, t_now: float) -> None:
+    def receive(self, pkt: list, m: int, j: int, t_now: float) -> None:
         for rec in pkt:
-            carry = rec[R_CARRY] or stuck_last[m] >= rec[R_ENQ]
+            carry = rec[R_CARRY] or self.stuck_last[m] >= rec[R_ENQ]
             new = [rec[R_T], rec[R_ORIGIN], rec[R_SEQ], rec[R_KIND], rec[R_TTL] - 1, rec[R_HOPS] + 1, carry, t_now]
-            if j == leader:
-                deliver_to_leader(new, t_now)
+            if j == self.leader:
+                self.deliver_to_leader(new, t_now)
                 continue
             key = (rec[R_ORIGIN], rec[R_SEQ])
-            if key in seen[j]:
+            if key in self.seen[j]:
                 continue
-            seen[j].add(key)
+            self.seen[j].add(key)
             if new[R_TTL] <= 0:
-                counters["ttl_drops"] += 1
+                self.counters["ttl_drops"] += 1
                 continue
-            insert(j, new, t_now)
+            self.insert(j, new, t_now)
 
-    for step in range(n_steps):
-        t_now = step * dt
-        for j, k in beacons_at.get(step, ()):
-            fill[j, k] = min(15, len(queues[j]))
-        if step % rec_step == 0:
-            for m in range(n_nodes):
-                if m != leader and (len(queues[m]) < buffer_size or step % deg_step == 0):
-                    create(m, KIND_NORMAL, t_now, step)
-        for node, kind in events.get(step, ()):
-            create(node, kind, t_now, step)
+    def generate(self, step: int, t_now: float) -> None:
+        for j, k in self.beacons_at.get(step, ()):
+            self.fill[j, k] = min(15, len(self.queues[j]))
+        if step % self.rec_step == 0:
+            for m in range(self.n_nodes):
+                if m != self.leader and (len(self.queues[m]) < self.buffer_size or step % self.deg_step == 0):
+                    self.create(m, KIND_NORMAL, t_now, step)
+        for node, kind in self.events.get(step, ()):
+            self.create(node, kind, t_now, step)
 
-        for m in range(n_nodes):
-            q = queues[m]
-            if m == leader or not q:
-                continue
-            if not (n_pri[m] > 0 or len(q) >= capacity or t_now - wait_since[m] >= max_wait - 1e-9):
-                continue
-            if not any_valid[step, m]:
-                stuck_last[m] = t_now
-                continue
-            if strategy == "direct":
-                js = np.array([leader]) if valid[step, m, leader] else np.empty(0, dtype=int)
-                kk = lastk[step, m, js]
-            else:
-                js = np.flatnonzero(valid[step, m])
-                kk = lastk[step, m, js]
-                hj = ann[js, kk]
-                keep = hj < ann_grid[step, m]
-                js, kk = js[keep], kk[keep]
-            if len(js) == 0:
-                stuck_last[m] = t_now
-                continue
-            hj = ann[js, kk].astype(float)
-            if strategy == "direct" or len(js) == 1 and chooser is None:
-                order = np.arange(len(js))
-            else:
-                sig = c1[step, m, js].astype(float)
-                crit = np.column_stack([sig, time_to_break(sig, slope[step, m, js], rcfg["candidate_threshold"], rcfg["ttb_cap"]), hj, c4[step, m, js], fill[js, kk]])
-                order = ranker.rank(m, t_now, crit, hj)
-            order = order[:1] if strategy == "direct" else order[:2]
-            primary = int(js[order[0]])
-            if last_primary[m] not in (-1, primary):
-                counters["bridge_changes"] += 1
-            last_primary[m] = primary
-            if trace and m == rd["sep_node"]:
-                decisions.append((t_now, primary, float(c1[step, m, primary]), float(ann_grid[step, m])))
+    def ready(self, m: int, t_now: float) -> bool:
+        return self.n_pri[m] > 0 or len(self.queues[m]) >= self.capacity or t_now - self.wait_since[m] >= self.max_wait - 1e-9
 
-            used = 0.0
-            while q and used < dt and (n_pri[m] > 0 or len(q) >= capacity or t_now - wait_since[m] >= max_wait - 1e-9):
-                pkt = select_packet(q, capacity, n_pri[m])
-                pkt_bytes = rcfg["packet_header_bytes"] + len(pkt) * rec_bytes
-                counters["max_packet_bytes_sent"] = max(counters["max_packet_bytes_sent"], pkt_bytes)
-                data_air = airtime(pkt_bytes, rcfg)
-                counters["cycles"] += 1
-                done = False
-                for rank, ci in enumerate(order):
-                    j = int(js[ci])
-                    ok, tries, arrivals = unicast_attempts(float(p[step, m, j]), float(p[step, j, m]), retries, stream)
-                    spent = tries * data_air + arrivals * ack_air
-                    used += spent
-                    tx_airtime[m] += tries * data_air
-                    tx_airtime[j] += arrivals * ack_air
-                    attempts_count[m] += tries
-                    if arrivals:
-                        receive(pkt, m, j, t_now)
-                    if ok:
-                        done = True
-                        break
-                    if rank == 0:
-                        counters["breaks"] += 1
-                        if trace and m == rd["sep_node"]:
-                            break_times.append(t_now)
-                        if not last_failed[m]:
-                            counters["break_episodes"] += 1
-                if not done:
-                    counters["fail_both"] += 1
-                    last_failed[m] = True
+    def candidates(self, step: int, m: int):
+        if self.strategy == Strategy.DIRECT:
+            js = np.array([self.leader]) if self.valid[step, m, self.leader] else np.empty(0, dtype=int)
+            kk = self.lastk[step, m, js]
+        else:
+            js = np.flatnonzero(self.valid[step, m])
+            kk = self.lastk[step, m, js]
+            hj = self.ann[js, kk]
+            keep = hj < self.ann_grid[step, m]
+            js, kk = js[keep], kk[keep]
+        return js, kk
+
+    def choose_order(self, step: int, m: int, t_now: float, js: np.ndarray, kk: np.ndarray) -> np.ndarray:
+        hj = self.ann[js, kk].astype(float)
+        if self.strategy == Strategy.DIRECT or len(js) == 1 and self.chooser is None:
+            order = np.arange(len(js))
+        else:
+            sig = self.c1[step, m, js].astype(float)
+            crit = np.column_stack([sig, time_to_break(sig, self.slope[step, m, js], self.rcfg["candidate_threshold"], self.rcfg["ttb_cap"]), hj, self.c4[step, m, js], self.fill[js, kk]])
+            order = self.ranker.rank(m, t_now, crit, hj)
+        return order[:1] if self.strategy == Strategy.DIRECT else order[:2]
+
+    def serve(self, step: int, m: int, t_now: float) -> None:
+        q = self.queues[m]
+        if m == self.leader or not q:
+            return
+        if not self.ready(m, t_now):
+            return
+        if not self.any_valid[step, m]:
+            self.stuck_last[m] = t_now
+            return
+        js, kk = self.candidates(step, m)
+        if len(js) == 0:
+            self.stuck_last[m] = t_now
+            return
+        order = self.choose_order(step, m, t_now, js, kk)
+        primary = int(js[order[0]])
+        if self.last_primary[m] not in (-1, primary):
+            self.counters["bridge_changes"] += 1
+        self.last_primary[m] = primary
+        if self.trace and m == self.rd["sep_node"]:
+            self.decisions.append((t_now, primary, float(self.c1[step, m, primary]), float(self.ann_grid[step, m])))
+        self.transmit(step, m, t_now, js, order)
+
+    def transmit(self, step: int, m: int, t_now: float, js: np.ndarray, order: np.ndarray) -> None:
+        q = self.queues[m]
+        rcfg, counters = self.rcfg, self.counters
+        used = 0.0
+        while q and used < self.dt and self.ready(m, t_now):
+            pkt = select_packet(q, self.capacity, self.n_pri[m])
+            pkt_bytes = rcfg["packet_header_bytes"] + len(pkt) * self.rec_bytes
+            counters["max_packet_bytes_sent"] = max(counters["max_packet_bytes_sent"], pkt_bytes)
+            data_air = airtime(pkt_bytes, rcfg)
+            counters["cycles"] += 1
+            done = False
+            for rank, ci in enumerate(order):
+                j = int(js[ci])
+                ok, tries, arrivals = unicast_attempts(float(self.p[step, m, j]), float(self.p[step, j, m]), self.retries, self.stream)
+                spent = tries * data_air + arrivals * self.ack_air
+                used += spent
+                self.tx_airtime[m] += tries * data_air
+                self.tx_airtime[j] += arrivals * self.ack_air
+                self.attempts_count[m] += tries
+                if arrivals:
+                    self.receive(pkt, m, j, t_now)
+                if ok:
+                    done = True
                     break
-                last_failed[m] = False
+                if rank == 0:
+                    counters["breaks"] += 1
+                    if self.trace and m == self.rd["sep_node"]:
+                        self.break_times.append(t_now)
+                    if not self.last_failed[m]:
+                        counters["break_episodes"] += 1
+            if not done:
+                counters["fail_both"] += 1
+                self.last_failed[m] = True
+                break
+            self.last_failed[m] = False
+            for rec in pkt:
+                if rec[R_KIND] != KIND_NORMAL:
+                    self.n_pri[m] -= 1
+            if self.n_pri[m] == 0 and pkt == q[: len(pkt)]:
+                del q[: len(pkt)]
+            else:
                 for rec in pkt:
-                    if rec[R_KIND] != KIND_NORMAL:
-                        n_pri[m] -= 1
-                if n_pri[m] == 0 and pkt == q[: len(pkt)]:
-                    del q[: len(pkt)]
-                else:
-                    for rec in pkt:
-                        q.remove(rec)
-                wait_since[m] = t_now if q else None
+                    q.remove(rec)
+            self.wait_since[m] = t_now if q else None
 
-    out = {
-        "log": {k: np.asarray(v) for k, v in log.items()},
-        "created": np.asarray(created, dtype=float).reshape(-1, 5),
-        "tx_airtime": tx_airtime,
-        "attempts": attempts_count,
-        "max_occupancy": max_occ,
-        "lost_buffer": lost_buffer,
-        "capacity": capacity,
-        "queue_lengths": [len(q) for q in queues],
-        **counters,
-    }
-    if trace:
-        out["decisions"] = decisions
-        out["break_times"] = break_times
-    if chooser is not None:
-        out["ahp_weights"], out["cr"] = chooser.w_ahp, chooser.cr
-    return out
+    def result(self) -> dict:
+        out = {
+            "log": {k: np.asarray(v) for k, v in self.log.items()},
+            "created": np.asarray(self.created, dtype=float).reshape(-1, 5),
+            "tx_airtime": self.tx_airtime,
+            "attempts": self.attempts_count,
+            "max_occupancy": self.max_occ,
+            "lost_buffer": self.lost_buffer,
+            "capacity": self.capacity,
+            "queue_lengths": [len(q) for q in self.queues],
+            **self.counters,
+        }
+        if self.trace:
+            out["decisions"] = self.decisions
+            out["break_times"] = self.break_times
+        if self.chooser is not None:
+            out["ahp_weights"], out["cr"] = self.chooser.w_ahp, self.chooser.cr
+        return out
+
+
+def simulate_strategy(rd: dict, strategy: str, rcfg: dict, max_packet_bytes: int | None = None, trace: bool = False) -> dict:
+    """Transport of the records to the group leader with strategy `strategy`, on the simulation grid.
+
+    Input: `rd` (prepared run: `prepare_run` or synthetic, see below), `strategy` in `STRATEGIES`, `rcfg`, `max_packet_bytes` (default ``routing.max_packet_bytes``), `trace`.
+    `rd` contains: ``dt``, ``t``, ``times``, ``steps``, ``ann``, ``ann_grid``, the fields of `link_state`, ``p`` (T, N, N) reception probability of link ``i → j``, ``leader``,
+    ``events`` (list ``(step, node, kind)`` of alarms and SOS), ``seed`` (of the run), ``sep_node`` (−1 if none).
+    Procedure: at each step every node creates 1 record/s (``record_period``; with a full buffer only at ``degraded_period``, overwriting the oldest non-SOS); it transmits if it has a
+    priority record, a full packet or the first queued record has waited ``max_wait`` s. Candidates = valid neighbours with strictly fewer hops than its own; `direct` only the leader.
+    One attempt = unicast with ack (`unicast_attempts`), up to ``max_retries`` retransmissions to the first candidate, then one try on the second; if that also fails the records
+    stay in the queue (carry). The receiver inserts the records in its own queue (drops those already seen; TTL ``max_hops``); the leader drops duplicates (origin, sequence).
+    A node does not exceed ``dt`` s of airtime per step. The unicast generator is ``SeedSequence(run seed, spawn_key=(seed_keys.unicast,))``.
+    Output: dict with the leader's log (``log``: lists origin, seq, t_create, t_arrive, hops, kind, carry), the created records (``created``), counters
+    (``breaks``, ``break_episodes``, ``fail_both``, ``bridge_changes``, ``ttl_drops``, ``duplicates``, ``max_packet_bytes_sent``) and per node ``tx_airtime``, ``attempts``,
+    ``max_occupancy``, ``lost_buffer``; with `trace` also ``decisions`` of the separated node.
+    """
+    strategy = Strategy(strategy)
+    transport = _Transport(rd, strategy, rcfg, max_packet_bytes, trace)
+    for step in range(transport.n_steps):
+        t_now = step * transport.dt
+        transport.generate(step, t_now)
+        for m in range(transport.n_nodes):
+            transport.serve(step, m, t_now)
+    return transport.result()
+
 
 
 # ---------------------------------------------------------------------------
-# Preparazione di una corsa
+# Preparation of a run
 # ---------------------------------------------------------------------------
 
 
 def position_class(mean_offset: np.ndarray, node: int) -> tuple:
-    """Posizione di `node` nel gruppo: rango della posizione longitudinale media (0 = coda) e classe 0/1/2 = coda/centro/testa (terzi: ranghi ``< round(N/3)``, ``< round(2N/3)``, il resto)."""
+    """Position of `node` in the group: rank of the mean longitudinal position (0 = tail) and class 0/1/2 = tail/centre/head (thirds: ranks ``< round(N/3)``, ``< round(2N/3)``, the rest)."""
     n = len(mean_offset)
     rank = int(np.argsort(np.argsort(mean_offset))[node])
     return rank, int(rank >= round(n / 3)) + int(rank >= round(2 * n / 3))
 
 
 def wrong_hops_episodes(t: np.ndarray, ann_grid: np.ndarray, rssi_true: np.ndarray, leader: int, rcfg: dict, stride: int) -> dict:
-    """Quanto a lungo un nodo annuncia un numero di salti finito pur non avendo una strada vera verso il capogruppo.
+    """How long a node announces a finite hop count while having no real path to the group leader.
 
-    Procedimento: ogni `stride` passi, grafo vero con arco ``m → j`` se ``rssi_true[m, j] ≥ candidate_threshold``; raggiungibilità del capogruppo per iterazione ``N`` volte sui vicini.
-    Sbagliato = salti annunciati finiti (≠ 255) e capogruppo non raggiungibile. Episodio = campioni consecutivi sbagliati di un nodo.
-    Output: ``durations`` (s) e ``max_announced`` di ogni episodio, ``wrong_fraction`` (frazione di campioni nodo-tempo sbagliati), ``samples``.
+    Procedure: every `stride` steps, true graph with edge ``m → j`` if ``rssi_true[m, j] ≥ candidate_threshold``; leader reachability by iterating ``N`` times over the neighbours.
+    Wrong = finite announced hops (≠ 255) and leader not reachable. Episode = consecutive wrong samples of a node.
+    Output: ``durations`` (s) and ``max_announced`` of each episode, ``wrong_fraction`` (fraction of wrong node-time samples), ``samples``.
     """
     idx = np.arange(0, len(t), stride)
     n_nodes = ann_grid.shape[1]
@@ -606,14 +667,14 @@ def wrong_hops_episodes(t: np.ndarray, ann_grid: np.ndarray, rssi_true: np.ndarr
     return {"durations": np.asarray(durations), "max_announced": np.asarray(peaks), "wrong_fraction": float(wrong.mean()), "samples": int(wrong.size)}
 
 
-RANGE_STEP, RANGE_MAX = 0.5, 100.0  # m; passo e massimo dell'istogramma distanza-segnale
+RANGE_STEP, RANGE_MAX = 0.5, 100.0  # m; step and maximum of the distance-signal histogram
 RANGE_RSSI_EDGES = np.arange(-150.0, -9.0, 1.0)  # dBm
 
 
 def link_components(adj: np.ndarray) -> np.ndarray:
-    """Componente connessa di ogni nodo, per ogni campione: etichetta = indice più basso della componente.
+    """Connected component of each node, for each sample: label = lowest index of the component.
 
-    Input: `adj` (S, N, N) bool simmetrico (nodi esclusi: righe e colonne tutte False, restano isolati). Procedimento: propagazione del minimo sui vicini, ``N`` iterazioni. Output (S, N) int.
+    Input: `adj` (S, N, N) symmetric bool (excluded nodes: rows and columns all False, they stay isolated). Procedure: propagation of the minimum over the neighbours, ``N`` iterations. Output (S, N) int.
     """
     n_nodes = adj.shape[1]
     lab = np.broadcast_to(np.arange(n_nodes), adj.shape[:2]).copy()
@@ -626,11 +687,11 @@ def link_components(adj: np.ndarray) -> np.ndarray:
 
 
 def connectivity_stats(t: np.ndarray, rssi_true: np.ndarray, leader: int, sep_node: int, sep_start: float, rcfg: dict, stride: int) -> dict:
-    """Connettività verso il capogruppo (anche a più salti), campionata ogni `stride` passi, con il grafo VERO.
+    """Connectivity to the group leader (also over multiple hops), sampled every `stride` steps, on the TRUE graph.
 
-    Arco ``i — j`` se il segnale vero è ≥ ``candidate_threshold`` in entrambe le direzioni (l'unicast ha bisogno anche della conferma). Dopo il distacco il nodo separato esce dal gruppo:
-    i nodi del gruppo si valutano sul grafo senza di lui, il separato sul grafo completo. Output: ``in``/``n`` (N,) campioni con strada / campioni totali per nodo (nodi nel gruppo; il capogruppo
-    conta sempre), ``sep_in``/``sep_n`` per il nodo separato dopo il distacco, ``split``/``split_n`` campioni con il gruppo (senza il separato) in più componenti / campioni totali.
+    Edge ``i — j`` if the true signal is ≥ ``candidate_threshold`` in both directions (the unicast also needs the ack). After the detachment the separated node leaves the group:
+    the group's nodes are evaluated on the graph without it, the separated one on the full graph. Output: ``in``/``n`` (N,) samples with a path / total samples per node (nodes in the group; the leader
+    always counts), ``sep_in``/``sep_n`` for the separated node after the detachment, ``split``/``split_n`` samples with the group (without the separated node) in several components / total samples.
     """
     idx = np.arange(0, len(t), stride)
     n_nodes = rssi_true.shape[1]
@@ -655,7 +716,7 @@ def connectivity_stats(t: np.ndarray, rssi_true: np.ndarray, leader: int, sep_no
 
 
 def range_histogram(distances: np.ndarray, level: np.ndarray, stride: int) -> np.ndarray:
-    """Istogramma 2D (distanza, segnale) di ``level`` = ``rssi_path_loss − corpi`` sulle coppie ordinate, ogni `stride` passi: distanza a passi di `RANGE_STEP` fino a `RANGE_MAX`, dBm a 1 dB."""
+    """2D histogram (distance, signal) of ``level`` = ``rssi_path_loss − bodies`` over the ordered pairs, every `stride` steps: distance in steps of `RANGE_STEP` up to `RANGE_MAX`, dBm at 1 dB."""
     n_nodes = distances.shape[1]
     off = ~np.eye(n_nodes, dtype=bool)
     d, v = distances[::stride][:, off].ravel(), level[::stride][:, off].ravel()
@@ -663,46 +724,13 @@ def range_histogram(distances: np.ndarray, level: np.ndarray, stride: int) -> np
     return np.histogram2d(d, v, bins=[edges, RANGE_RSSI_EDGES])[0].astype(np.int32)
 
 
-def prepare_run(config: dict, leader: int, sos_fraction: float) -> dict:
-    """Simula una corsa (Blocchi 1-3, Kalman del Blocco 4) e la riduce a ciò che serve al trasporto. Niente cache su disco.
-
-    Input: `config` della corsa (sostituzioni del Blocco 7 e scenario già applicati), indice del `leader`, `sos_fraction` in [0, 1) (istante del SOS = ``sos_window · sos_fraction`` dopo il distacco).
-    Procedimento: `simulate_mobility` → `simulate_channel` → `simulate_packets`; ``R`` dal fading della corsa (``kalman.measurement_noise``); `filter_all`, `predict_links`;
-    carico dei beacon quantizzato come la tabella dei vicini; `link_state`, `announce_hops`; probabilità di ricezione ``p = curva(rssi_vero)·(1 − perdita di fondo)`` (con perdite a raffiche si usa la
-    perdita media); eventi: SOS del separato e allarme oracolo (primo passo con il separato oltre ``oracle_distance`` dal gruppo, generato dal nodo del gruppo con il segnale stimato più alto verso di lui).
-    Output: dizionario `rd` per `simulate_strategy`, con in più ``distances``, ``mean_offset``, ``rank``/``pos_class`` del capogruppo, ``wrong`` (`wrong_hops_episodes`), ``extent`` e i campi del distacco.
-    """
-    rcfg = config["routing"]
-    mob = simulate_mobility(config)
-    ch = simulate_channel(mob, config)
-    pk = simulate_packets(mob, ch, config)
-    t = mob.t
-    n_nodes = mob.positions.shape[1]
-    dt = config["simulation"]["dt"]
-    fading_var = float(np.var(ch.fading[:, ~np.eye(n_nodes, dtype=bool)]))
-    R = measurement_noise(config, fading_var)
-    kcfg, tcfg = config["kalman"], config["neighbour_table"]
-    kres = filter_all(pk.beacon_times, pk.received, pk.rssi, R, kcfg["sigma_a"], kcfg)
-    est = predict_links(kres, t)
-    pay_r = _quantize(kres.r, tcfg["rssi_step"], _INT8)
-    pay_s = _quantize(kres.s, tcfg["slope_step"], _SLOPE)
-    ls = link_state(t, pk.beacon_times, pk.received, est["r"], est["s"], pay_r, pay_s, rcfg, config["packets"]["beacon_period"])
-    ann = announce_hops(pk.beacon_times, pk.beacon_steps, pk.received, est["r"], leader, rcfg)
-    ann_grid = announced_grid(t, pk.beacon_times, ann)
-
-    rc = config["packets"]["reception"]
+def _reception_p(ch, rc: dict) -> np.ndarray:
     background = rc["background_loss"] if rc["background_model"] == "independent" else rc["bursty"]["mean_loss"] * rc["bursty"]["loss_bad"]
-    p = np.nan_to_num(reception_probability(ch.rssi_true, rc) * (1.0 - background)).astype(np.float32)
+    return np.nan_to_num(reception_probability(ch.rssi_true, rc) * (1.0 - background)).astype(np.float32)
 
-    sep = config["separation"]
-    sep_enabled = bool(sep["enabled"])
-    sep_node = int(sep["node_id"]) if sep_enabled else -1
-    sep_start = float(sep["start_time"]) if sep_enabled else float("nan")
-    offsets = mob.s_nodes - mob.s_centroid[:, None]
-    before = slice(0, int(np.searchsorted(t, sep_start))) if sep_enabled else slice(None)
-    mean_offset = offsets[before].mean(axis=0)
-    rank, pos_class = position_class(mean_offset, leader)
 
+def _group_events(mob, est: dict, t: np.ndarray, dt: float, sep_enabled: bool, sep_node: int, sep_start: float, sos_fraction: float, rcfg: dict) -> tuple:
+    n_nodes = mob.positions.shape[1]
     events = []
     oracle_step = None
     if sep_enabled:
@@ -717,6 +745,44 @@ def prepare_run(config: dict, leader: int, sos_fraction: float) -> dict:
         sos_step = int(round((sep_start + sos_fraction * rcfg["sos_window"]) / dt))
         if sos_step < len(t):
             events.append((sos_step, sep_node, KIND_SOS))
+    return events, oracle_step
+
+
+def prepare_run(config: dict, leader: int, sos_fraction: float) -> dict:
+    """Simulates a run (Blocks 1-3, Block 4 Kalman filter) and reduces it to what the transport needs. No disk cache.
+
+    Input: run `config` (Block 7 overrides and scenario already applied), index of the `leader`, `sos_fraction` in [0, 1) (SOS instant = ``sos_window · sos_fraction`` after the detachment).
+    Procedure: `simulate_mobility` → `simulate_channel` → `simulate_packets`; ``R`` from the run's fading (``kalman.measurement_noise``); `filter_all`, `predict_links`;
+    beacon payload quantised like the neighbour table; `link_state`, `announce_hops`; reception probability ``p = curve(true_rssi)·(1 − background loss)`` (with bursty losses the
+    mean loss is used); events: SOS of the separated node and oracle alarm (first step with the separated node beyond ``oracle_distance`` from the group, generated by the group node with the highest estimated signal towards it).
+    Output: dict `rd` for `simulate_strategy`, plus ``distances``, ``mean_offset``, ``rank``/``pos_class`` of the leader, ``wrong`` (`wrong_hops_episodes`), ``extent`` and the detachment fields.
+    """
+    rcfg = config["routing"]
+    mob, ch, pk = simulate_pipeline(config)
+    t = mob.t
+    n_nodes = mob.positions.shape[1]
+    dt = config["simulation"]["dt"]
+    fading_var = off_diagonal_variance(ch.fading, n_nodes)
+    R = measurement_noise(config, fading_var)
+    kcfg, tcfg = config["kalman"], config["neighbour_table"]
+    kres = filter_all(pk.beacon_times, pk.received, pk.rssi, R, kcfg["sigma_a"], kcfg)
+    est = predict_links(kres, t)
+    pay_r = quantize(kres.r, tcfg["rssi_step"], INT8_RANGE)
+    pay_s = quantize(kres.s, tcfg["slope_step"], SLOPE_CODE_RANGE)
+    ls = link_state(t, pk.beacon_times, pk.received, est["r"], est["s"], pay_r, pay_s, rcfg, config["packets"]["beacon_period"])
+    ann = announce_hops(pk.beacon_times, pk.beacon_steps, pk.received, est["r"], leader, rcfg)
+    ann_grid = announced_grid(t, pk.beacon_times, ann)
+
+    p = _reception_p(ch, config["packets"]["reception"])
+
+    sep = separation_fields(config)
+    sep_enabled, sep_node, sep_start = sep["sep_enabled"], sep["sep_node"], sep["sep_start"]
+    offsets = mob.s_nodes - mob.s_centroid[:, None]
+    before = slice(0, int(np.searchsorted(t, sep_start))) if sep_enabled else slice(None)
+    mean_offset = offsets[before].mean(axis=0)
+    rank, pos_class = position_class(mean_offset, leader)
+
+    events, oracle_step = _group_events(mob, est, t, dt, sep_enabled, sep_node, sep_start, sos_fraction, rcfg)
 
     ext_long = offsets.max(axis=1) - offsets.min(axis=1)
     ext_lat = mob.lateral_offsets.max(axis=1) - mob.lateral_offsets.min(axis=1)
@@ -726,10 +792,10 @@ def prepare_run(config: dict, leader: int, sos_fraction: float) -> dict:
         "distances": mob.distances.astype(np.float32), "mean_offset": mean_offset, "rank": rank, "pos_class": pos_class,
         "extent": {"long_median": float(np.median(ext_long)), "long_p95": float(np.percentile(ext_long, 95)), "lat_median": float(np.median(ext_lat)),
                    "lat_p95": float(np.percentile(ext_lat, 95)), "sigma_long": mob.metadata["sigma_long"], "sigma_lat": mob.metadata["sigma_lat"]},
-        "wrong": wrong_hops_episodes(t, ann_grid, ch.rssi_true, leader, rcfg, int(round(1.0 / dt))),
+        "wrong": wrong_hops_episodes(t, ann_grid, ch.rssi_true, leader, rcfg, second_stride(dt)),
         "node_rank": np.argsort(np.argsort(mean_offset)),
-        "connectivity": connectivity_stats(t, ch.rssi_true, leader, sep_node, sep_start, rcfg, int(round(1.0 / dt))),
-        "range_hist": range_histogram(mob.distances, ch.rssi_path_loss - ch.body_own - ch.body_others, int(round(1.0 / dt))),
+        "connectivity": connectivity_stats(t, ch.rssi_true, leader, sep_node, sep_start, rcfg, second_stride(dt)),
+        "range_hist": range_histogram(mob.distances, ch.rssi_path_loss - ch.body_own - ch.body_others, second_stride(dt)),
         "R": R, **ls,
     }  # fmt: skip
     return rd

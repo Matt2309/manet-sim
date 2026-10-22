@@ -1,208 +1,208 @@
-# Configurazione di default per il simulatore MANET-sim.
-# Blocco 1 (mobilità): nessun valore numerico è cablato nel codice Python,
-# tutte le costanti del modello stanno qui.
+# Default configuration for the MANET-sim simulator.
+# Block 1 (mobility): no numeric value is hard-coded in the Python code,
+# all the model constants live here.
 
 simulation:
-  dt: 0.1                  # passo di simulazione in secondi
-  duration: null           # secondi; null = usa l'intera traccia GPX
-  seed: 42                 # seme RNG, per riproducibilità
+  dt: 0.1                  # simulation step in seconds
+  duration: null           # seconds; null = use the whole GPX track
+  seed: 42                 # RNG seed, for reproducibility
 
 track:
-  gpx_file: "../data/gpx/Corsa_serale.gpx"  # relativo a questo file di configurazione
-  assumed_sample_rate: 1.0    # Hz; il GPX non ha timestamp (vedi docstring di load_track)
-  glitch_max_step: 8.0        # m; passi oltre questa soglia sono buchi di campionamento GPS
-  start_offset: 20.0          # m; da dove parte il gruppo lungo il percorso (margine per l'OU a regime)
-  speed_smoothing_window: 5.0 # s; finestra della media mobile sul profilo di velocità
-  heading_smoothing: 6.0      # m; larghezza della media mobile della direzione del percorso lungo s (riferimento locale continuo nelle curve)
-  end_margin: 20.0            # m; con duration=null, ci si ferma a length - end_margin
-  plausible_speed_range: [1.5, 6.0]  # m/s; range atteso per la corsa, usato per validare
-                                      # a runtime l'assunzione di campionamento uniforme
+  gpx_file: "../data/gpx/Corsa_serale.gpx"  # relative to this configuration file
+  assumed_sample_rate: 1.0    # Hz; the GPX has no timestamps (see the load_track docstring)
+  glitch_max_step: 8.0        # m; steps beyond this threshold are GPS sampling gaps
+  start_offset: 20.0          # m; where the group starts along the route (margin for the OU at steady state)
+  speed_smoothing_window: 5.0 # s; moving-average window on the speed profile
+  heading_smoothing: 6.0      # m; width of the moving average of the route heading along s (continuous local frame in the curves)
+  end_margin: 20.0            # m; with duration=null, stop at length - end_margin
+  plausible_speed_range: [1.5, 6.0]  # m/s; expected range for running, used to validate
+                                      # the uniform-sampling assumption at runtime
 
 group:
   n_nodes: 5
-  longitudinal_spread: 10.0   # m; estensione testa-coda del gruppo (statistica: spread_statistic)
-  lateral_spread: 2.0         # m; larghezza della formazione (stessa statistica)
-  correlation_time: 8.0       # s; costante di tempo longitudinale degli scostamenti (OU del 2° ordine a smorzamento critico)
-  lateral_correlation_time: 2.5  # s; costante di tempo laterale: tornare sulla propria linea dopo una schivata è più rapido della deriva longitudinale
-  spread_statistic: p95       # come interpretare *_spread: "mean" | "p95"
-  min_node_gap: 1.2           # m; distanza di riferimento fra nodi: la repulsione cresce sotto di essa
-  repulsion:                  # forza repulsiva fra i corridori, nel piano: A·(exp((g-d)/B) - exp((g-R)/B)) per d < R
-    strength: 1.0             # m/s^2; A, accelerazione a distanza g (circa)
-    scale: 0.3                # m; B, scala della crescita esponenziale
-    action_distance: 2.4      # m; R, oltre questa distanza la forza è nulla
-  warmup_taus: 3.0            # tempi di correlazione simulati e scartati prima di registrare (stato stazionario con la repulsione)
-  margin_sigmas: 4.0          # start_offset/end_margin richiesti, in unità di sigma_long
-  spread_margin_factor: 1.5   # longitudinal_spread deve superare (n_nodes-1)*min_node_gap*fattore
-  max_relative_speed_p99: 1.0 # m/s; p99 della velocità relativa al baricentro (a passo dt) sotto cui il moto è realistico
-  max_relative_speed: 2.0     # m/s; massimo della velocità relativa al baricentro (a passo dt)
-  calibration:                 # calibrazione numerica di sigma sull'uscita (con la repulsione)
-    groups: 100               # gruppi indipendenti simulati
-    duration: 300.0           # s registrati per gruppo
+  longitudinal_spread: 10.0   # m; head-to-tail extent of the group (statistic: spread_statistic)
+  lateral_spread: 2.0         # m; width of the formation (same statistic)
+  correlation_time: 8.0       # s; longitudinal time constant of the offsets (critically damped 2nd-order OU)
+  lateral_correlation_time: 2.5  # s; lateral time constant: returning to one's own line after a dodge is faster than the longitudinal drift
+  spread_statistic: p95       # how to interpret *_spread: "mean" | "p95"
+  min_node_gap: 1.2           # m; reference distance between nodes: the repulsion grows below it
+  repulsion:                  # repulsive force between runners, in the plane: A·(exp((g-d)/B) - exp((g-R)/B)) for d < R
+    strength: 1.0             # m/s^2; A, acceleration at distance g (approx.)
+    scale: 0.3                # m; B, scale of the exponential growth
+    action_distance: 2.4      # m; R, beyond this distance the force is zero
+  warmup_taus: 3.0            # correlation times simulated and discarded before recording (steady state with the repulsion)
+  margin_sigmas: 4.0          # required start_offset/end_margin, in units of sigma_long
+  spread_margin_factor: 1.5   # longitudinal_spread must exceed (n_nodes-1)*min_node_gap*factor
+  max_relative_speed_p99: 1.0 # m/s; p99 of the speed relative to the centroid (per dt step) below which the motion is realistic
+  max_relative_speed: 2.0     # m/s; maximum of the speed relative to the centroid (per dt step)
+  calibration:                 # numerical calibration of sigma on the output (with the repulsion)
+    groups: 100               # independent groups simulated
+    duration: 300.0           # s recorded per group
     seed: 0
     max_iterations: 30
-    tolerance: 0.001          # convergenza relativa sulla statistica osservata
+    tolerance: 0.001          # relative convergence on the observed statistic
 
 separation:
   enabled: false
-  node_id: 4               # quale nodo si separa
-  start_time: 300.0        # s; istante di inizio della separazione
-  target_speed: 1.8        # m/s; velocità a cui il nodo rallenta
-  ramp_duration: 5.0        # s; tempo per passare dalla velocità di gruppo a target_speed
+  node_id: 4               # which node separates
+  start_time: 300.0        # s; start time of the separation
+  target_speed: 1.8        # m/s; speed the node slows down to
+  ramp_duration: 5.0        # s; time to go from the group speed to target_speed
 
-# Blocco 2 (canale): RSSI di ogni coppia ordinata di nodi.
+# Block 2 (channel): RSSI of every ordered pair of nodes.
 channel:
-  frequency: 2.437e+9         # Hz, canale Wi-Fi 6
-  tx_power: 10.0              # dBm; ridotta da 17 per evitare la saturazione (esp_wifi_set_max_tx_power)
+  frequency: 2.437e+9         # Hz, Wi-Fi channel 6
+  tx_power: 10.0              # dBm; reduced from 17 to avoid saturation (esp_wifi_set_max_tx_power)
   antenna_gain_tx: 0.0        # dBi
   antenna_gain_rx: 0.0        # dBi
 
   path_loss:
-    exponent: 3.0             # n; 3 all'aperto, 4 al chiuso
-    reference_distance: 1.0   # m; d0: sotto questa distanza l'attenuazione resta quella a d0
+    exponent: 3.0             # n; 3 outdoors, 4 indoors
+    reference_distance: 1.0   # m; d0: below this distance the attenuation stays that at d0
 
   shadowing:
     enabled: true
-    mode: field               # "field" (mappa condivisa) | "independent" (per link)
-    sigma: 4.0                # dB; deviazione standard sui link lunghi (field) o su tutti (independent)
-    correlation_distance: 7.0 # m; delta, distanza di correlazione
-    grid_resolution: 1.0      # m; passo della griglia della mappa
-    field_margin: 50.0        # m; margine attorno all'area percorsa
-    fft_padding: 70.0         # m; padding della FFT (>= 10 delta: la correlazione residua fra i bordi opposti è e^-10)
-    integration_step: 0.5     # m; passo di campionamento lungo il segmento del link
-    long_link_factor: 50.0    # i link più lunghi di questo multiplo di delta usano il passo grande
-    long_link_step_factor: 0.5 # passo di integrazione dei link lunghi, in unità di delta
-    chunk_points: 4000000     # punti di integrazione per blocco (solo memoria, non cambia il risultato)
+    mode: field               # "field" (shared map) | "independent" (per link)
+    sigma: 4.0                # dB; standard deviation on long links (field) or on all of them (independent)
+    correlation_distance: 7.0 # m; delta, correlation distance
+    grid_resolution: 1.0      # m; map grid step
+    field_margin: 50.0        # m; margin around the covered area
+    fft_padding: 70.0         # m; FFT padding (>= 10 delta: the residual correlation between opposite edges is e^-10)
+    integration_step: 0.5     # m; sampling step along the link segment
+    long_link_factor: 50.0    # links longer than this multiple of delta use the large step
+    long_link_step_factor: 0.5 # integration step of long links, in units of delta
+    chunk_points: 4000000     # integration points per chunk (memory only, does not change the result)
 
   body:
     own:
       enabled: true
-      mount_side: right       # scheda sulla spalla destra -> il torso blocca verso sinistra
-      max_loss: 12.0          # dB, quando l'altro nodo è esattamente dal lato del torso
-      lobe_exponent: 3.0      # forma del lobo: più alto = lobo più stretto
+      mount_side: right       # board on the right shoulder -> the torso blocks towards the left
+      max_loss: 12.0          # dB, when the other node is exactly on the torso side
+      lobe_exponent: 3.0      # lobe shape: higher = narrower lobe
     others:
       enabled: true
-      loss: 8.0               # dB per ogni corridore che sta in mezzo al link
-      radius: 0.2             # m; il corridore è un cilindro verticale di questo raggio
-      transition_width: 0.05  # m; larghezza della transizione graduale al bordo del cilindro
-      max_total_loss: 12.0    # dB; tetto alla somma delle perdite di più corridori (il 2° e 3° corpo bloccano meno del 1°: il segnale gira attorno)
+      loss: 8.0               # dB for each runner standing between the link ends
+      radius: 0.2             # m; the runner is a vertical cylinder of this radius
+      transition_width: 0.05  # m; width of the gradual transition at the cylinder edge
+      max_total_loss: 12.0    # dB; cap on the sum of the losses of several runners (the 2nd and 3rd bodies block less than the 1st: the signal goes around)
 
   fading:
     enabled: true
-    rician_k_db: 6.0          # fattore K di Rice in dB
+    rician_k_db: 6.0          # Rician K factor in dB
 
   device_offset:
     enabled: true
-    sigma: 1.5                # dB; scarto fisso per scheda, separato per trasmissione e ricezione
+    sigma: 1.5                # dB; fixed per-board offset, separate for transmission and reception
 
   measurement:
-    saturation_dbm: -30.0     # dBm; valore da verificare sulle schede
-    quantization_step: 1.0    # dB; l'ESP32 restituisce un intero in dBm
+    saturation_dbm: -30.0     # dBm; value to be verified on the boards
+    quantization_step: 1.0    # dB; the ESP32 returns an integer in dBm
 
   obstacles:
-    enabled: false            # edifici da OpenStreetMap: Blocco 2b, per ora contributo nullo
+    enabled: false            # buildings from OpenStreetMap: Block 2b, contribution currently zero
 
-# Blocco 3 (pacchetti): beacon ESP-NOW e ricezione.
+# Block 3 (packets): ESP-NOW beacons and reception.
 packets:
-  beacon_period: 0.5          # s; intervallo fra due beacon dello stesso nodo (2 Hz, come il firmware)
-  jitter: 0.05                # s; ritardo casuale uniforme in [-jitter, +jitter] su ogni intervallo
+  beacon_period: 0.5          # s; interval between two beacons of the same node (2 Hz, like the firmware)
+  jitter: 0.05                # s; uniform random delay in [-jitter, +jitter] on every interval
   reception:
-    model: curve              # "curve" (probabilità graduale) | "threshold" (soglia netta, per confronto)
-    sensitivity_dbm: -98.4    # dBm; ESP32-S3 Series Datasheet, tab. 6-4, 802.11b 1 Mbit/s, valore tipico
-    sensitivity_success: 0.92 # probabilità di ricezione alla sensibilità (definizione 802.11b: 8% di pacchetti persi)
-    transition_width: 2.0     # dB; da 10% a 90% di ricezione. Valore iniziale, da misurare con le Heltec
-    background_loss: 0.02     # probabilità di perdita indipendente dal segnale (interferenze Wi-Fi)
-    # Blocco 6 (D2): perdite di fondo a raffiche. "independent" riproduce esattamente il Blocco 3.
+    model: curve              # "curve" (gradual probability) | "threshold" (sharp threshold, for comparison)
+    sensitivity_dbm: -98.4    # dBm; ESP32-S3 Series Datasheet, tab. 6-4, 802.11b 1 Mbit/s, typical value
+    sensitivity_success: 0.92 # reception probability at the sensitivity (802.11b definition: 8% packets lost)
+    transition_width: 2.0     # dB; from 10% to 90% reception. Initial value, to be measured with the Heltec boards
+    background_loss: 0.02     # loss probability independent of the signal (Wi-Fi interference)
+    # Block 6 (D2): bursty background losses. "independent" exactly reproduces Block 3.
     background_model: independent   # "independent" | "bursty"
-    bursty:                        # Gilbert-Elliott a due stati (buono / disturbato), catena di Markov sulla griglia dt
-      mean_loss: 0.02            # frazione di tempo in cui il ricevitore è disturbato
-      mean_burst: 1.0            # s, durata media di una raffica
-      loss_bad: 1.0              # perdita nello stato disturbato
+    bursty:                        # two-state Gilbert-Elliott (good / disturbed), Markov chain on the dt grid
+      mean_loss: 0.02            # fraction of time the receiver is disturbed
+      mean_burst: 1.0            # s, mean burst duration
+      loss_bad: 1.0              # loss in the disturbed state
       burst_scope: receiver      # "receiver" | "link"
 
-# Blocco 4: Kalman per link, tabella dei vicini, fusione, allarmi, metriche.
+# Block 4: per-link Kalman, neighbour table, fusion, alarms, metrics.
 kalman:
-  measurement_noise: auto        # dB²; "auto" = varianza del fading (Blocco 2) + 1/12 di quantizzazione
-  sigma_a: 0.25                  # dB/s²; quanto in fretta può cambiare la pendenza (Blocco 6: 0.25; il Blocco 4 usava 0.5)
+  measurement_noise: auto        # dB²; "auto" = fading variance (Block 2) + 1/12 of quantization
+  sigma_a: 0.25                  # dB/s²; how fast the slope can change (Block 6: 0.25; Block 4 used 0.5)
   sigma_a_sweep: [0.25, 0.5, 1.0, 2.0]
-  initial_slope_std: 3.0         # dB/s; incertezza iniziale sulla pendenza
-  reinit_gap: 10.0               # s; dopo un silenzio più lungo il filtro riparte da zero
-  # Blocco 5 (D): robustezza ai salti da corpo. I default riproducono il Blocco 4.
+  initial_slope_std: 3.0         # dB/s; initial uncertainty on the slope
+  reinit_gap: 10.0               # s; after a longer silence the filter restarts from zero
+  # Block 5 (D): robustness to body jumps. The defaults reproduce Block 4.
   robust: none                   # "none" | "inflate" | "nis_gate"
-  r_inflation: 1.0               # "inflate": R moltiplicato per questo fattore
+  r_inflation: 1.0               # "inflate": R multiplied by this factor
   r_inflation_sweep: [2.0, 4.0]
-  nis_gate: 9.0                  # "nis_gate": oltre questa NIS l'aggiornamento usa R·NIS/nis_gate (9 = 3 sigma su chi quadro a 1 gdl)
-neighbour_table:                 # 5 byte per vicino: id, RSSI, pendenza, dev. std, età
+  nis_gate: 9.0                  # "nis_gate": beyond this NIS the update uses R·NIS/nis_gate (9 = 3 sigma on chi-square with 1 dof)
+neighbour_table:                 # 5 bytes per neighbour: id, RSSI, slope, std dev, age
   rssi_step: 1.0                 # dB (int8)
   slope_step: 0.1                # dB/s (int8)
   std_step: 0.1                  # dB (uint8)
-  age_step: 0.1                  # s (uint8, satura)
+  age_step: 0.1                  # s (uint8, saturates)
 fusion:
-  max_age: 2.0                   # s; le voci più vecchie sono escluse
-  max_age_own: true              # vale anche per la stima propria del link i→m (false = resta sempre, con varianza crescente)
-  # Blocco 5 (A): regola di fusione sull'indice di segnale (più alto = più vicino).
-  rule: weighted_mean            # "weighted_mean" | "median" | "max"; Blocco 6: verdetto = media (results/block6/verdict.yaml)
+  max_age: 2.0                   # s; older entries are excluded
+  max_age_own: true              # also applies to the node's own estimate of link i→m (false = always kept, with growing variance)
+  # Block 5 (A): fusion rule on the signal index (higher = closer).
+  rule: weighted_mean            # "weighted_mean" | "median" | "max"; Block 6: verdict = mean (results/block6/verdict.yaml)
   rule_sweep: [weighted_mean, median, max]
 detector:
-  mode: level                    # "level" | "slope" | "both" (Blocco 6: level; il Blocco 4 usava both)
+  mode: level                    # "level" | "slope" | "both" (Block 6: level; Block 4 used both)
   scope: fused                   # "fused" | "pairwise"
-  level_threshold: -75.0         # dBm; soglia CONGELATA sulla taratura per il rilevatore finale (results/block6/frozen_thresholds.yaml); circa 30 m con la sola distanza
-  slope_threshold: -0.5          # dB/s; soglia in "slope", conferma in "both"
-  min_duration: 1.0              # s; durata minima della condizione per accendere il pre-allarme
-  lost_silence: 10.0             # s; allarme "nodo perso"
-  release_time: 30.0             # s di ricezione buona per spegnere un allarme (Blocco 6: adottato dal Blocco 5; era 5.0)
-  lost_rule: any                 # Blocco 6 (D4): "any" | "not_deaf" (l'osservatore che non sente nessuno non dà il "perso")
-  release_reception: 0.8         # frazione minima di beacon ricevuti in quella finestra
-  release_level_margin: 3.0      # dB oltre la soglia per considerare rientrato il livello
-  release_slope_margin: 0.5      # dB/s, idem per la pendenza
-  min_observers: 1               # osservatori in allarme necessari per l'allarme di sistema
-  warmup: 10.0                   # s iniziali esclusi
-  # Blocco 5 (B): livello relativo = calo rispetto alla linea di base.
+  level_threshold: -75.0         # dBm; threshold FROZEN on the tuning for the final detector (results/block6/frozen_thresholds.yaml); about 30 m with distance alone
+  slope_threshold: -0.5          # dB/s; threshold in "slope", confirmation in "both"
+  min_duration: 1.0              # s; minimum duration of the condition to raise the pre-alarm
+  lost_silence: 10.0             # s; "lost node" alarm
+  release_time: 30.0             # s of good reception to clear an alarm (Block 6: adopted from Block 5; was 5.0)
+  lost_rule: any                 # Block 6 (D4): "any" | "not_deaf" (an observer that hears no one does not raise "lost")
+  release_reception: 0.8         # minimum fraction of beacons received in that window
+  release_level_margin: 3.0      # dB beyond the threshold to consider the level recovered
+  release_slope_margin: 0.5      # dB/s, same for the slope
+  min_observers: 1               # observers in alarm needed for the system alarm
+  warmup: 10.0                   # initial s excluded
+  # Block 5 (B): relative level = drop with respect to the baseline.
   reference: absolute            # "absolute" | "relative"
-  baseline_window: 30.0          # s; la base è la mediana dei campioni accettati in questa finestra
-  baseline_min_samples: 20       # campioni accettati minimi in finestra (10 s a 2 Hz); sotto, la base resta ferma
-  freeze_drop: 6.0               # dB sotto la base: un campione più basso non è accettato (la base si congela)
-  drop_threshold: 20.0           # dB; soglia del calo fuso (valore di default)
+  baseline_window: 30.0          # s; the baseline is the median of the samples accepted in this window
+  baseline_min_samples: 20       # minimum accepted samples in the window (10 s at 2 Hz); below it, the baseline stays frozen
+  freeze_drop: 6.0               # dB below the baseline: a lower sample is not accepted (the baseline freezes)
+  drop_threshold: 20.0           # dB; fused-drop threshold (default value)
   min_observers_sweep: [1, 2]
-  release_time_sweep: [5.0, 15.0, 30.0, 60.0]   # Blocco 5 (C)
+  release_time_sweep: [5.0, 15.0, 30.0, 60.0]   # Block 5 (C)
 metrics:
   scenarios: [none, slowdown, stop]
-  n_runs: 50                     # corse per scenario
-  stop_speed: 0.0                # m/s; scenario "si ferma"
-  separation_start_range: [300.0, 2400.0]   # s; almeno 10 minuti dopo il distacco prima della fine
-  success_window: 30.0           # s; solo informativo: colonna "entro 30 s" (il criterio di successo è success_distance)
-  success_distance: 30.0         # m; rilevato in tempo se l'allarme di sistema si accende prima che la distanza minima dal gruppo superi questo valore
-  max_alarm_time_fraction: 0.01  # un punto dello sweep è ammissibile solo se nelle corse none la frazione di tempo in allarme è <= questo valore
-  confidence_level: 0.95         # livello degli intervalli di Wilson (P_d) e di Poisson (falsi allarmi per ora)
+  n_runs: 50                     # runs per scenario
+  stop_speed: 0.0                # m/s; "stops" scenario
+  separation_start_range: [300.0, 2400.0]   # s; at least 10 minutes after the separation before the end
+  success_window: 30.0           # s; informative only: "within 30 s" column (the success criterion is success_distance)
+  success_distance: 30.0         # m; detected in time if the system alarm fires before the minimum distance from the group exceeds this value
+  max_alarm_time_fraction: 0.01  # a sweep point is admissible only if in the none runs the fraction of time in alarm is <= this value
+  confidence_level: 0.95         # level of the Wilson (P_d) and Poisson (false alarms per hour) intervals
   target_false_alarms_per_hour: 1.0
-  level_threshold_sweep: [-95.0, -60.0, 2.5]   # inizio, fine, passo (dBm)
-  slope_threshold_sweep: [-4.0, -0.25, 0.25]   # inizio, fine, passo (dB/s)
-  drop_threshold_sweep: [6.0, 40.0, 1.0]       # Blocco 5: inizio, fine, passo (dB)
-  nis_histogram: [0.0, 12.0, 0.1]              # inizio, fine, passo dell'istogramma della NIS (solo grafico)
-  reference_runs:                # corse da seguire nei grafici e nei resoconti: scenario -> indici
+  level_threshold_sweep: [-95.0, -60.0, 2.5]   # start, end, step (dBm)
+  slope_threshold_sweep: [-4.0, -0.25, 0.25]   # start, end, step (dB/s)
+  drop_threshold_sweep: [6.0, 40.0, 1.0]       # Block 5: start, end, step (dB)
+  nis_histogram: [0.0, 12.0, 0.1]              # start, end, step of the NIS histogram (plot only)
+  reference_runs:                # runs to follow in the plots and reports: scenario -> indices
     stop: [26, 30]
 
-# Blocco 5: esperimento di rifinitura. Il punto di lavoro "base" e le regole di scelta.
+# Block 5: refinement experiment. The "base" working point and the selection rules.
 refinement:
-  base: {sigma_a: 0.25, mode: level, scope: fused, variant: both}   # punto di lavoro del Blocco 4
-  min_net_gain_runs: 3           # corse guadagnate - perse (slowdown + stop) per battere un'alternativa; meno = rumore
-  repass_distance: 30.0          # m; ritorno sotto questa distanza dopo il rilevamento = ripassaggio
+  base: {sigma_a: 0.25, mode: level, scope: fused, variant: both}   # Block 4 working point
+  min_net_gain_runs: 3           # runs gained - lost (slowdown + stop) to beat an alternative; less = noise
+  repass_distance: 30.0          # m; return below this distance after detection = re-pass
   shadowing_modes: [field, independent]
-  nis_quantile: 0.99             # percentile della NIS riportato nel gruppo
-  time_budget_minutes: 45        # stima oltre la quale l'esperimento si ferma e chiede (con 8 processi)
-  drop_histogram: [-10.0, 60.0, 1.0]   # inizio, fine, passo (dB) dell'istogramma del calo fuso (diagnostica)
-  time_estimate: {factor: 1.6, extra_minutes: 3.5}   # stima del tempo totale del Blocco 5: fase A-D * factor + extra (min, con 8 processi)
+  nis_quantile: 0.99             # NIS percentile reported in the group
+  time_budget_minutes: 45        # estimate beyond which the experiment stops and asks (with 8 processes)
+  drop_histogram: [-10.0, 60.0, 1.0]   # start, end, step (dB) of the fused-drop histogram (diagnostics)
+  time_estimate: {factor: 1.6, extra_minutes: 3.5}   # estimated total time of Block 5: phase A-D * factor + extra (min, with 8 processes)
 
-# Blocco 6: numeri finali e sensibilità.
+# Block 6: final numbers and sensitivity.
 final:
-  n_runs: 100                    # corse di verifica per scenario
-  sensitivity_runs: 50           # prime corse di verifica usate nella sensibilità
-  seed_keys: {runs: 8, separation: 9, bursts: 10, bootstrap: 11}   # bootstrap: generatore dei ricampionamenti
+  n_runs: 100                    # verification runs per scenario
+  sensitivity_runs: 50           # first verification runs used in the sensitivity
+  seed_keys: {runs: 8, separation: 9, bursts: 10, bootstrap: 11}   # bootstrap: resampling generator
   configs: [media, migliore, coppia]
-  config_defs:                   # sostituzioni di config (chiavi puntate) per ciascuna configurazione
+  config_defs:                   # config replacements (dotted keys) for each configuration
     media: {detector.scope: fused, fusion.rule: weighted_mean}
     migliore: {detector.scope: fused, fusion.rule: max}
     coppia: {detector.scope: pairwise, fusion.rule: weighted_mean}
-  common:                        # fissate esplicitamente: il Blocco 6 non dipende dai default
+  common:                        # set explicitly: Block 6 does not depend on the defaults
     kalman.sigma_a: 0.25
     kalman.robust: none
     detector.mode: level
@@ -211,33 +211,33 @@ final:
     detector.min_observers: 1
     detector.lost_rule: any
     packets.reception.background_model: independent
-  min_net_gain: 3                # corse nette per adottare "migliore"
+  min_net_gain: 3                # net runs to adopt "migliore"
   bootstrap_samples: 2000
-  time_budget_minutes: 60        # stima oltre la quale l'esperimento si ferma e chiede (con 8 processi)
-  burst_long: 10.0               # s; una raffica più lunga di questo valore fa scattare il "perso" (= detector.lost_silence)
+  time_budget_minutes: 60        # estimate beyond which the experiment stops and asks (with 8 processes)
+  burst_long: 10.0               # s; a burst longer than this value triggers "lost" (= detector.lost_silence)
   sensitivity_points:
     sens_96:     {packets.reception.sensitivity_dbm: -96.0}
     bursty_2_1:  {packets.reception.background_model: bursty, packets.reception.bursty.mean_loss: 0.02, packets.reception.bursty.mean_burst: 1.0}
     bursty_2_3:  {packets.reception.background_model: bursty, packets.reception.bursty.mean_loss: 0.02, packets.reception.bursty.mean_burst: 3.0}
     bursty_5_3:  {packets.reception.background_model: bursty, packets.reception.bursty.mean_loss: 0.05, packets.reception.bursty.mean_burst: 3.0}
     pessimista:  {packets.reception.sensitivity_dbm: -96.0, packets.reception.background_model: bursty, packets.reception.bursty.mean_loss: 0.05, packets.reception.bursty.mean_burst: 3.0}
-  not_deaf_points: [base, bursty_2_1, bursty_2_3, bursty_5_3, pessimista]   # punti in cui si prova anche lost_rule: not_deaf
+  not_deaf_points: [base, bursty_2_1, bursty_2_3, bursty_5_3, pessimista]   # points where lost_rule: not_deaf is also tried
 
-# Blocco 7: routing verso il capogruppo. Non cambia i Blocchi 1-6.
+# Block 7: routing towards the group leader. Does not change Blocks 1-6.
 routing:
-  scenario_overrides:            # solo per l'esperimento del Blocco 7
+  scenario_overrides:            # only for the Block 7 experiment
     group.n_nodes: 10
     group.longitudinal_spread: 35.0
-    group.lateral_spread: 5.0    # 2 m non è raggiungibile con 10 nodi: sigma_lat va a ~0 e la larghezza p95 (4,4 m) viene dalla sola repulsione
-    track.start_offset: 35.0     # >= margin_sigmas * sigma_long (31,7 m)
+    group.lateral_spread: 5.0    # 2 m is not reachable with 10 nodes: sigma_lat goes to ~0 and the p95 width (4.4 m) comes from the repulsion alone
+    track.start_offset: 35.0     # >= margin_sigmas * sigma_long (31.7 m)
     track.end_margin: 35.0
-  channel_profile: heltec_run    # nominal | heltec_run; heltec_run è l'unico punto di lavoro in tesi, nominal resta come confronto
-  channel_profiles:              # sostituzioni di canale (solo Blocco 7), applicate dopo scenario_overrides
+  channel_profile: heltec_run    # nominal | heltec_run; heltec_run is the only working point in the thesis, nominal is kept for comparison
+  channel_profiles:              # channel replacements (Block 7 only), applied after scenario_overrides
     nominal: {}
-    heltec_run:                  # livelli misurati nella corsa con le Heltec del 13 ottobre
-      channel.tx_power: -17.0    # dBm EQUIVALENTI (EIRP con perdite di antenna, montaggio e corpi), non impostabili sull'ESP32. Tarato con scripts/calibrate_heltec_power.py: mediana RSSI nel gruppo da 5 = -78,0 dBm
+    heltec_run:                  # levels measured in the run with the Heltec boards of 13 October
+      channel.tx_power: -17.0    # EQUIVALENT dBm (EIRP including antenna, mounting and body losses), not settable on the ESP32. Calibrated with scripts/calibrate_heltec_power.py: median RSSI in the group of 5 = -78.0 dBm
       packets.reception.sensitivity_dbm: -96.0
-      routing.candidate_threshold: -88.0   # 8 dB sopra la sensibilità, come -90 su -98,4
+      routing.candidate_threshold: -88.0   # 8 dB above the sensitivity, like -90 on -98.4
   n_runs: 50
   seed_keys: {runs: 12, separation: 13, leader: 14, unicast: 15, sos: 16}
   strategies: [direct, best_rssi, dqrem, dqrem_no_slope]
@@ -247,33 +247,33 @@ routing:
   ttb_cap: 60.0                  # s
   ahp_matrix: [[1, 1, 3, 5, 5], [1, 1, 3, 5, 5], [0.3333, 0.3333, 1, 2, 2],
                [0.2, 0.2, 0.5, 1, 1], [0.2, 0.2, 0.5, 1, 1]]
-  ahp_random_index: {3: 0.58, 4: 0.90, 5: 1.12}   # indice casuale di Saaty per n criteri
-  reception_window: 10.0         # s, finestra di C4 (frazione di beacon ricevuti)
+  ahp_random_index: {3: 0.58, 4: 0.90, 5: 1.12}   # Saaty random index for n criteria
+  reception_window: 10.0         # s, C4 window (fraction of beacons received)
   entropy_window: 60.0           # s
   entropy_min_samples: 20
-  alpha: 0.5                     # peso AHP contro entropia
+  alpha: 0.5                     # AHP weight versus entropy
   record_period: 1.0             # s
   max_records: 10
-  max_packet_bytes: 250          # ESP-NOW v1; sweep informativo con 1470 (v2)
+  max_packet_bytes: 250          # ESP-NOW v1; informative sweep with 1470 (v2)
   packet_bytes_sweep: [1470]
   packet_header_bytes: 4
   max_wait: 1.0                  # s
   max_retries: 3
   buffer_records: 600
-  degraded_period: 5.0           # s, 0,2 Hz a buffer pieno
+  degraded_period: 5.0           # s, 0.2 Hz with a full buffer
   sos_window: 120.0              # s
   fresh_age: 5.0                 # s
-  oracle_distance: 30.0          # m, allarme oracolo: distanza del separato dal gruppo
-  warmup: 10.0                   # s iniziali esclusi dalle metriche
-  end_margin: 60.0               # s finali: i record creati dopo non entrano nella consegna
+  oracle_distance: 30.0          # m, oracle alarm: distance of the separated node from the group
+  warmup: 10.0                   # initial s excluded from the metrics
+  end_margin: 60.0               # final s: records created later do not count in the delivery
   view_age_thresholds: [5.0, 10.0]   # s
-  distance_bins: [0.0, 10.0, 20.0, 30.0, 50.0, 1.0e+9]   # m, consegna per distanza dal capogruppo
+  distance_bins: [0.0, 10.0, 20.0, 30.0, 50.0, 1.0e+9]   # m, delivery by distance from the group leader
   airtime: {preamble_us: 192.0, us_per_byte: 8.0, ack_bytes: 14}   # 802.11b 1 Mbit/s
-  min_break_reduction: 0.2       # DQREM "ripaga" se riduce le rotture di almeno questa frazione rispetto a best_rssi
-  time_budget_minutes: 60        # stima oltre la quale l'esperimento si ferma e chiede (con 8 processi)
-  reference_run: {scenario: stop, index: 0}   # corsa di cui si salva la traccia per route_example.png
+  min_break_reduction: 0.2       # DQREM "pays off" if it reduces breaks by at least this fraction with respect to best_rssi
+  time_budget_minutes: 60        # estimate beyond which the experiment stops and asks (with 8 processes)
+  reference_run: {scenario: stop, index: 0}   # run whose trace is saved for route_example.png
 
-# Configurazione del Blocco 4 (sostituzioni ai default del Blocco 6): serve agli script dei Blocchi 4-5 e ai test.
+# Block 4 configuration (replacements to the Block 6 defaults): used by the Block 4-5 scripts and the tests.
 history:
   block4:
     kalman.sigma_a: 0.5

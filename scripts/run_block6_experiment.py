@@ -1,19 +1,17 @@
 #!/usr/bin/env python3
-"""Esperimento del Blocco 6: soglie congelate, valutazione su corse nuove, verdetto media/migliore, sensibilità.
+"""Block 6 experiment: frozen thresholds, evaluation on new runs, media/migliore verdict, sensitivity.
 
-1. taratura (150 corse dei Blocchi 4-5, chiavi 6-7): sweep della soglia per `media`, `migliore`, `coppia`, scelta del punto di lavoro, scrittura di
+1. tuning (150 runs of Blocks 4-5, keys 6-7): threshold sweep for `media`, `migliore`, `coppia`, choice of the working point, writing of
    ``results/block6/frozen_thresholds.yaml``;
-2. verifica (``final.n_runs`` corse per scenario, chiavi 8-9): valutazione alle soglie LETTE dal file;
-3. verdetto media contro migliore (``results/block6/verdict.yaml``);
-4. sensibilità (prime ``final.sensitivity_runs`` corse di verifica; cambia solo il Blocco 3) della configurazione finale.
-Se ``frozen_thresholds.yaml`` esiste non viene riscritto: la taratura deve ridare le stesse soglie (altrimenti errore; ``--refreeze`` per riscriverlo).
-Config: config/default.yaml se non indicata.
+2. verification (``final.n_runs`` runs per scenario, keys 8-9): evaluation at the thresholds READ from the file;
+3. verdict media versus migliore (``results/block6/verdict.yaml``);
+4. sensitivity (first ``final.sensitivity_runs`` verification runs; only Block 3 changes) of the final configuration.
+If ``frozen_thresholds.yaml`` exists it is not rewritten: tuning must give the same thresholds again (otherwise error; ``--refreeze`` to rewrite it).
+Config: config/default.yaml if not given.
 """
 
-import argparse
 import datetime
 import math
-import os
 import sys
 import time
 from pathlib import Path
@@ -21,19 +19,19 @@ from pathlib import Path
 import numpy as np
 import yaml
 
-_REPO_ROOT = Path(__file__).resolve().parent.parent
-sys.path.insert(0, str(_REPO_ROOT))
-
+from _cli import make_parser  # noqa: E402
+from src.common.git import git_or_unknown  # noqa: E402
+from src.common.io import load_pickle, save_pickle  # noqa: E402
+from src.common.paths import block_dir  # noqa: E402
 from src.experiment import pooled_fading_variance  # noqa: E402
-from src.final import (  # noqa: E402
-    LOST,
+from src.final import (
     decide_verdict,
     evaluate_at,
     evaluate_sensitivity,
     evaluation_table,
     freeze_thresholds,
-    _git,
     load_frozen,
+    LOST,
     process_run_final,
     run_final_phase,
     run_sets,
@@ -46,18 +44,12 @@ from src.final import (  # noqa: E402
 )
 from src.kalman import measurement_noise  # noqa: E402
 from src.mobility import load_config  # noqa: E402
-from src.refinement import SEPARATED, load_pickle, save_pickle  # noqa: E402
 from src.simulator import ensure_all_cached  # noqa: E402
 
 
 def main() -> None:
-    parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("config", nargs="?", default=str(_REPO_ROOT / "config" / "default.yaml"))
-    parser.add_argument("--jobs", type=int, default=os.cpu_count() or 1, help="processi paralleli")
-    parser.add_argument("--cache-dir", default=str(_REPO_ROOT / "results" / "cache"))
-    parser.add_argument("--out-dir", default=str(_REPO_ROOT / "results" / "block6"))
-    parser.add_argument("--force", action="store_true", help="prosegue anche se la stima supera ``final.time_budget_minutes``")
-    parser.add_argument("--refreeze", action="store_true", help="riscrive frozen_thresholds.yaml dalla taratura")
+    parser = make_parser(__doc__, jobs=True, cache_dir=True, out_dir=block_dir(6), force_help="proceeds even if the estimate exceeds ``final.time_budget_minutes``")
+    parser.add_argument("--refreeze", action="store_true", help="rewrites frozen_thresholds.yaml from the tuning")
     args = parser.parse_args()
 
     config = load_config(args.config)
@@ -69,11 +61,11 @@ def main() -> None:
 
     tuning, verification = run_sets(config)
     seeds_t, seeds_v = {r["seed"] for r in tuning}, {r["seed"] for r in verification}
-    assert not seeds_t & seeds_v, "semi in comune fra taratura e verifica"
+    assert not seeds_t & seeds_v, "seeds in common between tuning and verification"
     n_sens = fcfg["sensitivity_runs"]
     print(
-        f"Taratura: {len(tuning)} corse ({config['metrics']['n_runs']} per scenario); verifica: {len(verification)} corse"
-        f" ({fcfg['n_runs']} per scenario); sensibilità: prime {n_sens} per scenario; {jobs} processi"
+        f"Tuning: {len(tuning)} runs ({config['metrics']['n_runs']} per scenario); verification: {len(verification)} runs"
+        f" ({fcfg['n_runs']} per scenario); sensitivity: first {n_sens} per scenario; {jobs} processes"
     )
 
     # ---- Cache ---------------------------------------------------------------
@@ -82,15 +74,15 @@ def main() -> None:
     ensure_all_cached(verification, cache_dir, jobs, with_channel=lambda r: r["index"] < n_sens)
     timings["cache"] = time.perf_counter() - t0
     R = measurement_noise(config, pooled_fading_variance(tuning, cache_dir))
-    print(f"R = {R:.3f} dB² (dalla taratura); cache: {timings['cache']:.1f} s")
+    print(f"R = {R:.3f} dB² (from tuning); cache: {timings['cache']:.1f} s")
 
-    # ---- Stima dei tempi -------------------------------------------------------
+    # ---- Time estimate -------------------------------------------------------
     spec_main = {"mode": "cache", "point": {}, "configs": list(fcfg["configs"]), "rules": ["any"]}
     cases = sensitivity_cases(config)
     pess = next(p for n, p, _ in cases if n == "pessimista")
     spec_probe = {"mode": "channel", "point": pess, "configs": ["media"], "rules": ["any", "not_deaf", "not_deaf_episode"]}
     probe = [next(r for r in verification if r["scenario"] == s) for s in ("none", "slowdown")]
-    process_run_final((probe[0], config, cache_dir, R, {**spec_main, "configs": ["media"]}))  # compilazione numba
+    process_run_final((probe[0], config, cache_dir, R, {**spec_main, "configs": ["media"]}))  # numba compilation
     t_main, t_sens = [], []
     for r in probe:
         t0 = time.perf_counter()
@@ -103,14 +95,14 @@ def main() -> None:
     est_main = ((t_main[0] * (n_tun + n_ver)) + 2 * t_main[1] * (n_tun + n_ver)) / jobs / 60.0
     est_sens = len(cases) * (t_sens[0] * n_sens + 2 * t_sens[1] * n_sens) / jobs / 60.0
     print(
-        f"Una corsa none: {t_main[0]:.1f} s (3 configurazioni), con distacco {t_main[1]:.1f} s; sensibilità: {t_sens[0]:.1f} s / {t_sens[1]:.1f} s."
-        f" Stima: taratura + verifica {est_main:.1f} min, sensibilità {est_sens:.1f} min, totale circa {est_main + est_sens:.1f} min (cache esclusa)"
+        f"One none run: {t_main[0]:.1f} s (3 configurations), with separation {t_main[1]:.1f} s; sensitivity: {t_sens[0]:.1f} s / {t_sens[1]:.1f} s."
+        f" Estimate: tuning + verification {est_main:.1f} min, sensitivity {est_sens:.1f} min, total about {est_main + est_sens:.1f} min (cache excluded)"
     )
     if est_main + est_sens > fcfg["time_budget_minutes"] and not args.force:
-        print(f"La stima supera {fcfg['time_budget_minutes']} min: mi fermo (--force per proseguire).")
+        print(f"The estimate exceeds {fcfg['time_budget_minutes']} min: stopping (--force to proceed).")
         sys.exit(2)
 
-    # ---- 1. Taratura e soglie congelate ---------------------------------------
+    # ---- 1. Tuning and frozen thresholds ---------------------------------------
     t0 = time.perf_counter()
     tuning_outs = run_final_phase(config, tuning, cache_dir, R, spec_main, jobs)
     timings["tuning"] = time.perf_counter() - t0
@@ -121,34 +113,34 @@ def main() -> None:
         for name, f in chosen.items():
             if abs(frozen["thresholds"][name]["threshold"] - f["threshold"]) > 1e-9:
                 raise SystemExit(
-                    f"La taratura dà per {name} la soglia {f['threshold']} ma il file congelato ha {frozen['thresholds'][name]['threshold']}:"
-                    f" il file non viene riscritto (usa --refreeze se la modifica è voluta)."
+                    f"Tuning gives threshold {f['threshold']} for {name} but the frozen file has {frozen['thresholds'][name]['threshold']}:"
+                    f" the file is not rewritten (use --refreeze if the change is intended)."
                 )
-        print(f"Soglie congelate lette da {frozen_path} (la taratura le riconferma)")
+        print(f"Frozen thresholds read from {frozen_path} (tuning reconfirms them)")
     else:
         write_frozen(frozen_path, chosen, config, R)
         frozen = load_frozen(frozen_path)
-        print(f"Soglie congelate scritte in {frozen_path}")
-    print(f"\n=== Soglie congelate (taratura: {frozen['date']}, commit {frozen['commit']}{' + modifiche' if frozen['dirty'] else ''}, release_time {frozen['release_time']:g} s) ===")
-    print(f"{'config':<9} {'ambito':>9} {'regola':>13} {'soglia dBm':>10} {'P_d slowdown':>13} {'P_d stop':>9} {'FA/h':>6} {'in allarme':>10}")
+        print(f"Frozen thresholds written to {frozen_path}")
+    print(f"\n=== Frozen thresholds (tuning: {frozen['date']}, commit {frozen['commit']}{' + changes' if frozen['dirty'] else ''}, release_time {frozen['release_time']:g} s) ===")
+    print(f"{'config':<9} {'scope':>9} {'rule':>13} {'thr. dBm':>10} {'P_d slowdown':>13} {'P_d stop':>9} {'FA/h':>6} {'in alarm':>10}")
     for name, f in frozen["thresholds"].items():
         t = f["tuning"]
         print(
             f"{name:<9} {f['scope']:>9} {f['fusion_rule']:>13} {f['threshold']:>10.1f} {t['p_detect_slowdown']:>13.2f} {t['p_detect_stop']:>9.2f}"
             f" {t['fa_per_hour']:>6.2f} {100 * t['active_fraction']:>9.2f}%"
         )
-    block5 = _REPO_ROOT / "results" / "block5" / "results.pkl"
+    block5 = block_dir(5) / "results.pkl"
     if block5.exists():
         s5 = load_pickle(block5)["summaries"].get(("C:release=30", "fused", 1))
         m = frozen["thresholds"]["media"]
         if s5 is not None and s5["wp"] is not None:
             print(
-                f"Controllo con il Blocco 5 (C:release=30): soglia {s5['wp']['threshold']:.1f} dBm, P_d {s5['point']['slowdown']['p_detect']:.2f}/"
+                f"Check against Block 5 (C:release=30): threshold {s5['wp']['threshold']:.1f} dBm, P_d {s5['point']['slowdown']['p_detect']:.2f}/"
                 f"{s5['point']['stop']['p_detect']:.2f}, FA/h {s5['wp']['fa_per_hour']:.2f} -> "
-                + ("coincide" if abs(s5["wp"]["threshold"] - m["threshold"]) < 1e-9 else "DIVERSO")
+                + ("matches" if abs(s5["wp"]["threshold"] - m["threshold"]) < 1e-9 else "DIFFERENT")
             )
 
-    # ---- 2. Verifica -------------------------------------------------------------
+    # ---- 2. Verification -------------------------------------------------------------
     t0 = time.perf_counter()
     verif_outs = run_final_phase(config, verification, cache_dir, R, spec_main, jobs)
     timings["verification"] = time.perf_counter() - t0
@@ -161,7 +153,7 @@ def main() -> None:
         "verification": {n: sweep_rows(verif_outs, n, "any", config) for n in fcfg["configs"]},
     }
 
-    # ---- 3. Verdetto -------------------------------------------------------------
+    # ---- 3. Verdict -------------------------------------------------------------
     v = decide_verdict(
         total_success(verification_eval["media"]["at"]),
         total_success(verification_eval["migliore"]["at"]),
@@ -172,7 +164,7 @@ def main() -> None:
     final_name = v["adopted"]
     with open(out_dir / "verdict.yaml", "w") as f:
         yaml.safe_dump(
-            {"date": datetime.datetime.now().isoformat(timespec="seconds"), "commit": _git("rev-parse", "HEAD"), **v,
+            {"date": datetime.datetime.now().isoformat(timespec="seconds"), "commit": git_or_unknown("rev-parse", "HEAD"), **v,
              "final": final_name, "final_threshold": frozen["thresholds"][final_name]["threshold"]},
             f, sort_keys=False, allow_unicode=True,
         )  # fmt: skip
@@ -180,40 +172,40 @@ def main() -> None:
         "config": config, "R": R, "frozen": frozen, "tuning": tuning_eval, "verification": verification_eval, "verdict": v,
         "final_name": final_name, "sweeps": sweeps, "diag_tuning": None,
     }  # fmt: skip
-    print("\n=== Valutazione sulle corse di verifica (soglie congelate; ottimismo = verifica meno taratura) ===")
+    print("\n=== Evaluation on the verification runs (frozen thresholds; optimism = verification minus tuning) ===")
     results["sensitivity"] = {}
     print(evaluation_table(results))
-    print("\n=== Verdetto media contro migliore ===")
+    print("\n=== Verdict media versus migliore ===")
     print(verdict_text(v))
-    print(f"Configurazione finale: {final_name} (soglia {frozen['thresholds'][final_name]['threshold']:g} dBm)")
+    print(f"Final configuration: {final_name} (threshold {frozen['thresholds'][final_name]['threshold']:g} dBm)")
 
-    # ---- 4. Sensibilità -----------------------------------------------------------
+    # ---- 4. Sensitivity -----------------------------------------------------------
     t0 = time.perf_counter()
     subset = [r for r in verification if r["index"] < n_sens]
     case_outs = {}
     for name, point, rules in cases:
         spec = {"mode": "cache" if name == "base" else "channel", "point": point, "configs": [final_name], "rules": rules}
         case_outs[name] = run_final_phase(config, subset, cache_dir, R, spec, jobs)
-        print(f"  sensibilità {name}: {time.perf_counter() - t0:.0f} s dall'inizio della fase")
+        print(f"  sensitivity {name}: {time.perf_counter() - t0:.0f} s since the start of the phase")
     timings["sensitivity"] = time.perf_counter() - t0
     results["sensitivity"] = evaluate_sensitivity(case_outs, final_name, frozen["thresholds"][final_name]["threshold"], config)
-    # la base ricostruita dal canale deve coincidere con la cache (bit per bit)
+    # the base rebuilt from the channel must match the cache (bit for bit)
     check_runs = [r for r in subset if r["scenario"] == "none"][:1]
     a = process_run_final((check_runs[0], config, cache_dir, R, {"mode": "cache", "point": {}, "configs": [final_name], "rules": ["any"]}))
     b = process_run_final((check_runs[0], config, cache_dir, R, {"mode": "channel", "point": {}, "configs": [final_name], "rules": ["any"]}))
     same = all(np.array_equal(a["results"][(final_name, "any")][k], b["results"][(final_name, "any")][k]) for k in a["results"][(final_name, "any")])
-    print("\n=== Sensibilità (prime %d corse per scenario di verifica, stessi semi in tutti i punti) ===" % n_sens)
+    print("\n=== Sensitivity (first %d runs per verification scenario, same seeds at all points) ===" % n_sens)
     print(sensitivity_table(results))
-    print(f"Controllo: base ricostruita dal canale = base dalla cache (corsa none): {'identica' if same else 'DIVERSA'}")
+    print(f"Check: base rebuilt from the channel = base from the cache (none run): {'identical' if same else 'DIFFERENT'}")
 
     timings["total"] = time.perf_counter() - t_start
     results["timings"] = timings
-    print("\n=== Tempi di esecuzione ===")
+    print("\n=== Execution times ===")
     for k, val in timings.items():
         print(f"  {k:<14} {val:>8.1f} s")
-    print(f"  totale {timings['total'] / 60:.1f} min con {jobs} processi")
+    print(f"  total {timings['total'] / 60:.1f} min with {jobs} processes")
     save_pickle(out_dir / "results.pkl", results)
-    print(f"\nRisultati salvati in {out_dir}")
+    print(f"\nResults saved to {out_dir}")
 
 
 if __name__ == "__main__":
