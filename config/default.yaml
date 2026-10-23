@@ -53,11 +53,13 @@ separation:
 channel:
   frequency: 2.437e+9         # Hz, Wi-Fi channel 6
   tx_power: 10.0              # dBm; reduced from 17 to avoid saturation (esp_wifi_set_max_tx_power)
-  antenna_gain_tx: 0.0        # dBi
-  antenna_gain_rx: 0.0        # dBi
+  # Heltec measurements: antenna and mounting loss, split evenly between tx and rx. With n = 1.9 it gives -62 dBm at 1 m: 10 - 31.8 - 40.2
+  # (previous values 0.0 / 0.0 in history.channel_v1)
+  antenna_gain_tx: -15.9      # dBi
+  antenna_gain_rx: -15.9      # dBi
 
   path_loss:
-    exponent: 3.0             # n; 3 outdoors, 4 indoors
+    exponent: 1.9             # n; field test of 20 October, boards on their mounts, rms deviation 3 dB (previous value 3.0 in history.channel_v1)
     reference_distance: 1.0   # m; d0: below this distance the attenuation stays that at d0
 
   shadowing:
@@ -107,7 +109,7 @@ packets:
   jitter: 0.05                # s; uniform random delay in [-jitter, +jitter] on every interval
   reception:
     model: curve              # "curve" (gradual probability) | "threshold" (sharp threshold, for comparison)
-    sensitivity_dbm: -98.4    # dBm; ESP32-S3 Series Datasheet, tab. 6-4, 802.11b 1 Mbit/s, typical value
+    sensitivity_dbm: -96.0    # dBm; run of 13 October, histogram of the received beacons (the datasheet typical value was -98.4, see history.channel_v1)
     sensitivity_success: 0.92 # reception probability at the sensitivity (802.11b definition: 8% packets lost)
     transition_width: 2.0     # dB; from 10% to 90% reception. Initial value, to be measured with the Heltec boards
     background_loss: 0.02     # loss probability independent of the signal (Wi-Fi interference)
@@ -155,6 +157,7 @@ detector:
   release_level_margin: 3.0      # dB beyond the threshold to consider the level recovered
   release_slope_margin: 0.5      # dB/s, same for the slope
   min_observers: 1               # observers in alarm needed for the system alarm
+  lost_min_observers: 1          # observers in "lost" needed for the system alarm; system alarm = (pre-alarm observers >= min_observers) OR (lost observers >= this). null = old formula (pre | lost) >= min_observers
   warmup: 10.0                   # initial s excluded
   # Block 5 (B): relative level = drop with respect to the baseline.
   reference: absolute            # "absolute" | "relative"
@@ -174,7 +177,7 @@ metrics:
   max_alarm_time_fraction: 0.01  # a sweep point is admissible only if in the none runs the fraction of time in alarm is <= this value
   confidence_level: 0.95         # level of the Wilson (P_d) and Poisson (false alarms per hour) intervals
   target_false_alarms_per_hour: 1.0
-  level_threshold_sweep: [-95.0, -60.0, 2.5]   # start, end, step (dBm)
+  level_threshold_sweep: [-100.0, -70.0, 1.0]   # start, end, step (dBm); levels in the group now lie between -75 and -95: 1 dB step and lower thresholds (previous [-95, -60, 2.5] in history.channel_v1)
   slope_threshold_sweep: [-4.0, -0.25, 0.25]   # start, end, step (dB/s)
   drop_threshold_sweep: [6.0, 40.0, 1.0]       # Block 5: start, end, step (dB)
   nis_histogram: [0.0, 12.0, 0.1]              # start, end, step of the NIS histogram (plot only)
@@ -209,6 +212,7 @@ final:
     detector.reference: absolute
     detector.release_time: 30.0
     detector.min_observers: 1
+    detector.lost_min_observers: 2   # firmware rule: a single disturbed board cannot declare its neighbours lost
     detector.lost_rule: any
     packets.reception.background_model: independent
   min_net_gain: 3                # net runs to adopt "migliore"
@@ -216,12 +220,44 @@ final:
   time_budget_minutes: 60        # estimate beyond which the experiment stops and asks (with 8 processes)
   burst_long: 10.0               # s; a burst longer than this value triggers "lost" (= detector.lost_silence)
   sensitivity_points:
-    sens_96:     {packets.reception.sensitivity_dbm: -96.0}
+    sens_94:     {packets.reception.sensitivity_dbm: -94.0}
+    sens_98:     {packets.reception.sensitivity_dbm: -98.0}
     bursty_2_1:  {packets.reception.background_model: bursty, packets.reception.bursty.mean_loss: 0.02, packets.reception.bursty.mean_burst: 1.0}
     bursty_2_3:  {packets.reception.background_model: bursty, packets.reception.bursty.mean_loss: 0.02, packets.reception.bursty.mean_burst: 3.0}
     bursty_5_3:  {packets.reception.background_model: bursty, packets.reception.bursty.mean_loss: 0.05, packets.reception.bursty.mean_burst: 3.0}
-    pessimista:  {packets.reception.sensitivity_dbm: -96.0, packets.reception.background_model: bursty, packets.reception.bursty.mean_loss: 0.05, packets.reception.bursty.mean_burst: 3.0}
+    pessimista:  {packets.reception.sensitivity_dbm: -94.0, packets.reception.background_model: bursty, packets.reception.bursty.mean_loss: 0.05, packets.reception.bursty.mean_burst: 3.0}
+    corpo_fermo: {channel.body.own.max_loss: 10.0, channel.body.own.lobe_exponent: 0.9}   # body tuned on test A (static nodes); changes the channel
+    lost_1:      {detector.lost_min_observers: 1}   # value of the 2-board confirmation
   not_deaf_points: [base, bursty_2_1, bursty_2_3, bursty_5_3, pessimista]   # points where lost_rule: not_deaf is also tried
+
+# Check of the channel against the Heltec measurements (scripts/check_channel_heltec.py).
+channel_check:
+  n_runs: 20                     # first runs of the tuning set (scenario none), whole
+  reference:                     # run of 13 October, links [3 -> 1, 1 -> 3]
+    received_fraction: [0.965, 0.977]
+    median: [-78.0, -79.0]       # dBm
+    p25: [-83.0, -84.0]
+    p5: [-90.0, -91.0]
+    below_fraction: [0.04, 0.06] # fraction of the received beacons below below_level
+  below_level: -90.0             # dBm
+  gap_seconds: [5.0, 10.0]       # silences between received beacons of a link: indicative, to be about zero
+  tolerance:
+    level_db: 3.0                # median, 25th and 5th percentile within this distance of BOTH reference values
+    received_min: 0.95
+    below_max: 0.10
+    long_gap_max_per_link_hour: 0.1   # gaps >= gap_seconds[1] per link-hour: "about zero" (each is a false "lost")
+  distance_bins: [0.0, 2.0, 3.0, 4.0, 6.0, 8.0, 12.0]   # m
+  test_a:                        # two static nodes, no shadowing, no board offsets, fading on (informative only: the model is NOT corrected)
+    distance: 5.0                # m
+    duration: 60.0               # s per position
+    positions:                   # phi = angle of the other node relative to the heading (own_body_loss): board at -90 deg, torso at +90 deg
+      - {name: "side by side, boards inside", phi_a: -90.0, phi_b: -90.0, measured_db: 3.0}
+      - {name: "face to face", phi_a: 0.0,   phi_b: 0.0,   measured_db: -8.0}
+      - {name: "back to back", phi_a: 180.0, phi_b: 180.0, measured_db: -10.0}
+      - {name: "in line", phi_a: 0.0,   phi_b: 180.0, measured_db: -14.0}
+      - {name: "side by side, boards outside", phi_a: 90.0,  phi_b: 90.0,  measured_db: -17.0}   # measured: at most -17
+  range_distances: [1.0, 2.0, 5.0, 10.0, 20.0, 30.0, 40.0, 60.0, 80.0]   # m, level of the distance alone
+  separated_runs: 20             # first slowdown and stop runs of the tuning set
 
 # Block 7: routing towards the group leader. Does not change Blocks 1-6.
 routing:
@@ -232,7 +268,7 @@ routing:
     track.start_offset: 35.0     # >= margin_sigmas * sigma_long (31.7 m)
     track.end_margin: 35.0
   channel_profile: heltec_run    # nominal | heltec_run; heltec_run is the only working point in the thesis, nominal is kept for comparison
-  channel_profiles:              # channel replacements (Block 7 only), applied after scenario_overrides
+  channel_profiles:              # channel replacements (Block 7 only), applied after scenario_overrides; block7_config applies history.channel_v1 first, so both profiles start from the old channel
     nominal: {}
     heltec_run:                  # levels measured in the run with the Heltec boards of 13 October
       channel.tx_power: -17.0    # EQUIVALENT dBm (EIRP including antenna, mounting and body losses), not settable on the ESP32. Calibrated with scripts/calibrate_heltec_power.py: median RSSI in the group of 5 = -78.0 dBm
@@ -273,9 +309,16 @@ routing:
   time_budget_minutes: 60        # estimate beyond which the experiment stops and asks (with 8 processes)
   reference_run: {scenario: stop, index: 0}   # run whose trace is saved for route_example.png
 
-# Block 4 configuration (replacements to the Block 6 defaults): used by the Block 4-5 scripts and the tests.
+# Block 4 configuration (replacements to the current defaults): used by the Block 4-5 scripts and the tests.
 history:
-  block4:
+  channel_v1:       # channel before the Heltec re-calibration: Blocks 4-5 and 7 are reproduced with these values
+    channel.antenna_gain_tx: 0.0
+    channel.antenna_gain_rx: 0.0
+    channel.path_loss.exponent: 3.0
+    packets.reception.sensitivity_dbm: -98.4
+    metrics.level_threshold_sweep: [-95.0, -60.0, 2.5]
+  block4:                        # applied after channel_v1
+    detector.lost_min_observers: null
     kalman.sigma_a: 0.5
     detector.mode: both
     detector.release_time: 5.0

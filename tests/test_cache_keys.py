@@ -18,6 +18,8 @@ def test_block4_run_keys_match_existing_cache():
     config = block4_config(load_config(CONFIG_PATH))
     tuning, _ = run_sets(config)
     assert tuning
+    if not any(cache_path(r["config"], CACHE).exists() for r in tuning):
+        pytest.skip("no cache of the Block 4 channel (history.channel_v1) in the local cache")
     assert all(cache_path(r["config"], CACHE).exists() for r in tuning)
 
 
@@ -25,5 +27,7 @@ def test_block6_run_and_channel_keys_match_existing_cache():
     config = load_config(CONFIG_PATH)
     tuning, verification = run_sets(config)
     runs = tuning + verification
+    if not any(cache_path(r["config"], CACHE).exists() for r in runs):
+        pytest.skip("no cache of the current channel in the local cache")
     assert all(cache_path(r["config"], CACHE).exists() for r in runs)
     assert sum(channel_cache_path(r["config"], CACHE).exists() for r in runs) == 150

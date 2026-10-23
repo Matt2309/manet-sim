@@ -412,7 +412,7 @@ def test_nominal_profile_is_the_previous_block7_config_and_heltec_changes_three_
     from src.refinement import apply_overrides
     from src.routing_experiment import block7_config
 
-    previous = apply_overrides(cfg, cfg["routing"]["scenario_overrides"])
+    previous = apply_overrides(cfg, {**cfg["routing"]["scenario_overrides"], **cfg["history"]["channel_v1"]})
     nominal = block7_config(cfg, "nominal")
     assert nominal == previous
     heltec = block7_config(cfg, "heltec_run")
@@ -432,8 +432,8 @@ def test_heltec_profile_median_rssi_in_compact_group_of_five(cfg):
     from src.routing_experiment import group_median_rssi
 
     channel_only = {k: v for k, v in cfg["routing"]["channel_profiles"]["heltec_run"].items() if k.startswith("channel.")}
-    assert group_median_rssi(apply_overrides(cfg, channel_only)) == pytest.approx(-78.0, abs=1.0)
-    assert group_median_rssi(cfg) == pytest.approx(-51.0, abs=1.0)
+    assert group_median_rssi(apply_overrides(cfg, {**cfg["history"]["channel_v1"], **channel_only})) == pytest.approx(-78.0, abs=1.0)
+    assert group_median_rssi(apply_overrides(cfg, cfg["history"]["channel_v1"])) == pytest.approx(-51.0, abs=1.0)
 
 
 def test_connectivity_on_a_cut_chain(cfg):

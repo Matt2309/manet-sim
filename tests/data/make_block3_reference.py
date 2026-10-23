@@ -15,6 +15,7 @@ _ROOT = Path(__file__).resolve().parents[2]
 sys.path.insert(0, str(_ROOT))
 
 from src.channel import simulate_channel  # noqa: E402
+from src.common.config import apply_overrides  # noqa: E402
 from src.mobility import load_config, simulate_mobility  # noqa: E402
 from src.packets import simulate_packets  # noqa: E402
 from src.simulator import scenario_config  # noqa: E402
@@ -23,7 +24,7 @@ DURATION, SEED, NODE, START = 150.0, 5, 2, 60.0
 
 
 def reference_config() -> dict:
-    cfg = load_config(_ROOT / "config" / "default.yaml")
+    cfg = apply_overrides(load_config(_ROOT / "config" / "default.yaml"), load_config(_ROOT / "config" / "default.yaml")["history"]["channel_v1"])  # channel of the time (before the Heltec re-calibration)
     cfg["simulation"]["duration"] = DURATION
     return cfg
 

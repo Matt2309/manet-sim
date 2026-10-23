@@ -40,8 +40,10 @@ from scipy.stats import chi2, norm
 from src.common.enums import DetectorMode, Reference, Scenario
 from src.detector import (
     DetectionInputs,
+    combined_alarm,
     count_episodes,
     lost_alarm,
+    lost_system_alarm,
     pre_alarm,
     system_alarm,
 )
@@ -189,7 +191,7 @@ def evaluate_run(inputs: DetectionInputs, config: dict, summarize) -> dict:
     mcfg = config["metrics"]
     t = inputs.t
     lost_obs = lost_alarm(inputs.silence, inputs.rx_ok, t, dcfg, inputs.valid, **inputs.lost_kwargs())
-    results = {("-", "-", "lost"): stack_summaries([math.nan], [summarize(system_alarm(lost_obs, dcfg["min_observers"]))])}
+    results = {("-", "-", "lost"): stack_summaries([math.nan], [summarize(lost_system_alarm(lost_obs, dcfg))])}
     for scope in SCOPES:
         for mode in MODES:
             grid = _grid_for(mode, mcfg)
@@ -200,7 +202,7 @@ def evaluate_run(inputs: DetectionInputs, config: dict, summarize) -> dict:
                     inputs.level[scope], inputs.slope[scope], inputs.rx_ok, t, dcfg, mode, valid=inputs.valid, **kwargs
                 )
                 rows["pre"].append(summarize(system_alarm(pre_obs, dcfg["min_observers"])))
-                rows["both"].append(summarize(system_alarm(pre_obs | lost_obs, dcfg["min_observers"])))
+                rows["both"].append(summarize(combined_alarm(pre_obs, lost_obs, dcfg["min_observers"], dcfg.get("lost_min_observers"))))
             for variant, summaries in rows.items():
                 results[(scope, mode, variant)] = stack_summaries(grid, summaries)
     return results
@@ -438,7 +440,7 @@ def evaluate_config(
     lost_obs = lost_alarm(inputs.silence, inputs.rx_ok, inputs.t, dcfg, inputs.valid, **inputs.lost_kwargs())
     out = {}
     for mo in min_observers:
-        out[mo] = stack_summaries(grid, [summarize(system_alarm(states[n] | lost_obs, mo)) for n in range(len(grid))])
+        out[mo] = stack_summaries(grid, [summarize(combined_alarm(states[n], lost_obs, mo, dcfg.get("lost_min_observers"))) for n in range(len(grid))])
     if corr_warmup is not None:
         out["corr"] = observer_stats(states | lost_obs, inputs.t, corr_warmup)
     return out

@@ -390,6 +390,23 @@ def system_alarm(observer_alarm: np.ndarray, min_observers: int) -> np.ndarray:
     return observer_alarm.sum(axis=1) >= min_observers
 
 
+def combined_alarm(pre_obs: np.ndarray, lost_obs: np.ndarray, min_observers: int, lost_min_observers: int | None) -> np.ndarray:
+    """System alarm from the pre-alarm and "lost" alarms of the observers (time, observer, ...) → (time, ...).
+
+    ``lost_min_observers`` None: the old formula, ``system_alarm(pre | lost, min_observers)``. Otherwise the alarm fires with
+    ``min_observers`` observers in pre-alarm OR ``lost_min_observers`` observers in "lost" (a single disturbed board cannot declare its neighbours lost).
+    """
+    if lost_min_observers is None:
+        return system_alarm(pre_obs | lost_obs, min_observers)
+    return system_alarm(pre_obs, min_observers) | system_alarm(lost_obs, lost_min_observers)
+
+
+def lost_system_alarm(lost_obs: np.ndarray, detector_cfg: dict) -> np.ndarray:
+    """System alarm of the "lost node" alone: ``detector.lost_min_observers`` observers (``min_observers`` if it is None)."""
+    lost_min = detector_cfg.get("lost_min_observers")
+    return system_alarm(lost_obs, detector_cfg["min_observers"] if lost_min is None else lost_min)
+
+
 def count_episodes(system: np.ndarray, t: np.ndarray, warmup: float) -> np.ndarray:
     """Number of rising edges of the system alarm with ``t[k] >= warmup`` (s), per non-time axis.
 

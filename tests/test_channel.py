@@ -106,7 +106,7 @@ def test_path_loss_matches_formula(cfg):
 
     # formula written independently (physical c, no value from the code)
     pl0_ref = 20.0 * np.log10(4.0 * np.pi * d0 * 2.437e9 / C_LIGHT)
-    expected = 10.0 - (pl0_ref + 10.0 * n * np.log10(np.maximum(distances, d0) / d0))
+    expected = ch["tx_power"] + ch["antenna_gain_tx"] + ch["antenna_gain_rx"] - (pl0_ref + 10.0 * n * np.log10(np.maximum(distances, d0) / d0))
     assert np.allclose(result.rssi_true[:, 0, 1], expected, atol=1e-9)
     assert np.allclose(result.rssi_path_loss[:, 0, 1], expected, atol=1e-9)
 
@@ -439,6 +439,7 @@ def test_device_offsets_break_reciprocity(cfg, short_mobility):
 
 def test_measurement_saturation_and_quantization(cfg, short_mobility):
     cfg["channel"]["tx_power"] = 30.0
+    cfg["channel"]["antenna_gain_tx"] = cfg["channel"]["antenna_gain_rx"] = 0.0  # the test is about saturation, not the antenna loss
     m = cfg["channel"]["measurement"]
     result = simulate_channel(short_mobility, cfg)
     meas = _offdiag(result.rssi_measured)

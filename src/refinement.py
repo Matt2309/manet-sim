@@ -52,9 +52,9 @@ PER_RUN_FIELDS = (
 
 
 def block4_config(config: dict) -> dict:
-    """Copy of the config with the Block 4 values (`history.block4`): the defaults are those of the final detector (Block 6),
-    the Block 4-5 scripts restore them to reproduce the numbers of that time."""
-    return apply_overrides(config, config["history"]["block4"])
+    """Copy of the config with the Block 4 values (`history.channel_v1` then `history.block4`): the defaults are those of the final detector
+    and of the Heltec channel, the Block 4-5 scripts restore the old ones to reproduce the numbers of that time."""
+    return apply_overrides(config, {**config["history"]["channel_v1"], **config["history"]["block4"]})
 
 
 def make_variant(name: str, group: str, overrides: dict, scopes=("fused",), min_observers=(1,), corr=False) -> dict:

@@ -13,7 +13,7 @@ from pathlib import Path
 
 from _cli import load_block4_config, make_parser  # noqa: E402
 from src.common.paths import block_dir  # noqa: E402
-from src.detector import build_inputs, count_episodes, lost_alarm, pre_alarm, system_alarm  # noqa: E402
+from src.detector import build_inputs, combined_alarm, count_episodes, lost_alarm, pre_alarm  # noqa: E402
 from src.experiment import load_results, pooled_fading_variance, print_summary, run_sweep, save_results  # noqa: E402
 from src.kalman import measurement_noise  # noqa: E402
 from src.simulator import ensure_all_cached, experiment_runs, load_or_simulate  # noqa: E402
@@ -28,7 +28,7 @@ def time_single_run(config: dict, run_info: dict, cache_dir: Path, R: float) -> 
     scope = d["scope"]
     pre = pre_alarm(inputs.level[scope], inputs.slope[scope], inputs.rx_ok, inputs.t, d, valid=inputs.valid)
     lost = lost_alarm(inputs.silence, inputs.rx_ok, inputs.t, d, inputs.valid, **inputs.lost_kwargs())
-    count_episodes(system_alarm(pre | lost, d["min_observers"]), inputs.t, d["warmup"])
+    count_episodes(combined_alarm(pre, lost, d["min_observers"], d.get("lost_min_observers")), inputs.t, d["warmup"])
     return time.perf_counter() - t0
 
 

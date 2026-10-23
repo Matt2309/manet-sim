@@ -16,7 +16,7 @@ from src.common.config import apply_overrides
 from src.common.io import load_pickle
 from src.common.paths import block_dir
 from src.common.plotting import INK, INK_2, plt, save_figure, style_axes, ZERO_FA_PLOT
-from src.detector import build_inputs, lost_alarm, pre_alarm, system_alarm
+from src.detector import build_inputs, combined_alarm, lost_alarm, pre_alarm
 from src.metrics import SEPARATED, min_distance_to_group
 from src.relative import relative_trace
 from src.simulator import experiment_runs, load_or_simulate
@@ -255,7 +255,7 @@ def system_alarm_for(res, run, name):
     t = run["t"]
     pre = pre_alarm(sliced.level["fused"], sliced.slope["fused"], sliced.rx_ok, t, vcfg["detector"], "level", level_threshold=thr, valid=sliced.valid)
     lost = lost_alarm(sliced.silence, sliced.rx_ok, t, vcfg["detector"], sliced.valid, **sliced.lost_kwargs())
-    return vcfg, system_alarm(pre | lost, 1)
+    return vcfg, combined_alarm(pre, lost, 1, vcfg["detector"].get("lost_min_observers"))
 
 
 def longest_wrong_off(res, cache_dir):

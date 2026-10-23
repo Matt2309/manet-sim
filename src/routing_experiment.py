@@ -39,13 +39,14 @@ def block7_config(config: dict, profile: str | None = None) -> dict:
     """Copy of the config with the Block 7 overrides: long group (``routing.scenario_overrides``) and channel profile.
 
     `profile` is ``nominal`` or ``heltec_run`` (default ``routing.channel_profile``); the profile overrides live in ``routing.channel_profiles``.
-    ``nominal`` changes nothing with respect to the first Block 7 operating point.
+    ``nominal`` changes nothing with respect to the first Block 7 operating point. Both profiles are built on the channel of
+    ``history.channel_v1`` (before the Heltec re-calibration of the defaults): the profile overrides never add up to the new channel.
     """
     rcfg = config["routing"]
     profile = rcfg["channel_profile"] if profile is None else profile
     if profile not in rcfg["channel_profiles"]:
         raise KeyError(f"unknown routing.channel_profile: {profile!r} (available: {', '.join(rcfg['channel_profiles'])})")
-    cfg = apply_overrides(config, rcfg["scenario_overrides"])
+    cfg = apply_overrides(config, {**rcfg["scenario_overrides"], **config["history"]["channel_v1"]})
     return apply_overrides(cfg, rcfg["channel_profiles"][profile] or {})
 
 

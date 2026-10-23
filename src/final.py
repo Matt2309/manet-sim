@@ -30,7 +30,7 @@ from src.common.git import git_or_unknown
 from src.common.parallel import parallel_map
 from src.common.stats import percentile_interval, resample_indices
 from src.common.rng import bootstrap_rng
-from src.detector import build_inputs, lost_alarm, system_alarm
+from src.detector import build_inputs, combined_alarm, lost_alarm, lost_system_alarm, system_alarm
 from src.kalman import filter_all
 from src.metrics import (
     SEPARATED,
@@ -179,12 +179,12 @@ def process_run_final(args: tuple) -> dict:
             dcfg = {**vcfg["detector"], "lost_rule": rule}
             lost_obs = lost_alarm(inputs.silence, inputs.rx_ok, t, dcfg, inputs.valid, **inputs.lost_kwargs())
             out["results"][(name, rule)] = stack_summaries(
-                grid, [summarize(pre_systems[n], system_alarm(states[n] | lost_obs, mo)) for n in range(len(grid))]
+                grid, [summarize(pre_systems[n], combined_alarm(states[n], lost_obs, mo, dcfg.get("lost_min_observers"))) for n in range(len(grid))]
             )
     for rule in spec["rules"]:
         dcfg = {**common["detector"], "lost_rule": rule}
-        lost_sys = system_alarm(
-            lost_alarm(first_inputs.silence, first_inputs.rx_ok, t, dcfg, first_inputs.valid, **first_inputs.lost_kwargs()), dcfg["min_observers"]
+        lost_sys = lost_system_alarm(
+            lost_alarm(first_inputs.silence, first_inputs.rx_ok, t, dcfg, first_inputs.valid, **first_inputs.lost_kwargs()), dcfg
         )
         out["results"][(LOST, rule)] = stack_summaries([math.nan], [summarize(np.zeros_like(lost_sys), lost_sys)])
     if is_none:
@@ -221,7 +221,8 @@ def freeze_thresholds(tuning_outs: list, config: dict) -> dict:
     """Choose the thresholds from the TUNING runs: Block 4 rule (`working_point`): maximum mean P_d with admissible false alarms/h and time in alarm.
 
     Output: ``{name: {"threshold", "scope", "fusion_rule", "tuning": {p_detect_slowdown, p_detect_stop, fa_per_hour, active_fraction}}}`` for the
-    configurations of ``final.configs``. The only place in the code where a threshold that is then frozen is chosen.
+    configurations of ``final.configs``; ``None`` for a configuration with no admissible point on the tuning set (reported on the console, the
+    others go on). The only place in the code where a threshold that is then frozen is chosen.
     """
     frozen = {}
     for name in config["final"]["configs"]:
@@ -229,7 +230,9 @@ def freeze_thresholds(tuning_outs: list, config: dict) -> dict:
         scope = config["final"]["config_defs"][name]["detector.scope"]
         wp = working_point(rows, scope, "level", "both")
         if wp is None:
-            raise RuntimeError(f"configuration {name}: no admissible point on the tuning set")
+            print(f"WARNING: configuration {name}: no admissible point on the tuning set, no threshold frozen")
+            frozen[name] = None
+            continue
         at = {s: next(r for r in rows if r["scenario"] == s and r["threshold"] == wp["threshold"]) for s in SEPARATED}
         frozen[name] = {
             "threshold": float(wp["threshold"]),
@@ -403,6 +406,52 @@ def decide_verdict(success_mean: np.ndarray, success_best: np.ndarray, fa_mean: 
     }
 
 
+def decide_final(verification_eval: dict, config: dict) -> dict:
+    """Media versus migliore (`decide_verdict`) when both have a frozen threshold; otherwise the one that has it, or ``adopted = None``.
+
+    `verification_eval` holds only the configurations with a frozen threshold (plus "perso"). Without both, ``net`` etc. are not defined and the
+    reason is given in ``note``.
+    """
+    mean, best = verification_eval.get("media"), verification_eval.get("migliore")
+    if mean is not None and best is not None:
+        return decide_verdict(
+            total_success(mean["at"]), total_success(best["at"]), mean["summary"]["none"]["fa_per_hour"], best["summary"]["none"]["fa_per_hour"],
+            config["final"]["min_net_gain"],
+        )
+    present = [n for n, e in (("media", mean), ("migliore", best)) if e is not None]
+    return {"adopted": present[0] if present else None, "note": "no admissible threshold for " + ", ".join(n for n in ("media", "migliore") if n not in present)}
+
+
+def decide_pre_alarm(final_eval: dict | None, lost_eval: dict, config: dict) -> dict:
+    """Rule on the level pre-alarm, fixed before seeing the data (verification runs, frozen threshold).
+
+    Input: `final_eval` = `evaluate_at` of the final configuration (None if no configuration has a threshold), `lost_eval` = "lost" alone.
+    Procedure: ``net`` = runs (slowdown + stop) detected within ``success_distance`` by the final configuration (pre-alarm + "lost") and not by "lost" alone,
+    minus the opposite. The pre-alarm is adopted ONLY if ``net >= final.min_net_gain`` AND the false alarms/h (point estimate) of the final configuration are
+    ``<= metrics.target_false_alarms_per_hour``; otherwise the firmware gets "lost" alone (``lost_only``).
+    """
+    min_net, target = config["final"]["min_net_gain"], config["metrics"]["target_false_alarms_per_hour"]
+    if final_eval is None:
+        return {"adopted": "lost_only", "reason": "no admissible threshold on the tuning set", "min_net_gain": int(min_net), "target_fa_per_hour": float(target)}
+    gained, lost = paired_counts(total_success(final_eval["at"]), total_success(lost_eval["at"]))
+    none = final_eval["summary"]["none"]
+    net, fa = gained - lost, none["fa_per_hour"]
+    ok_net, ok_fa = net >= min_net, fa <= target
+    return {
+        "adopted": "pre_alarm" if (ok_net and ok_fa) else "lost_only",
+        "reason": "net gain and false alarms ok" if (ok_net and ok_fa) else ", ".join(
+            r for r, bad in (("net gain below the minimum", not ok_net), ("false alarms above the target", not ok_fa)) if bad
+        ),
+        "gained": int(gained),
+        "lost": int(lost),
+        "net": int(net),
+        "min_net_gain": int(min_net),
+        "fa_per_hour": float(fa),
+        "fa_bootstrap": [float(x) for x in none["bootstrap"]],
+        "target_fa_per_hour": float(target),
+    }
+
+
 # ---------------------------------------------------------------------------
 # Sensitivity
 # ---------------------------------------------------------------------------
@@ -416,6 +465,11 @@ def sensitivity_cases(config: dict) -> list:
     return [
         (name, point, ["any", "not_deaf", "not_deaf_episode"] if name in fcfg["not_deaf_points"] else ["any"]) for name, point in cases
     ]
+
+
+def sensitivity_mode(point: dict) -> str:
+    """``cache`` if the point leaves Blocks 1-3 untouched (detector-only changes), ``channel`` if it changes ``packets`` or ``channel`` (Block 3 redone)."""
+    return "channel" if any(k.split(".")[0] in ("packets", "channel") for k in point) else "cache"
 
 
 def expected_long_bursts(config: dict, point: dict, duration: float) -> float | None:
@@ -500,6 +554,11 @@ def _ci(value: float, interval: tuple) -> str:
     return f"{value:.2f} [{interval[0]:.2f}-{interval[1]:.2f}]"
 
 
+def evaluated_names(results: dict) -> list:
+    """Configurations with a frozen threshold (in the order of ``final.configs``) followed by "lost" alone."""
+    return [*[n for n in results["config"]["final"]["configs"] if results["frozen"]["thresholds"].get(n)], LOST]
+
+
 def evaluation_table(results: dict) -> str:
     """Section C table: per configuration and for "lost" alone, P_d (30 m and 30 s), delay, distance, false alarms, optimism."""
     verif, tuning, frozen = results["verification"], results["tuning"], results["frozen"]["thresholds"]
@@ -509,9 +568,13 @@ def evaluation_table(results: dict) -> str:
         f" {'tun.':>5} {'diff.':>6}"
     )
     lines.append(head)
-    for name in [*results["config"]["final"]["configs"], LOST]:
+    names = evaluated_names(results)
+    for name in results["config"]["final"]["configs"]:
+        if name not in names:
+            lines.append(f"{name:<9} no admissible threshold on the tuning set")
+    for name in names:
         s = verif[name]["summary"]
-        thr = frozen[name]["threshold"] if name in frozen else math.nan
+        thr = frozen[name]["threshold"] if frozen.get(name) else math.nan
         for sc in SEPARATED:
             d = s["sep"][sc]
             tun = tuning[name]["summary"]["sep"][sc]["p_detect"]
@@ -524,7 +587,7 @@ def evaluation_table(results: dict) -> str:
         f"{'config':<9} {'FA/h Poisson':>19} {'FA/h bootstrap':>19} {'level/h':>9} {'lost/h':>8} {'in alarm':>10} {'FA/h tuning':>13} {'diff.':>6}"
         f" {'wrong (runs/n)':>16} {'re-passes (off)':>20}"
     )
-    for name in [*results["config"]["final"]["configs"], LOST]:
+    for name in names:
         s, st = verif[name]["summary"], tuning[name]["summary"]
         n = s["none"]
         wrong = sum(s["sep"][sc]["wrong_off_runs"] for sc in SEPARATED)
@@ -537,7 +600,7 @@ def evaluation_table(results: dict) -> str:
             f" {wrong:>8d}/{total:<7d} {rep:>11d} ({repo})"
         )
     target = results["config"]["metrics"]["target_false_alarms_per_hour"]
-    over = [n for n in results["config"]["final"]["configs"] if verif[n]["summary"]["none"]["fa_per_hour"] > target]
+    over = [n for n in names if n != LOST and verif[n]["summary"]["none"]["fa_per_hour"] > target]
     lines.append(
         f"False alarm target: {target:g}/h. "
         + (f"EXCEEDED on verification by: {', '.join(over)} (thresholds not corrected, as required)." if over else "Met by all configurations on verification.")
@@ -546,6 +609,8 @@ def evaluation_table(results: dict) -> str:
 
 
 def verdict_text(v: dict) -> str:
+    if "net" not in v:
+        return f"{v['note']} -> final = {v['adopted']}"
     return (
         f"net = {v['net']:+d} (migliore gains {v['gained']}, loses {v['lost']}; threshold {v['min_net_gain']}); FA/h media {v['fa_media']:.2f}, migliore"
         f" {v['fa_migliore']:.2f}; exact McNemar p = {v['mcnemar_p']:.3f} (informative) -> final = {v['adopted']}"
@@ -598,9 +663,9 @@ def write_final_summary(results: dict, path: Path, versions: dict) -> None:
         "",
         "## Final configuration",
         "",
-        f"- configuration: **{final}** (scope `{frozen['thresholds'][final]['scope']}`, fusion rule `{frozen['thresholds'][final]['fusion_rule']}`)",
-        f"- frozen level threshold: **{frozen['thresholds'][final]['threshold']:g} dBm** (tuning: {frozen['date']}, commit `{frozen['commit']}`)",
-        f"- release: {dcfg['release_time']:g} s; `sigma_a` {config['kalman']['sigma_a']:g}; `min_observers` {dcfg['min_observers']};"
+        f"- configuration: **{final}**" + (f" (scope `{frozen['thresholds'][final]['scope']}`, fusion rule `{frozen['thresholds'][final]['fusion_rule']}`)" if final else ""),
+        f"- frozen level threshold: **{frozen['thresholds'][final]['threshold']:g} dBm** (tuning: {frozen['date']}, commit `{frozen['commit']}`)" if final else "- frozen level threshold: none",
+        f"- release: {dcfg['release_time']:g} s; `sigma_a` {config['kalman']['sigma_a']:g}; `min_observers` {dcfg['min_observers']}; `lost_min_observers` {config['final']['common']['detector.lost_min_observers']};"
         f" `lost_rule` {dcfg['lost_rule']}; shadowing `{config['channel']['shadowing']['mode']}`",
         "",
         "## Frozen thresholds (on the tuning set)",
@@ -609,10 +674,25 @@ def write_final_summary(results: dict, path: Path, versions: dict) -> None:
         "| --- | --- | --- | --- | --- | --- |",
     ]
     for name, f in frozen["thresholds"].items():
+        if f is None:
+            doc.append(f"| {name} | no admissible point | | | | |")
+            continue
         t = f["tuning"]
         doc.append(f"| {name} | {f['threshold']:g} | {t['p_detect_slowdown']:.2f} | {t['p_detect_stop']:.2f} | {t['fa_per_hour']:.2f} | {100 * t['active_fraction']:.2f}% |")
     doc += ["", "## Evaluation on the verification runs", "", "```", evaluation_table(results), "```", "", "## Verdict: media versus migliore", "", verdict_text(results["verdict"]), ""]
-    doc += ["## Sensitivity", "", "```", sensitivity_table(results), "```", ""]
+    if results.get("pre_alarm"):
+        doc += [pre_alarm_text(results["pre_alarm"]), ""]
+    if results["sensitivity"]:
+        doc += ["## Sensitivity", "", "```", sensitivity_table(results), "```", ""]
     path = Path(path)
     path.parent.mkdir(parents=True, exist_ok=True)
     path.write_text("\n".join(doc))
+
+
+def pre_alarm_text(v: dict) -> str:
+    if "net" not in v:
+        return f"pre-alarm: {v['reason']} -> {v['adopted']}"
+    return (
+        f"pre-alarm: net = {v['net']:+d} (final gains {v['gained']} over \"lost\" alone, loses {v['lost']}; threshold {v['min_net_gain']}); FA/h {v['fa_per_hour']:.2f}"
+        f" [{v['fa_bootstrap'][0]:.2f}-{v['fa_bootstrap'][1]:.2f}] (target {v['target_fa_per_hour']:g}) -> {v['adopted']} ({v['reason']})"
+    )

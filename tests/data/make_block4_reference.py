@@ -24,7 +24,7 @@ DURATION, SEED, NODE, START, SIGMA_A, R = 150.0, 5, 2, 60.0, 0.25, 9.0
 
 def reference_config() -> dict:
     cfg = load_config(_ROOT / "config" / "default.yaml")
-    for dotted, value in cfg["history"]["block4"].items():  # Block 6: the defaults changed, so Block 4 is pinned explicitly
+    for dotted, value in {**cfg["history"]["channel_v1"], **cfg["history"]["block4"]}.items():  # the defaults changed (Block 6, Heltec channel): Block 4 is pinned explicitly
         node = cfg
         *path, last = dotted.split(".")
         for key in path:

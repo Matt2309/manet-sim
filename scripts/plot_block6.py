@@ -1,9 +1,9 @@
 #!/usr/bin/env python3
 """Block 6 figures for the thesis (``results/block6/``).
 
-Reads ``results/block6/results.pkl`` (from ``run_block6_experiment.py``). Labels in Italian, readable in black and white (different line styles and
+Reads ``<out-dir>/results.pkl`` (from ``run_block6_experiment.py``); the config is the one stored in it (so a run made with ``--set`` is plotted consistently).
+Without sensitivity (``--no-sensitivity``) the sensitivity and burst figures are skipped. Labels in Italian, readable in black and white (different line styles and
 markers besides color), no long titles in the figure. The ``burst_example`` figure redoes from the cache a run with a long burst.
-Config: config/default.yaml if not given.
 """
 
 import math
@@ -19,7 +19,6 @@ from src.common.plotting import GRID, INK, INK_2, plt, save_figure, SCEN_LABEL, 
 from src.detector import deafness, lost_alarm, reception_features
 from src.final import sensitivity_cases
 from src.metrics import SEPARATED
-from src.mobility import load_config
 from src.simulator import run_from_channel
 
 
@@ -36,7 +35,7 @@ def figure_tradeoff(res, out):
     for ax, scenario in zip(axes, SEPARATED):
         style_axes(ax)
         ax.set_xscale("log")
-        for name in config["final"]["configs"]:
+        for name in res["active_configs"]:
             rows = sorted((r for r in res["sweeps"]["verification"][name] if r["scenario"] == scenario), key=lambda r: r["threshold"])
             fa = np.array([max(r["fa_per_hour"], ZERO_FA_PLOT) for r in rows])
             ax.plot(fa, [r["p_detect"] for r in rows], STYLES[name], color=COLORS[name], linewidth=1.6, label=name)
@@ -64,7 +63,7 @@ def figure_distance(res, out):
     final = res["final_name"]
     fig, ax = plt.subplots(figsize=(7, 4.4))
     style_axes(ax)
-    for name in (final, "coppia"):
+    for name in dict.fromkeys(n for n in (final, "coppia") if n in res["active_configs"]):
         for scenario, ls in zip(SEPARATED, ("-", "--")):
             d = res["verification"][name]["at"]["sep"][scenario]["distance"]
             ax.plot(xs, _cdf(d, xs), ls, color=COLORS[name], linewidth=2.0 if name == final else 1.5, label=f"{name}, {SCEN_LABEL[scenario]}")
@@ -107,7 +106,7 @@ def _errbar(ax, x, y, lo, hi, marker, filled, color="#0b0b0b", offset=0.0, **kw)
 
 
 def figure_tuning_vs_test(res, out):
-    names = res["config"]["final"]["configs"]
+    names = res["active_configs"]
     fig, axes = plt.subplots(1, 3, figsize=(11, 3.9))
     panels = [("slowdown", "$P_d$ entro 30 m, rallenta"), ("stop", "$P_d$ entro 30 m, si ferma"), (None, "falsi allarmi all'ora")]
     for ax, (scenario, label) in zip(axes, panels):
@@ -235,15 +234,20 @@ def main() -> None:
     parser = make_parser(__doc__, cache_dir=True, out_dir=block_dir(6))
     args = parser.parse_args()
     out = Path(args.out_dir)
-    config = load_config(args.config)
     res = load_pickle(out / "results.pkl")
+    config = res["config"]
+    res.setdefault("active_configs", config["final"]["configs"])  # results saved before null thresholds existed
     figure_tradeoff(res, out)
-    figure_distance(res, out)
-    figure_delay(res, out)
+    if res["final_name"] is not None:
+        figure_distance(res, out)
+        figure_delay(res, out)
     figure_tuning_vs_test(res, out)
-    figure_sensitivity(res, out)
-    best, node, length = figure_burst_example(res, config, Path(args.cache_dir), out)
-    print(f"Figures saved to {out} (burst_example: point {best}, receiver {node}, burst of {length:.1f} s)")
+    if res["sensitivity"]:
+        figure_sensitivity(res, out)
+        best, node, length = figure_burst_example(res, config, Path(args.cache_dir), out)
+        print(f"Figures saved to {out} (burst_example: point {best}, receiver {node}, burst of {length:.1f} s)")
+    else:
+        print(f"Figures saved to {out} (no sensitivity in the results: sensitivity and burst_example skipped)")
 
 
 if __name__ == "__main__":

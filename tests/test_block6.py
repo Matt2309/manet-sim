@@ -162,6 +162,49 @@ def test_only_freeze_thresholds_chooses_a_threshold():
     assert "working_point" not in script
 
 
+def test_freeze_thresholds_records_none_when_no_point_is_admissible(cfg, capsys):
+    """A configuration whose false alarms exceed the target at every threshold gets ``None`` (and a console warning), the others are frozen as usual."""
+    from src.final import freeze_thresholds
+
+    outs = _synthetic_outs(20, best_threshold_index=1)
+    for o in outs:
+        for name in cfg["final"]["configs"]:
+            res = dict(o["results"][("media", "any")])
+            if o["scenario"] == "none" and name != "media":
+                res["episodes"] = np.full(3, 50)  # 50 false alarms/h at every threshold
+            o["results"][(name, "any")] = res
+    frozen = freeze_thresholds(outs, cfg)
+    assert frozen["media"]["threshold"] == -75.0
+    assert frozen["migliore"] is None and frozen["coppia"] is None
+    assert "no admissible point" in capsys.readouterr().out
+
+
+def _pre_alarm_eval(gain, loss, fa, n=100):
+    """Synthetic evaluations (final, "lost" alone): the final configuration gains `gain` runs and loses `loss`, with `fa` false alarms/h."""
+    base = np.zeros(2 * n, bool)
+    base[:10] = True
+    final = base.copy()
+    final[10 : 10 + gain] = True
+    final[:loss] = False
+    pack = lambda ok, rate: {  # noqa: E731
+        "at": {"sep": {"slowdown": {"success": ok[:n]}, "stop": {"success": ok[n:]}}},
+        "summary": {"none": {"fa_per_hour": rate, "bootstrap": (rate / 2, rate * 2)}},
+    }
+    return pack(final, fa), pack(base, 0.0)
+
+
+def test_pre_alarm_rule_on_synthetic_outcomes(cfg):
+    """net 3 with false alarms at the target: pre-alarm; net 3 with 1.2/h: lost only; net 2: lost only; no final configuration: lost only."""
+    from src.final import decide_pre_alarm
+
+    final, lost = _pre_alarm_eval(4, 1, 1.0)
+    v = decide_pre_alarm(final, lost, cfg)
+    assert (v["gained"], v["lost"], v["net"], v["adopted"]) == (4, 1, 3, "pre_alarm")
+    assert decide_pre_alarm(*_pre_alarm_eval(4, 1, 1.2), cfg)["adopted"] == "lost_only"
+    assert decide_pre_alarm(*_pre_alarm_eval(3, 1, 0.5), cfg)["adopted"] == "lost_only"
+    assert decide_pre_alarm(None, lost, cfg)["adopted"] == "lost_only"
+
+
 # ---------------------------------------------------------------------------
 # 4. Gilbert-Elliott
 # ---------------------------------------------------------------------------

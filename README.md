@@ -37,12 +37,15 @@ python scripts/run_block5_experiment.py --jobs 8   # number of processes
 python scripts/plot_block5.py                      # Block 5: seven figures in results/block5/
 python scripts/run_block6_experiment.py            # Block 6: frozen thresholds, verification, verdict, sensitivity (results/block6/)
 python scripts/plot_block6.py                      # Block 6: six figures in results/block6/
+python scripts/check_channel_heltec.py             # channel against the Heltec measurements (results/channel_check/)
+python scripts/run_block6_experiment.py --out-dir results/block6_heltec_20dbm --set channel.tx_power=20 --no-sensitivity   # --set: config replacement
 python scripts/reproduce_all.py                    # EVERYTHING: figures of Blocks 1-7 and results/final_summary.md
 python scripts/reproduce_all.py --clean            # same, starting without cache
 ```
 
-The Block 4-5 scripts restore the Block 4 values (`history.block4` in `config/default.yaml`): since Block 6, the defaults of `config/default.yaml`
-describe the final detector (frozen threshold, 30 s release).
+The Block 4-5 scripts restore the Block 4 values (`history.channel_v1` then `history.block4` in `config/default.yaml`): the defaults of
+`config/default.yaml` describe the final detector (frozen threshold, 30 s release) on the channel measured with the Heltec boards. `history.channel_v1` holds
+the channel values before that re-calibration (antenna gains, path-loss exponent, sensitivity, threshold sweep); the Block 7 profiles are built on it too.
 
 `run_detection_experiment.py` caches Blocks 1-3 of every run in `results/cache/`
 (key = seed + hash of the configuration used): the first execution is slow, later ones are not.

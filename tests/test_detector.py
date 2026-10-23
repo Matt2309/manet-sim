@@ -14,11 +14,13 @@ from tests.helpers import manual_channel, static_mobility
 from src.refinement import block4_config
 from src.detector import (
     build_inputs,
+    combined_alarm,
     count_episodes,
     fuse,
     fusion_indices,
     latched_alarm,
     lost_alarm,
+    lost_system_alarm,
     neighbour_knowledge,
     pre_alarm,
     reception_features,
@@ -441,6 +443,62 @@ def test_system_alarm_and_episode_count(cfg):
     sysa[t >= 90.0, 1] = True  # episode until the end
     assert count_episodes(sysa, t, d["warmup"]).tolist() == [2, 3]
     assert count_episodes(sysa, t, 0.0).tolist() == [3, 3]  # without warmup the first one counts
+
+
+def _full_reception(n_nodes, t_end, period=0.5):
+    """Staggered periodic beacons (node k at k * period / n_nodes), all received by everyone (diagonal excluded)."""
+    times = np.array([np.arange(k * period / n_nodes, t_end, period) for k in range(n_nodes)])
+    received = np.ones((n_nodes, times.shape[1], n_nodes), bool)
+    received[np.arange(n_nodes), :, np.arange(n_nodes)] = False
+    return times, received
+
+
+def _lost_observers(cfg, times, received, t):
+    silence, rx_ok = reception_features(t, times, received, cfg)
+    return lost_alarm(silence, rx_ok, t, cfg["detector"], ~np.eye(times.shape[0], dtype=bool))
+
+
+def test_combined_alarm_with_one_observer_is_the_old_formula(cfg):
+    """`lost_min_observers` 1 (and None) give bit for bit `system_alarm(pre | lost, min_observers)`; `lost_system_alarm` the old "lost" alone."""
+    rng = np.random.default_rng(0)
+    pre = rng.random((400, 5, 5)) < 0.05
+    lost = rng.random((400, 5, 5)) < 0.03
+    for mo in (1, 2):
+        old = system_alarm(pre | lost, mo)
+        np.testing.assert_array_equal(combined_alarm(pre, lost, mo, None), old)
+        if mo == 1:
+            np.testing.assert_array_equal(combined_alarm(pre, lost, mo, 1), old)
+    d = {**cfg["detector"], "min_observers": 1, "lost_min_observers": 1}
+    np.testing.assert_array_equal(lost_system_alarm(lost, d), system_alarm(lost, 1))
+    d["lost_min_observers"] = None
+    np.testing.assert_array_equal(lost_system_alarm(lost, {**d, "min_observers": 2}), system_alarm(lost, 2))
+
+
+def test_deaf_observer_alone_cannot_raise_the_system_alarm_with_two_confirmations(cfg):
+    """Observer 0 hears nobody for 15 s: its four "lost" alarms reach the system with `lost_min_observers` 1, not with 2."""
+    n, t_end = 5, 120.0
+    t = _time(t_end)
+    times, received = _full_reception(n, t_end)
+    received[:, :, 0] &= ~((times >= 40.0) & (times < 55.0))
+    lost = _lost_observers(cfg, times, received, t)
+    pre = np.zeros_like(lost)
+    one = combined_alarm(pre, lost, 1, 1)
+    two = combined_alarm(pre, lost, 1, 2)
+    assert one[:, 1:].any(axis=0).all()
+    assert not two.any()
+
+
+def test_node_that_everyone_stops_hearing_raises_the_alarm_with_two_confirmations(cfg):
+    """Node 3 stops transmitting at 40 s: the four other observers declare it lost, so the alarm fires with 2 confirmations (and only on node 3)."""
+    n, t_end = 5, 120.0
+    t = _time(t_end)
+    times, received = _full_reception(n, t_end)
+    received[3, times[3] >= 40.0, :] = False
+    lost = _lost_observers(cfg, times, received, t)
+    two = combined_alarm(np.zeros_like(lost), lost, 1, 2)
+    assert _first_true(two[:, 3], t) == pytest.approx(40.0 + cfg["detector"]["lost_silence"], abs=1.5)
+    assert two[t > 52.0, 3].all()
+    assert not two[:, [0, 1, 2, 4]].any()
 
 
 def test_detection_chain_on_a_fading_link(cfg):
